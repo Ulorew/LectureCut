@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local tooling/state
+.idea/
+.omx/
+
+# Local media and generated renders
+data/
+previews/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.aac
+
+# Temporary files
+*.tmp
+*.log
+filtergraph*.ffmpeg

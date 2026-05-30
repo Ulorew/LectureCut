@@ -1,0 +1,12 @@
+[project]
+name = "lecturecut"
+version = "0.1.0"
+description = "Python + FFmpeg lecture cleanup pipeline"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+lecturecut = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
