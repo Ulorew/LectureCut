@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -22,6 +23,13 @@ if TestClient is not None:
 class WebUITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        # The model cache is a real directory on the developer's machine; point it
+        # somewhere disposable so a downloaded model cannot alter these results.
+        cache = unittest.mock.patch.dict(
+            os.environ, {"XDG_CACHE_HOME": str(Path(self.temp.name) / "cache")}
+        )
+        cache.start()
+        self.addCleanup(cache.stop)
         self.root = Path(self.temp.name) / "media"
         self.root.mkdir()
         self.outside = Path(self.temp.name) / "outside"
@@ -140,23 +148,98 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(set(body["denoise_help"]), set(main.AUDIO_DENOISE_MODES))
         self.assertEqual([m["name"] for m in body["models"]], ["sh.rnnn"])
-        self.assertIn("rnnoise-models", body["model_hint"])
+        # The hint names the cache the models actually land in, per request.
+        self.assertIn(str(Path(self.temp.name) / "cache"), body["model_hint"])
 
-    def test_no_models_is_reported_as_an_empty_list(self):
-        self.assertEqual(self.client.get("/api/schema").json()["models"], [])
+    def test_schema_carries_the_downloadable_catalogue(self):
+        body = self.client.get("/api/schema").json()
+        keys = [entry["key"] for entry in body["catalogue"]]
 
-    def test_arnndn_without_a_model_is_a_400_not_a_failed_job(self):
+        self.assertEqual(set(keys), set(main.ARNNDN_MODELS))
+        self.assertEqual(body["default_model"], main.ARNNDN_DEFAULT_MODEL)
+        recommended = [e for e in body["catalogue"] if e["recommended"]]
+        self.assertEqual([e["key"] for e in recommended], [main.ARNNDN_DEFAULT_MODEL])
+
+    def test_fetching_a_model_reports_the_updated_lists(self):
+        fetched = []
+
+        def fake_download(model, dest_dir=None):
+            fetched.append(model.name)
+            target = self.root / model.file
+            target.write_bytes(b"model")
+            return target
+
+        with unittest.mock.patch.object(
+            webui.core, "download_arnndn_model", fake_download
+        ):
+            body = self.client.post("/api/models", json={}).json()
+
+        self.assertEqual(fetched, [main.ARNNDN_DEFAULT_MODEL])
+        self.assertIn("sh.rnnn", [m["name"] for m in body["models"]])
+
+    def test_fetching_all_models_asks_for_every_one(self):
+        fetched = []
+
+        with unittest.mock.patch.object(
+            webui.core,
+            "download_arnndn_model",
+            lambda model, dest_dir=None: (fetched.append(model.name), self.root / model.file)[1],
+        ):
+            self.client.post("/api/models", json={"keys": "all"})
+
+        self.assertEqual(set(fetched), set(main.ARNNDN_MODELS))
+
+    def test_fetching_an_unknown_model_is_a_400(self):
+        response = self.client.post("/api/models", json={"keys": ["bogus"]})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_failed_download_is_a_502(self):
+        def fail(model, dest_dir=None):
+            raise main.PipelineError("network is down")
+
+        with unittest.mock.patch.object(webui.core, "download_arnndn_model", fail):
+            response = self.client.post("/api/models", json={})
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("network is down", response.json()["detail"])
+
+    def test_models_on_hand_describe_what_they_are_for(self):
+        (self.root / "sh.rnnn").write_bytes(b"model")
+        models = self.client.get("/api/schema").json()["models"]
+        found = next(m for m in models if m["name"] == "sh.rnnn")
+
+        self.assertEqual((found["signal"], found["noise"]), ("speech", "recording"))
+        self.assertTrue(found["recommended"])
+
+    def test_an_unknown_model_is_a_400_not_a_failed_job(self):
         response = self.client.post(
             "/api/jobs",
             json={
                 "source": str(self.root / "lecture.mp4"),
-                "settings": {"denoise": "arnndn"},
+                "settings": {"denoise": "arnndn", "arnndn_model": "/nope.rnnn"},
             },
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("--arnndn-model", response.json()["detail"])
+        self.assertIn("sh", response.json()["detail"])
         self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+
+    def test_accepting_a_job_never_downloads_a_model(self):
+        def explode(*args, **kwargs):
+            raise AssertionError("a request handler must not fetch a model")
+
+        with unittest.mock.patch.object(webui.core, "download_arnndn_model", explode):
+            response = self.client.post(
+                "/api/jobs",
+                json={
+                    "source": str(self.root / "lecture.mp4"),
+                    "settings": {"denoise": "arnndn"},
+                },
+            )
+
+        # Accepted: the worker fetches the default model where its log is visible.
+        self.assertEqual(response.status_code, 200)
 
     def test_job_creation_requires_a_source(self):
         response = self.client.post("/api/jobs", json={"settings": {}})

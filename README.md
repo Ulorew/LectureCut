@@ -137,16 +137,38 @@ Denoiser options:
 | `arnndn` | recurrent network trained on speech, the best of these; needs a model |
 | `none` | leave the noise alone |
 
-`arnndn` needs a `.rnnn` model file, which ships separately from FFmpeg — get
-one from [rnnoise-models](https://github.com/GregorR/rnnoise-models):
+`arnndn` needs a `.rnnn` model, which ships separately from FFmpeg. They are
+~300 KB each, so they are fetched on demand:
 
 ```bash
-python3 main.py data/lec1.mp4 -o out.mp4 --denoise arnndn --arnndn-model ~/models/sh.rnnn
+python3 main.py data/lec1.mp4 -o out.mp4 --denoise arnndn          # fetches sh
+python3 main.py data/lec1.mp4 -o out.mp4 --denoise arnndn --arnndn-model bd
+python3 main.py data/lec1.mp4 -o out.mp4 --denoise arnndn --arnndn-model ~/models/own.rnnn
+python3 main.py --download-models all                              # prefetch, then exit
 ```
 
-Without a model the run is refused immediately, before any measuring, rather
-than failing once it reaches the filter chain. The web UI lists every `.rnnn`
-file it finds under the roots and offers them as a dropdown.
+Models land in `~/.cache/lecturecut/models` and their SHA-256 digests are pinned,
+so a download that does not match is discarded rather than used. The web UI
+lists what is on hand and offers a button for the rest.
+
+The catalogue comes from
+[rnnoise-models](https://github.com/GregorR/rnnoise-models), whose table maps
+the signal a model expects against the noise it expects:
+
+| key | expects | noise | |
+| --- | --- | --- | --- |
+| `sh` | speech | recorded | default: a lecture is speech recorded in a room |
+| `bd` | voice, including laughter | recorded | |
+| `cb` | any audio | recorded | |
+| `lq` | voice | general | |
+| `mp` | any audio | general | |
+
+**On a very quiet source, `arnndn` is not automatically the better choice.**
+Measured against `afftdn` on the 85-minute lecture above: it leaves the noise
+floor about 9 dB lower, but it also thins out quiet speech, which widens the
+loudness range from ~7 LU to 20-25 LU and leaves the quietest passages several
+dB down. `afftdn` stays the default for a reason; try `arnndn` when the source
+is not fighting for headroom.
 
 ## Repeating a run
 

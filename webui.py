@@ -48,11 +48,13 @@ MEDIA_SUFFIXES = {
 }
 UPLOAD_CHUNK = 1024 * 1024
 PROBE_WORKERS = 8
-ARNNDN_MODEL_HINT = (
-    "Модели arnndn поставляются отдельно от FFmpeg. Положите файл "
-    f"{core.ARNNDN_MODEL_SUFFIX} в одну из доступных папок — например, взяв его "
-    "из https://github.com/GregorR/rnnoise-models"
-)
+def model_hint() -> str:
+    """Built per request: the cache location follows the environment."""
+
+    return (
+        f"Модели по ~300 КБ, скачиваются по кнопке в кэш {core.model_cache_dir()}. "
+        "Хеши зашиты, так что загрузка проверяется"
+    )
 # A listing should stay responsive even when pointed at a large archive.
 PROBE_LIMIT = 400
 EVENT_HISTORY_LIMIT = 2000
@@ -320,20 +322,57 @@ def resolve_within_roots(raw: str, config: Config) -> Path:
 
 
 def list_arnndn_models(config: Config) -> list[dict[str, Any]]:
-    """Find .rnnn models so arnndn can be offered only when it can actually run."""
+    """Every model on hand: the download cache first, then the roots."""
 
     found: list[dict[str, Any]] = []
     seen: set[Path] = set()
-    for root in config.roots:
-        if not root.exists():
+    catalogue = {model.file: model for model in core.ARNNDN_MODELS.values()}
+
+    directories = [core.model_cache_dir(), *config.roots]
+    for directory in directories:
+        if not directory.exists():
             continue
-        for path in sorted(root.rglob(f"*{core.ARNNDN_MODEL_SUFFIX}")):
+        paths = (
+            sorted(directory.glob(f"*{core.ARNNDN_MODEL_SUFFIX}"))
+            if directory == core.model_cache_dir()
+            else sorted(directory.rglob(f"*{core.ARNNDN_MODEL_SUFFIX}"))
+        )
+        for path in paths:
             resolved = path.resolve()
             if resolved in seen:
                 continue
             seen.add(resolved)
-            found.append({"path": str(resolved), "name": resolved.name})
+            known = catalogue.get(resolved.name)
+            found.append(
+                {
+                    "path": str(resolved),
+                    "name": resolved.name,
+                    "key": known.name if known else None,
+                    "signal": known.signal if known else None,
+                    "noise": known.noise if known else None,
+                    "recommended": bool(known)
+                    and known.name == core.ARNNDN_DEFAULT_MODEL,
+                }
+            )
+    found.sort(key=lambda entry: (not entry["recommended"], entry["name"]))
     return found
+
+
+def model_catalogue() -> list[dict[str, Any]]:
+    """What can be fetched, and whether it already is."""
+
+    return [
+        {
+            "key": model.name,
+            "file": model.file,
+            "size": model.size,
+            "signal": model.signal,
+            "noise": model.noise,
+            "recommended": model.name == core.ARNNDN_DEFAULT_MODEL,
+            "installed": core.installed_model_path(model).exists(),
+        }
+        for model in core.ARNNDN_MODELS.values()
+    ]
 
 
 class ProcessedIndex:
@@ -425,7 +464,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "allow_open": config.allow_open,
             "denoise_help": core.AUDIO_DENOISE_HELP,
             "models": list_arnndn_models(config),
-            "model_hint": ARNNDN_MODEL_HINT,
+            "catalogue": model_catalogue(),
+            "default_model": core.ARNNDN_DEFAULT_MODEL,
+            "model_hint": model_hint(),
         }
 
     @app.get("/api/files")
@@ -470,6 +511,31 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
                 handle.write(chunk)
                 written += len(chunk)
         return {"path": str(target), "name": safe_name, "size": written}
+
+    @app.post("/api/models")
+    def fetch_models(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        """Fetch models into the cache. They are ~300 KB each with pinned digests."""
+
+        requested = payload.get("keys") or [core.ARNNDN_DEFAULT_MODEL]
+        if requested == "all":
+            requested = list(core.ARNNDN_MODELS)
+        unknown = [key for key in requested if key not in core.ARNNDN_MODELS]
+        if unknown:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown model(s): {', '.join(unknown)}"
+            )
+        fetched: list[str] = []
+        for key in requested:
+            try:
+                path = core.download_arnndn_model(core.ARNNDN_MODELS[key])
+            except core.PipelineError as error:
+                raise HTTPException(status_code=502, detail=str(error)) from None
+            fetched.append(str(path))
+        return {
+            "fetched": fetched,
+            "models": list_arnndn_models(config),
+            "catalogue": model_catalogue(),
+        }
 
     @app.get("/api/dirs")
     def dirs() -> dict[str, Any]:
@@ -530,9 +596,10 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
 
         try:
             argv = core.settings_to_argv(str(source), settings)
-            # Refuse a job the pipeline cannot run before it reaches the queue,
-            # so a missing denoiser model is a 400 and not a failed render.
-            core.validate_denoise_settings(core.parse_args(argv))
+            # Refuse a job the pipeline cannot run before it reaches the queue.
+            # The check does not download: fetching a model belongs in the worker,
+            # where its progress is visible, not in a request handler.
+            core.check_denoise_settings(core.parse_args(argv))
         except core.PipelineError as error:
             raise HTTPException(status_code=400, detail=str(error)) from None
         except SystemExit:

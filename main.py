@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import hashlib
 import shutil
 import signal
 import subprocess
@@ -18,9 +19,11 @@ import threading
 import time
 from statistics import median
 from contextvars import ContextVar, copy_context
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 
@@ -236,6 +239,87 @@ AUDIO_DENOISE_HELP = {
 }
 OUTPUT_EXISTS_MODES = ("suffix", "overwrite", "error")
 ARNNDN_MODEL_SUFFIX = ".rnnn"
+
+# The rnnoise-nu models. They are ~300 KB each and not subject to copyright per
+# their repository, so fetching one on request is cheaper than making somebody
+# hunt for it. Digests are pinned: a download that does not match is discarded.
+ARNNDN_MODEL_BASE_URL = "https://raw.githubusercontent.com/GregorR/rnnoise-models/master"
+ARNNDN_MODEL_MAX_BYTES = 2 * 1024 * 1024
+ARNNDN_DEFAULT_MODEL = "sh"
+
+
+@dataclass(frozen=True)
+class ArnndnModel:
+    """One downloadable denoiser model.
+
+    `signal` and `noise` come from the upstream table, which maps what the model
+    expects to hear against what it expects to filter out. A lecture is speech
+    recorded in a room, which is what makes `sh` the default here.
+    """
+
+    name: str
+    file: str
+    repo_path: str
+    sha256: str
+    size: int
+    signal: str
+    noise: str
+
+    @property
+    def url(self) -> str:
+        return f"{ARNNDN_MODEL_BASE_URL}/{self.repo_path}"
+
+
+ARNNDN_MODELS: dict[str, ArnndnModel] = {
+    model.name: model
+    for model in (
+        ArnndnModel(
+            "sh",
+            "sh.rnnn",
+            "somnolent-hogwash-2018-09-01/sh.rnnn",
+            "70bb6685eb0c2a1d18e2918dca3fbfbd39317010b1802eb1b6ea73a92f3fdec0",
+            297646,
+            "speech",
+            "recording",
+        ),
+        ArnndnModel(
+            "bd",
+            "bd.rnnn",
+            "beguiling-drafter-2018-08-30/bd.rnnn",
+            "ae3f7411e1e6a884f839a4a145c394408398f09854dbc1216ee02faafc98a17b",
+            299693,
+            "voice",
+            "recording",
+        ),
+        ArnndnModel(
+            "cb",
+            "cb.rnnn",
+            "conjoined-burgers-2018-08-28/cb.rnnn",
+            "f1357c4e5be9dee8467bead486dfced2d75b640c26ad0b594fa7f102322371d9",
+            299741,
+            "general",
+            "recording",
+        ),
+        ArnndnModel(
+            "lq",
+            "lq.rnnn",
+            "leavened-quisling-2018-08-31/lq.rnnn",
+            "1957528b752799fddf06270bc5469af7cf54c3badc358544ae2abed730943ff9",
+            297041,
+            "voice",
+            "general",
+        ),
+        ArnndnModel(
+            "mp",
+            "mp.rnnn",
+            "marathon-prescription-2018-08-29/mp.rnnn",
+            "4e84a448a4baf937992aaf4d10c8258007ec5d24219b6647dfd5fb4b563ad231",
+            296861,
+            "general",
+            "general",
+        ),
+    )
+}
 AUDIO_LOUDNESS_MODES = ("dynaudnorm", "speechnorm", "loudnorm", "none")
 
 # Used when measurement is skipped or fails. The silence threshold is well below
@@ -256,6 +340,12 @@ SILENCE_CALIBRATION_ROUNDS = 4
 # fine trim stays small and any real lift comes from crest reduction instead.
 GAIN_BIAS_LIMITS = (-6.0, 2.0)
 GAIN_MAKEUP_MAX_DB = 7.0
+# dynaudnorm's max gain is a ceiling, not a target. It is derived from the input
+# level, so a denoiser that thins the signal out - arnndn especially - can leave
+# the normalizer unable to reach its peak target. Measured once, then raised.
+GAIN_CEILING_SLACK_DB = 6.0
+GAIN_CEILING_TRIGGER_DB = 6.0
+DYNAUDNORM_MAX_GAIN = 100.0
 GAIN_CALIBRATION_WINDOWS = 6
 GAIN_CALIBRATION_WINDOW = 20.0
 
@@ -339,7 +429,21 @@ def build_parser() -> argparse.ArgumentParser:
             "with FFmpeg. Input can be a local file or a URL supported by yt-dlp."
         )
     )
-    parser.add_argument("source", help="Local media file or video URL")
+    parser.add_argument(
+        "source",
+        nargs="?",
+        help="Local media file or video URL",
+    )
+    parser.add_argument(
+        "--download-models",
+        nargs="?",
+        const="all",
+        metavar="NAMES",
+        help=(
+            "Fetch arnndn models into the cache and exit: 'all' or a comma-separated "
+            f"list of {', '.join(ARNNDN_MODELS)}"
+        ),
+    )
     parser.add_argument("-o", "--output", type=Path, help="Output MP4 path")
     parser.add_argument(
         "--force",
@@ -447,7 +551,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audio_group.add_argument(
         "--arnndn-model",
-        help="Path to an .rnnn model for the arnndn speech denoiser",
+        help=(
+            "Model for the arnndn denoiser: a path to an .rnnn file, or one of "
+            f"{', '.join(ARNNDN_MODELS)} to fetch it on demand "
+            f"(default {ARNNDN_DEFAULT_MODEL})"
+        ),
     )
     audio_group.add_argument(
         "--anlmdn-strength",
@@ -626,7 +734,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.source is None and args.download_models is None:
+        parser.error("the following arguments are required: source")
+    return args
+
+
+def install_models(selection: str) -> int:
+    """Prefetch models so a later run never waits on the network."""
+
+    names = list(ARNNDN_MODELS) if selection == "all" else csv_values(selection)
+    unknown = [name for name in names if name not in ARNNDN_MODELS]
+    if unknown:
+        raise PipelineError(
+            f"Unknown model(s): {', '.join(unknown)}. Known: {', '.join(ARNNDN_MODELS)}"
+        )
+    for name in names:
+        download_arnndn_model(ARNNDN_MODELS[name])
+    report(f"Models are in {model_cache_dir()}")
+    return 0
 
 
 def option_strings_by_dest(parser: argparse.ArgumentParser) -> dict[str, str]:
@@ -1497,24 +1624,108 @@ def resolved_denoise_mode(args: argparse.Namespace) -> str:
     return "arnndn" if args.arnndn_model else "afftdn"
 
 
-def validate_denoise_settings(args: argparse.Namespace) -> Path | None:
-    """Check the denoiser can actually run, and return its model if it needs one.
+def model_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "lecturecut" / "models"
 
-    Called before any work starts as well as from the chain builder, so a missing
-    model is refused up front instead of halfway through a job.
+
+def installed_model_path(model: ArnndnModel) -> Path:
+    return model_cache_dir() / model.file
+
+
+def verify_model_bytes(payload: bytes, model: ArnndnModel) -> None:
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != model.sha256:
+        raise PipelineError(
+            f"Downloaded {model.file} does not match its known digest "
+            f"({digest[:12]}... instead of {model.sha256[:12]}...); discarded"
+        )
+
+
+def download_arnndn_model(model: ArnndnModel, *, dest_dir: Path | None = None) -> Path:
+    """Fetch one model into the cache, verifying it before it is kept.
+
+    Idempotent: an already-installed model with the right digest is returned as
+    it is, so this can sit on the path of every run that asks for arnndn.
+    """
+
+    target = (dest_dir / model.file) if dest_dir else installed_model_path(model)
+    if target.exists():
+        try:
+            verify_model_bytes(target.read_bytes(), model)
+            return target
+        except PipelineError:
+            report(f"Cached {model.file} is damaged, fetching it again", error=True)
+
+    report(f"Downloading {model.file} ({model.size // 1024} KB) from rnnoise-models...")
+    request = urllib.request.Request(model.url, headers={"User-Agent": "LectureCut"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = response.read(ARNNDN_MODEL_MAX_BYTES + 1)
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise PipelineError(f"Could not download {model.file}: {error}") from None
+    if len(payload) > ARNNDN_MODEL_MAX_BYTES:
+        raise PipelineError(f"{model.file} is larger than expected; refusing it")
+    verify_model_bytes(payload, model)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Write beside the target and move, so an interrupted fetch cannot leave a
+    # half-written model that later looks installed.
+    temporary = target.with_name(f".{target.name}.part")
+    temporary.write_bytes(payload)
+    os.replace(temporary, target)
+    report(f"Model ready: {target}")
+    return target
+
+
+def unknown_model_error(spec: str) -> PipelineError:
+    return PipelineError(
+        f"arnndn model not found: {spec}. Pass a path to an "
+        f"{ARNNDN_MODEL_SUFFIX} file, or one of {', '.join(ARNNDN_MODELS)}"
+    )
+
+
+def check_denoise_settings(args: argparse.Namespace) -> None:
+    """Reject an unusable denoiser choice without touching disk or network.
+
+    Callers that must answer quickly - a request handler deciding whether to
+    accept a job - need to know the choice is sound without waiting on a fetch.
+    """
+
+    if resolved_denoise_mode(args) != "arnndn":
+        return
+    spec = args.arnndn_model
+    if not spec or spec in ARNNDN_MODELS:
+        return
+    if not Path(spec).expanduser().exists():
+        raise unknown_model_error(spec)
+
+
+def resolve_arnndn_model(spec: str | None) -> Path:
+    """Turn a path, a catalogue name, or nothing at all into a usable model."""
+
+    if spec:
+        candidate = Path(spec).expanduser()
+        if candidate.exists():
+            return candidate
+        if spec in ARNNDN_MODELS:
+            return download_arnndn_model(ARNNDN_MODELS[spec])
+        raise unknown_model_error(spec)
+    return download_arnndn_model(ARNNDN_MODELS[ARNNDN_DEFAULT_MODEL])
+
+
+def validate_denoise_settings(args: argparse.Namespace) -> Path | None:
+    """Make sure the denoiser can run, fetching its model if that is what is missing.
+
+    Called before any work starts as well as from the chain builder, so a model
+    problem surfaces up front rather than halfway through a job. The resolved
+    path is written back onto args so the chain builder does no work twice.
     """
 
     if resolved_denoise_mode(args) != "arnndn":
         return None
-    if not args.arnndn_model:
-        raise PipelineError(
-            "--denoise arnndn needs a model: pass --arnndn-model /path/to/model"
-            f"{ARNNDN_MODEL_SUFFIX}. Models ship separately from FFmpeg; see "
-            "https://github.com/GregorR/rnnoise-models"
-        )
-    model = Path(args.arnndn_model).expanduser()
-    if not model.exists():
-        raise PipelineError(f"arnndn model not found: {model}")
+    model = resolve_arnndn_model(args.arnndn_model)
+    args.arnndn_model = str(model)
     return model
 
 
@@ -1557,6 +1768,7 @@ def loudness_filters(
     *,
     speech_lufs: float,
     noise_floor_db: float,
+    extra_ceiling_db: float = 0.0,
 ) -> list[str]:
     mode = args.loudness
     if mode == "none":
@@ -1577,7 +1789,11 @@ def loudness_filters(
             f"speechnorm=p={peak:.3f}:e={expansion:.2f}:t={threshold:.5f}:r=0.0004:f=0.0002"
         ]
     # dynaudnorm gain is a ceiling, not a target, so allow more than the deficit.
-    max_gain = clamp(db_to_linear(deficit + 6.0), 4.0, 60.0)
+    max_gain = clamp(
+        db_to_linear(deficit + GAIN_CEILING_SLACK_DB + extra_ceiling_db),
+        4.0,
+        DYNAUDNORM_MAX_GAIN,
+    )
     return [f"dynaudnorm=f=400:g=15:p={peak:.3f}:m={max_gain:.1f}:s=12"]
 
 
@@ -1600,10 +1816,11 @@ def compressor_filter(*, makeup_db: float, true_peak_db: float) -> str:
 
 @dataclass(frozen=True)
 class GainPlan:
-    """How the measured loudness gap is closed: compression first, trim second."""
+    """How the measured loudness gap is closed: headroom, compression, then trim."""
 
     makeup_db: float = 0.0
     bias_db: float = 0.0
+    extra_ceiling_db: float = 0.0
     measured_lufs: float | None = None
     shortfall_db: float = 0.0
 
@@ -1636,10 +1853,15 @@ def audio_chain_for(
     )
     if not args.no_gate:
         filters.append(gate_filter(noise_floor_db=noise_floor_db))
-    filters.extend(
-        loudness_filters(args, speech_lufs=speech_lufs, noise_floor_db=noise_floor_db)
-    )
     plan = gain_plan or GainPlan()
+    filters.extend(
+        loudness_filters(
+            args,
+            speech_lufs=speech_lufs,
+            noise_floor_db=noise_floor_db,
+            extra_ceiling_db=plan.extra_ceiling_db,
+        )
+    )
     if plan.makeup_db >= 0.5:
         filters.append(
             compressor_filter(makeup_db=plan.makeup_db, true_peak_db=args.true_peak)
@@ -1697,20 +1919,36 @@ def calibrate_gain(
         return GainPlan()
 
     report("Calibrating output gain...")
+    base = GainPlan()
     measured = measure_processed_loudness(
-        input_path, args=args, analysis=analysis, gain_plan=GainPlan()
+        input_path, args=args, analysis=analysis, gain_plan=base
     )
     if measured is None:
-        return GainPlan()
+        return base
 
     deficit = args.target_lufs - measured
     report(f"  peak-normalized loudness: {measured:.1f} LUFS")
+
+    if deficit > GAIN_CEILING_TRIGGER_DB:
+        # This far short of the target means peak normalization never got there,
+        # so its ceiling is binding rather than the crest factor.
+        raised = GainPlan(extra_ceiling_db=deficit)
+        lifted = measure_processed_loudness(
+            input_path, args=args, analysis=analysis, gain_plan=raised
+        )
+        if lifted is not None and lifted > measured + 1.0:
+            report(
+                f"  gain ceiling was binding: {lifted:.1f} LUFS with "
+                f"{deficit:.0f} dB more headroom"
+            )
+            base, measured, deficit = raised, lifted, args.target_lufs - lifted
+
     if deficit <= GAIN_BIAS_LIMITS[1]:
         bias = clamp(deficit, *GAIN_BIAS_LIMITS)
-        return GainPlan(bias_db=bias, measured_lufs=measured)
+        return replace(base, bias_db=bias, measured_lufs=measured)
 
     makeup = clamp(deficit, 0.0, GAIN_MAKEUP_MAX_DB)
-    plan = GainPlan(makeup_db=makeup, measured_lufs=measured)
+    plan = replace(base, makeup_db=makeup, measured_lufs=measured)
     verified = measure_processed_loudness(
         input_path, args=args, analysis=analysis, gain_plan=plan
     )
@@ -1728,8 +1966,8 @@ def calibrate_gain(
             f"  {shortfall:.1f} dB short of {args.target_lufs:g} LUFS; raise "
             "--target-lufs or accept the quieter result rather than clipping",
         )
-    return GainPlan(
-        makeup_db=makeup,
+    return replace(
+        plan,
         bias_db=bias,
         measured_lufs=verified,
         shortfall_db=shortfall,
@@ -2211,6 +2449,8 @@ def run_preview_sweep(
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
+    if args.download_models is not None:
+        return install_models(args.download_models)
     require_command("ffmpeg")
     workdir_manager: tempfile.TemporaryDirectory[str] | None = None
     if args.workdir is None:

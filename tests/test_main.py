@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import main
@@ -207,19 +208,79 @@ class LectureCutTests(unittest.TestCase):
     def test_suffix_is_the_default(self):
         self.assertEqual(main.parse_args(["in.mp4"]).if_exists, "suffix")
 
-    def test_arnndn_without_a_model_is_refused_up_front(self):
+    def test_arnndn_without_a_model_fetches_the_default(self):
+        args = main.parse_args(["in.mp4", "--denoise", "arnndn"])
+        asked = []
+
+        def fake_download(model, dest_dir=None):
+            asked.append(model.name)
+            return Path("/cache") / model.file
+
+        with unittest.mock.patch.object(main, "download_arnndn_model", fake_download):
+            resolved = main.validate_denoise_settings(args)
+
+        self.assertEqual(asked, [main.ARNNDN_DEFAULT_MODEL])
+        self.assertEqual(resolved, Path("/cache/sh.rnnn"))
+        # The resolved path is written back so the chain builder repeats no work.
+        self.assertEqual(args.arnndn_model, "/cache/sh.rnnn")
+
+    def test_a_catalogue_name_is_accepted_as_a_model(self):
+        args = main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", "bd"])
+
+        with unittest.mock.patch.object(
+            main, "download_arnndn_model", lambda model, dest_dir=None: Path(model.file)
+        ):
+            self.assertEqual(main.validate_denoise_settings(args), Path("bd.rnnn"))
+
+    def test_an_unknown_model_spec_is_refused(self):
+        args = main.parse_args(
+            ["in.mp4", "--denoise", "arnndn", "--arnndn-model", "/nope.rnnn"]
+        )
+
         with self.assertRaises(main.PipelineError) as caught:
-            main.validate_denoise_settings(main.parse_args(["in.mp4", "--denoise", "arnndn"]))
-
-        # The message has to say what to do about it, not just what is wrong.
-        self.assertIn("--arnndn-model", str(caught.exception))
-        self.assertIn("rnnoise-models", str(caught.exception))
-
-    def test_arnndn_with_a_missing_model_file_is_refused(self):
-        args = main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", "/nope.rnnn"])
-
+            main.check_denoise_settings(args)
         with self.assertRaises(main.PipelineError):
             main.validate_denoise_settings(args)
+
+        self.assertIn("sh", str(caught.exception))
+
+    def test_the_quick_check_neither_downloads_nor_touches_args(self):
+        args = main.parse_args(["in.mp4", "--denoise", "arnndn"])
+
+        def explode(*_args, **_kwargs):
+            raise AssertionError("the quick check must not download")
+
+        with unittest.mock.patch.object(main, "download_arnndn_model", explode):
+            main.check_denoise_settings(args)
+            main.check_denoise_settings(
+                main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", "sh"])
+            )
+
+        self.assertIsNone(args.arnndn_model)
+
+    def test_model_catalogue_is_pinned_and_complete(self):
+        for name, model in main.ARNNDN_MODELS.items():
+            self.assertEqual(model.name, name)
+            self.assertEqual(len(model.sha256), 64)
+            self.assertTrue(model.url.startswith("https://"))
+            self.assertLess(model.size, main.ARNNDN_MODEL_MAX_BYTES)
+            self.assertIn(model.signal, {"speech", "voice", "general"})
+            self.assertIn(model.noise, {"recording", "general"})
+        # A lecture is speech recorded in a room, which is what sh is trained for.
+        default = main.ARNNDN_MODELS[main.ARNNDN_DEFAULT_MODEL]
+        self.assertEqual((default.signal, default.noise), ("speech", "recording"))
+
+    def test_a_download_that_does_not_match_its_digest_is_rejected(self):
+        model = main.ARNNDN_MODELS["sh"]
+
+        with self.assertRaises(main.PipelineError) as caught:
+            main.verify_model_bytes(b"not the model", model)
+
+        self.assertIn("digest", str(caught.exception))
+
+    def test_install_models_rejects_unknown_names(self):
+        with self.assertRaises(main.PipelineError):
+            main.install_models("sh,bogus")
 
     def test_auto_denoise_needs_no_model(self):
         self.assertIsNone(main.validate_denoise_settings(main.parse_args(["in.mp4"])))
@@ -364,10 +425,6 @@ class LectureCutTests(unittest.TestCase):
             ),
             [],
         )
-        with self.assertRaises(main.PipelineError):
-            main.denoise_filters(
-                self.audio_args(denoise="arnndn"), noise_floor_db=-57.0, snr_db=20.0
-            )
         with self.assertRaises(main.PipelineError):
             main.denoise_filters(
                 self.audio_args(denoise="auto", arnndn_model="/nope/missing.rnnn"),

@@ -50,7 +50,11 @@
         <span id="denoise-help" class="muted small"></span>
       </label>
       <label class="wide hidden" id="model-label">Модель arnndn
-        <select id="set-arnndn-model"></select>
+        <span class="inline">
+          <select id="set-arnndn-model"></select>
+          <button type="button" id="fetch-model" class="secondary tiny">Скачать</button>
+          <button type="button" id="fetch-all-models" class="secondary tiny">Все</button>
+        </span>
         <span id="model-hint" class="muted small"></span>
       </label>
       <label>Порог тишины

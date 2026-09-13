@@ -17,6 +17,10 @@ const BASIC_DESTS = new Set([
 ]);
 // The preview sweep is a separate flow, not part of this screen.
 const SKIPPED_GROUPS = new Set(["preview sweep"]);
+// The upstream table maps what a model expects to hear against what it expects
+// to filter out; the core passes those two keys and the wording lives here.
+const SIGNAL_WORDS = { speech: "речь", voice: "речь и смех", general: "любой звук" };
+const NOISE_WORDS = { recording: "шум записи", general: "любой шум" };
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const SETTINGS_KEY = "lecturecut.settings.v1";
 // Deliberately not remembered: they belong to one particular file, and silently
@@ -177,6 +181,15 @@ function applyDefaults() {
   syncSilenceControls();
 }
 
+function modelLabel(model) {
+  const signal = SIGNAL_WORDS[model.signal];
+  const noise = NOISE_WORDS[model.noise];
+  const parts = [model.name || model.file];
+  if (signal && noise) parts.push(`${signal} + ${noise}`);
+  if (model.recommended) parts.push("рекомендуется для лекций");
+  return parts.join(" — ");
+}
+
 function syncDenoiseHelp() {
   const mode = el("set-denoise").value;
   const help = (state.schema.denoise_help || {})[mode] || "";
@@ -185,12 +198,11 @@ function syncDenoiseHelp() {
   // model picker appears exactly when it is about to be used.
   const needsModel = mode === "arnndn" || (mode === "auto" && models.length > 0);
   el("model-label").classList.toggle("hidden", !needsModel);
-  let note = help;
-  if (mode === "arnndn" && !models.length) {
-    note = `${help}. Модель не найдена — ${state.schema.model_hint}`;
-  }
-  el("denoise-help").textContent = note;
-  el("denoise-help").classList.toggle("warn", mode === "arnndn" && !models.length);
+  const missing = mode === "arnndn" && !models.length;
+  el("denoise-help").textContent = missing
+    ? `${help}. Модели ещё нет — нажмите «Скачать»`
+    : help;
+  el("denoise-help").classList.toggle("warn", missing);
 }
 
 function renderModels() {
@@ -201,7 +213,7 @@ function renderModels() {
   if (!models.length) {
     const empty = document.createElement("option");
     empty.value = "";
-    empty.textContent = "моделей не найдено";
+    empty.textContent = "моделей нет";
     select.appendChild(empty);
     select.disabled = true;
   } else {
@@ -209,13 +221,42 @@ function renderModels() {
     for (const model of models) {
       const option = document.createElement("option");
       option.value = model.path;
-      option.textContent = model.name;
+      option.textContent = modelLabel(model);
       option.title = model.path;
       select.appendChild(option);
     }
     select.value = previous || models[0].path;
   }
-  el("model-hint").textContent = models.length ? "" : state.schema.model_hint;
+  const pending = (state.schema.catalogue || []).filter((m) => !m.installed);
+  const total = pending.reduce((sum, m) => sum + m.size, 0);
+  el("fetch-model").classList.toggle("hidden", models.length > 0);
+  el("fetch-all-models").classList.toggle("hidden", pending.length === 0);
+  el("fetch-all-models").textContent = pending.length
+    ? `Ещё ${pending.length} (${Math.round(total / 1024)} КБ)`
+    : "Все";
+  el("model-hint").textContent = state.schema.model_hint;
+}
+
+async function fetchModels(keys) {
+  const buttons = [el("fetch-model"), el("fetch-all-models")];
+  for (const button of buttons) button.disabled = true;
+  el("model-hint").textContent = "Скачиваю...";
+  try {
+    const data = await api("/api/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keys }),
+    });
+    state.schema.models = data.models;
+    state.schema.catalogue = data.catalogue;
+    renderModels();
+    syncDenoiseHelp();
+  } catch (error) {
+    el("model-hint").textContent = `Не удалось скачать: ${error.message}`;
+    el("model-hint").classList.add("warn");
+  } finally {
+    for (const button of buttons) button.disabled = false;
+  }
 }
 
 function syncSilenceControls() {
@@ -851,6 +892,10 @@ async function init() {
   updateConvertButton();
   el("convert").addEventListener("click", convert);
   el("set-denoise").addEventListener("change", syncDenoiseHelp);
+  el("fetch-model").addEventListener("click", () =>
+    fetchModels([state.schema.default_model])
+  );
+  el("fetch-all-models").addEventListener("click", () => fetchModels("all"));
   el("set-silence-auto").addEventListener("change", syncSilenceControls);
   el("set-silence-bias").addEventListener("input", syncSilenceControls);
   el("reset-settings").addEventListener("click", resetFormState);
