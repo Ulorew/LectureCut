@@ -26,3 +26,6 @@ previews/
 *.tmp
 *.log
 filtergraph*.ffmpeg
+
+# Editable install metadata
+*.egg-info/
