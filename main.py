@@ -375,6 +375,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     silence_group.add_argument(
+        "--silence-bias",
+        type=float,
+        default=0.0,
+        help=(
+            "Nudge the auto threshold in dB: positive cuts more pauses, negative "
+            "keeps more. Ignored when --silence-threshold is set explicitly"
+        ),
+    )
+    silence_group.add_argument(
         "--min-silence",
         type=positive_float,
         default=0.35,
@@ -1373,6 +1382,17 @@ def calibrate_silence_threshold(
     return best
 
 
+def apply_silence_bias(threshold_db: float, bias_db: float) -> float:
+    """Shift the calibrated threshold by the listener's taste.
+
+    Calibration aims for a typical share of removed pauses, which is a starting
+    point rather than an answer: a lecturer who thinks in long pauses and one who
+    barely breathes want different cuts from the same measurements.
+    """
+
+    return clamp(threshold_db + bias_db, *SILENCE_THRESHOLD_LIMITS)
+
+
 def denoise_filters(
     args: argparse.Namespace,
     *,
@@ -1602,11 +1622,18 @@ def resolve_audio_settings(
 
     start_phase(PHASE_CALIBRATE)
     if str(args.silence_threshold).strip().lower() == "auto":
-        threshold = calibrate_silence_threshold(
+        calibrated = calibrate_silence_threshold(
             input_path, analysis=analysis, args=args
         )
+        threshold = apply_silence_bias(calibrated, args.silence_bias)
         args.silence_threshold = f"{threshold:.1f}dB"
-        report(f"Silence threshold: {args.silence_threshold} (auto)")
+        if threshold != calibrated:
+            report(
+                f"Silence threshold: {args.silence_threshold} "
+                f"(auto {calibrated:.1f}dB, bias {args.silence_bias:+.1f}dB)"
+            )
+        else:
+            report(f"Silence threshold: {args.silence_threshold} (auto)")
     if args.gain_bias is None:
         plan = calibrate_gain(input_path, analysis=analysis, args=args)
     else:

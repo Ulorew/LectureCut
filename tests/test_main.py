@@ -194,6 +194,21 @@ class LectureCutTests(unittest.TestCase):
             main.derive_silence_threshold(None), main.FALLBACK_SILENCE_THRESHOLD_DB
         )
 
+    def test_silence_bias_shifts_the_calibrated_threshold(self):
+        # Positive bias raises the threshold, so more of the pauses get cut.
+        self.assertAlmostEqual(main.apply_silence_bias(-49.1, 5.0), -44.1)
+        self.assertAlmostEqual(main.apply_silence_bias(-49.1, -5.0), -54.1)
+        self.assertAlmostEqual(main.apply_silence_bias(-49.1, 0.0), -49.1)
+
+    def test_silence_bias_stays_inside_the_usable_range(self):
+        low, high = main.SILENCE_THRESHOLD_LIMITS
+
+        self.assertEqual(main.apply_silence_bias(-49.1, -40.0), low)
+        self.assertEqual(main.apply_silence_bias(-49.1, 40.0), high)
+
+    def test_silence_bias_defaults_to_no_shift(self):
+        self.assertEqual(main.parse_args(["in.mp4"]).silence_bias, 0.0)
+
     def test_derived_silence_threshold_tracks_a_loud_noise_floor(self):
         # A noisy room must not push the threshold above gated speech level.
         analysis = self.analysis(speech_lufs=-30.0, noise_floor_db=-32.0)
