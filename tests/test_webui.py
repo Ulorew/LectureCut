@@ -174,8 +174,9 @@ class WebUITests(unittest.TestCase):
         ):
             body = self.client.post("/api/models", json={}).json()
 
+        default_file = main.ARNNDN_MODELS[main.ARNNDN_DEFAULT_MODEL].file
         self.assertEqual(fetched, [main.ARNNDN_DEFAULT_MODEL])
-        self.assertIn("sh.rnnn", [m["name"] for m in body["models"]])
+        self.assertIn(default_file, [m["name"] for m in body["models"]])
 
     def test_fetching_all_models_asks_for_every_one(self):
         fetched = []
@@ -205,11 +206,12 @@ class WebUITests(unittest.TestCase):
         self.assertIn("network is down", response.json()["detail"])
 
     def test_models_on_hand_describe_what_they_are_for(self):
-        (self.root / "sh.rnnn").write_bytes(b"model")
+        default = main.ARNNDN_MODELS[main.ARNNDN_DEFAULT_MODEL]
+        (self.root / default.file).write_bytes(b"model")
         models = self.client.get("/api/schema").json()["models"]
-        found = next(m for m in models if m["name"] == "sh.rnnn")
+        found = next(m for m in models if m["name"] == default.file)
 
-        self.assertEqual((found["signal"], found["noise"]), ("speech", "recording"))
+        self.assertEqual((found["signal"], found["noise"]), (default.signal, default.noise))
         self.assertTrue(found["recommended"])
 
     def test_an_unknown_model_is_a_400_not_a_failed_job(self):

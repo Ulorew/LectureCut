@@ -219,10 +219,11 @@ class LectureCutTests(unittest.TestCase):
         with unittest.mock.patch.object(main, "download_arnndn_model", fake_download):
             resolved = main.validate_denoise_settings(args)
 
+        default_file = main.ARNNDN_MODELS[main.ARNNDN_DEFAULT_MODEL].file
         self.assertEqual(asked, [main.ARNNDN_DEFAULT_MODEL])
-        self.assertEqual(resolved, Path("/cache/sh.rnnn"))
+        self.assertEqual(resolved, Path("/cache") / default_file)
         # The resolved path is written back so the chain builder repeats no work.
-        self.assertEqual(args.arnndn_model, "/cache/sh.rnnn")
+        self.assertEqual(args.arnndn_model, str(Path("/cache") / default_file))
 
     def test_a_catalogue_name_is_accepted_as_a_model(self):
         args = main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", "bd"])
@@ -266,9 +267,9 @@ class LectureCutTests(unittest.TestCase):
             self.assertLess(model.size, main.ARNNDN_MODEL_MAX_BYTES)
             self.assertIn(model.signal, {"speech", "voice", "general"})
             self.assertIn(model.noise, {"recording", "general"})
-        # A lecture is speech recorded in a room, which is what sh is trained for.
-        default = main.ARNNDN_MODELS[main.ARNNDN_DEFAULT_MODEL]
-        self.assertEqual((default.signal, default.noise), ("speech", "recording"))
+        # The default was picked by measuring speech loss against SNR gain on real
+        # lectures, not from the upstream table, so only its presence is asserted.
+        self.assertIn(main.ARNNDN_DEFAULT_MODEL, main.ARNNDN_MODELS)
 
     def test_a_download_that_does_not_match_its_digest_is_rejected(self):
         model = main.ARNNDN_MODELS["sh"]
@@ -311,6 +312,88 @@ class LectureCutTests(unittest.TestCase):
         self.assertTrue(main.name_suggests_output(main.Path("c_LectureCut.mp4")))
         self.assertFalse(main.name_suggests_output(main.Path("Lecture_01.MOV")))
         self.assertFalse(main.name_suggests_output(main.Path("notes.mp4")))
+
+    def test_gate_stays_clear_of_the_speech(self):
+        # Good SNR: the old floor+8 rule already sat well below the speech.
+        self.assertAlmostEqual(
+            main.gate_threshold_db(noise_floor_db=-57.0, speech_lufs=-37.0), -49.0
+        )
+
+    def test_gate_is_refused_when_there_is_no_room_for_it(self):
+        # ~8 dB SNR: floor+8 would land inside the speech and silence passages.
+        self.assertIsNone(
+            main.gate_threshold_db(noise_floor_db=-38.0, speech_lufs=-29.8)
+        )
+
+    def test_chain_omits_the_gate_on_a_noisy_recording(self):
+        noisy = self.analysis(noise_floor_db=-38.0, speech_lufs_median=-29.8)
+        quiet = self.analysis(noise_floor_db=-57.0, speech_lufs_median=-37.0)
+
+        noisy_chain = main.audio_chain_for(self.audio_args(), analysis=noisy)
+        quiet_chain = main.audio_chain_for(self.audio_args(), analysis=quiet)
+
+        self.assertNotIn("agate", [item.split("=")[0] for item in noisy_chain])
+        self.assertIn("agate", [item.split("=")[0] for item in quiet_chain])
+
+    def test_denoise_loss_is_the_difference_in_speech_level(self):
+        check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-48.6)
+
+        self.assertAlmostEqual(check.loss_db, 26.6)
+
+    def test_a_destructive_denoiser_is_replaced(self):
+        args = self.audio_args(denoise="arnndn", arnndn_model="/model.rnnn")
+        check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-48.6)
+
+        with unittest.mock.patch.object(
+            main, "measure_denoise_effect", lambda *a, **k: check
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                main.enforce_denoise_sanity(
+                    main.Path("in.mp4"), args=args, analysis=self.analysis()
+                )
+
+        self.assertEqual(args.denoise, "afftdn")
+
+    def test_a_harmless_denoiser_is_kept(self):
+        args = self.audio_args(denoise="arnndn", arnndn_model="/model.rnnn")
+        check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-23.1)
+
+        with unittest.mock.patch.object(
+            main, "measure_denoise_effect", lambda *a, **k: check
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                main.enforce_denoise_sanity(
+                    main.Path("in.mp4"), args=args, analysis=self.analysis()
+                )
+
+        self.assertEqual(args.denoise, "arnndn")
+
+    def test_a_destructive_afftdn_falls_back_to_no_denoise(self):
+        args = self.audio_args(denoise="afftdn")
+        check = main.DenoiseCheck("afftdn", speech_before=-22.0, speech_after=-40.0)
+
+        with unittest.mock.patch.object(
+            main, "measure_denoise_effect", lambda *a, **k: check
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                main.enforce_denoise_sanity(
+                    main.Path("in.mp4"), args=args, analysis=self.analysis()
+                )
+
+        self.assertEqual(args.denoise, "none")
+
+    def test_the_loss_check_can_be_switched_off(self):
+        args = self.audio_args(denoise="arnndn", denoise_loss_limit=0.0)
+
+        def explode(*a, **k):
+            raise AssertionError("the check must not run when disabled")
+
+        with unittest.mock.patch.object(main, "measure_denoise_effect", explode):
+            main.enforce_denoise_sanity(
+                main.Path("in.mp4"), args=args, analysis=self.analysis()
+            )
+
+        self.assertEqual(args.denoise, "arnndn")
 
     def test_percentile_interpolates(self):
         self.assertEqual(main.percentile([1.0], 0.5), 1.0)

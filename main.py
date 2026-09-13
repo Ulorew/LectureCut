@@ -245,7 +245,17 @@ ARNNDN_MODEL_SUFFIX = ".rnnn"
 # hunt for it. Digests are pinned: a download that does not match is discarded.
 ARNNDN_MODEL_BASE_URL = "https://raw.githubusercontent.com/GregorR/rnnoise-models/master"
 ARNNDN_MODEL_MAX_BYTES = 2 * 1024 * 1024
-ARNNDN_DEFAULT_MODEL = "sh"
+# Chosen by measurement rather than by the upstream table. Across two lectures
+# lq gave the best or near-best SNR improvement while taking the least speech
+# with it; sh, which the table nominates for speech-in-a-room, was the only
+# model ever to remove more than 20 dB of speech (26.6 dB on one passage).
+ARNNDN_DEFAULT_MODEL = "lq"
+# A denoiser that quietens speech this much is destroying it, not cleaning it.
+DENOISE_LOSS_LIMIT_DB = 6.0
+# The gate must sit below the quietest speech worth keeping, not just above the
+# noise; with a poor SNR there is no such gap and gating is simply wrong.
+GATE_SPEECH_MARGIN_DB = 12.0
+GATE_FLOOR_MARGIN_DB = 2.0
 
 
 @dataclass(frozen=True)
@@ -589,6 +599,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=non_negative_float,
         default=85.0,
         help="High-pass cutoff in Hz that removes rumble before gain; 0 disables",
+    )
+    audio_group.add_argument(
+        "--denoise-loss-limit",
+        type=float,
+        default=DENOISE_LOSS_LIMIT_DB,
+        help=(
+            "Fall back to a predictable denoiser if the chosen one quietens speech "
+            "by more than this many dB; 0 disables the check"
+        ),
     )
     audio_group.add_argument(
         "--no-gate",
@@ -1758,8 +1777,27 @@ def resolve_output_path(path: Path, args: argparse.Namespace) -> Path:
     return fresh
 
 
-def gate_filter(*, noise_floor_db: float) -> str:
-    threshold = clamp(db_to_linear(noise_floor_db + 8.0), 0.0005, 0.05)
+def gate_threshold_db(*, noise_floor_db: float, speech_lufs: float) -> float | None:
+    """Where to gate, or None when gating would cut into the speech.
+
+    Sitting a fixed distance above the noise floor is only safe when the speech
+    is well clear of it. On a recording with an SNR of about 10 dB that rule put
+    the gate inside the speech, which silenced whole passages.
+    """
+
+    threshold = min(noise_floor_db + 8.0, speech_lufs - GATE_SPEECH_MARGIN_DB)
+    if threshold <= noise_floor_db + GATE_FLOOR_MARGIN_DB:
+        return None
+    return threshold
+
+
+def gate_filter(*, noise_floor_db: float, speech_lufs: float) -> str | None:
+    threshold_db = gate_threshold_db(
+        noise_floor_db=noise_floor_db, speech_lufs=speech_lufs
+    )
+    if threshold_db is None:
+        return None
+    threshold = clamp(db_to_linear(threshold_db), 0.0005, 0.05)
     return f"agate=threshold={threshold:.5f}:range=0.06:ratio=2:attack=20:release=300"
 
 
@@ -1784,7 +1822,14 @@ def loudness_filters(
     peak = clamp(db_to_linear(args.true_peak - 0.5), 0.5, 0.99)
     if mode == "speechnorm":
         expansion = clamp(db_to_linear(deficit), 2.0, 50.0)
-        threshold = clamp(db_to_linear(noise_floor_db + 8.0), 0.0005, 0.05)
+        gate_db = gate_threshold_db(
+            noise_floor_db=noise_floor_db, speech_lufs=speech_lufs
+        )
+        threshold = clamp(
+            db_to_linear(gate_db if gate_db is not None else noise_floor_db),
+            0.0005,
+            0.05,
+        )
         return [
             f"speechnorm=p={peak:.3f}:e={expansion:.2f}:t={threshold:.5f}:r=0.0004:f=0.0002"
         ]
@@ -1852,7 +1897,9 @@ def audio_chain_for(
         )
     )
     if not args.no_gate:
-        filters.append(gate_filter(noise_floor_db=noise_floor_db))
+        gate = gate_filter(noise_floor_db=noise_floor_db, speech_lufs=speech_lufs)
+        if gate is not None:
+            filters.append(gate)
     plan = gain_plan or GainPlan()
     filters.extend(
         loudness_filters(
@@ -1900,6 +1947,88 @@ def measure_processed_loudness(
         if value is not None:
             measured.append(value)
     return combine_loudness(measured) if measured else None
+
+
+@dataclass(frozen=True)
+class DenoiseCheck:
+    """What the denoiser did to the speech, measured rather than assumed."""
+
+    mode: str
+    speech_before: float
+    speech_after: float
+
+    @property
+    def loss_db(self) -> float:
+        return self.speech_before - self.speech_after
+
+
+def measure_denoise_effect(
+    input_path: Path,
+    *,
+    args: argparse.Namespace,
+    analysis: AudioAnalysis,
+) -> DenoiseCheck | None:
+    """Compare the speech level with and without the denoiser.
+
+    A denoiser is a classifier, and classifiers are wrong sometimes: on one
+    lecture arnndn quietened plainly voiced, full-level speech by 26 dB. Cheap to
+    check, and the alternative is handing back a silent recording.
+    """
+
+    mode = resolved_denoise_mode(args)
+    if mode == "none":
+        return None
+    prefix = [f"highpass=f={args.highpass:g}"] if args.highpass > 0 else ["anull"]
+    denoise = denoise_filters(
+        args,
+        noise_floor_db=analysis.noise_floor_db,
+        snr_db=analysis.snr_db,
+    )
+    if not denoise:
+        return None
+
+    window = min(args.analysis_window, GAIN_CALIBRATION_WINDOW)
+    plain: list[float] = []
+    treated: list[float] = []
+    for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]:
+        for chain, sink in ((prefix, plain), (prefix + denoise, treated)):
+            log = run_audio_probe(
+                input_path,
+                start=args.start + start,
+                duration=window,
+                audio_filter=",".join([*chain, "ebur128"]),
+            )
+            value = first_match(EBUR128_I_RE, log)
+            if value is not None:
+                sink.append(value)
+    if not plain or not treated:
+        return None
+    return DenoiseCheck(mode, combine_loudness(plain), combine_loudness(treated))
+
+
+def enforce_denoise_sanity(
+    input_path: Path,
+    *,
+    args: argparse.Namespace,
+    analysis: AudioAnalysis | None,
+) -> None:
+    """Fall back to a predictable denoiser when the chosen one destroys speech."""
+
+    if analysis is None or args.denoise_loss_limit <= 0:
+        return
+    check = measure_denoise_effect(input_path, args=args, analysis=analysis)
+    if check is None:
+        return
+    report(f"Denoiser {check.mode} costs {check.loss_db:.1f} dB of speech")
+    if check.loss_db <= args.denoise_loss_limit:
+        return
+    fallback = "afftdn" if check.mode != "afftdn" else "none"
+    report(
+        f"  that is more than {args.denoise_loss_limit:g} dB, so it is removing "
+        f"speech rather than noise; using {fallback} instead",
+        error=True,
+    )
+    args.denoise = fallback
 
 
 def calibrate_gain(
@@ -1983,6 +2112,7 @@ def resolve_audio_settings(
     """Freeze the derived silence threshold and audio chain onto args."""
 
     start_phase(PHASE_CALIBRATE)
+    enforce_denoise_sanity(input_path, args=args, analysis=analysis)
     if str(args.silence_threshold).strip().lower() == "auto":
         calibrated = calibrate_silence_threshold(
             input_path, analysis=analysis, args=args

@@ -157,18 +157,36 @@ the signal a model expects against the noise it expects:
 
 | key | expects | noise | |
 | --- | --- | --- | --- |
-| `sh` | speech | recorded | default: a lecture is speech recorded in a room |
+| `lq` | voice | general | default, chosen by measurement — see below |
+| `sh` | speech | recorded | |
 | `bd` | voice, including laughter | recorded | |
 | `cb` | any audio | recorded | |
-| `lq` | voice | general | |
 | `mp` | any audio | general | |
 
-**On a very quiet source, `arnndn` is not automatically the better choice.**
-Measured against `afftdn` on the 85-minute lecture above: it leaves the noise
-floor about 9 dB lower, but it also thins out quiet speech, which widens the
-loudness range from ~7 LU to 20-25 LU and leaves the quietest passages several
-dB down. `afftdn` stays the default for a reason; try `arnndn` when the source
-is not fighting for headroom.
+The default is **not** the one the table nominates for a lecture. Measured
+across two recordings, `sh` took 3-27 dB of speech with it, while `lq` took
+1-8 dB and still gave the best or near-best improvement in signal-to-noise.
+A denoiser is a classifier, and this one is confidently wrong often enough that
+the table is not a safe guide.
+
+**`arnndn` is not automatically better than `afftdn`.** It cleans harder, but it
+decides what is speech, and when it decides wrong it removes the voice. On a
+very quiet source it also thins out quiet passages, widening the loudness range
+from ~7 LU to 20-25 LU. `afftdn` remains the default denoiser.
+
+## When a denoiser goes wrong
+
+Any denoiser can mistake speech for noise. Before the run, the pipeline measures
+the speech level with and without the denoiser on the sampled windows; if the
+denoiser costs more than `--denoise-loss-limit` dB (6 by default), it is removing
+speech rather than noise and the run falls back to `afftdn` — or to no denoise if
+`afftdn` was the culprit. `--denoise-loss-limit 0` turns the check off.
+
+The noise gate is subject to the same reasoning. Sitting a fixed distance above
+the noise floor is only safe when the speech is well clear of it: on a recording
+with ~10 dB of signal-to-noise that rule put the gate *inside* the speech and
+silenced whole passages. The gate now also has to sit 12 dB below the speech
+level, and is dropped entirely when no such gap exists.
 
 ## Repeating a run
 
