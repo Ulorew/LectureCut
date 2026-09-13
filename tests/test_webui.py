@@ -60,6 +60,32 @@ class WebUITests(unittest.TestCase):
         self.assertNotIn("notes.txt", names)
         self.assertNotIn("secret.mp4", names)
 
+    def test_listing_marks_processed_files(self):
+        (self.root / "already_lecturecut.mp4").write_bytes(b"x")
+        files = {entry["name"]: entry for entry in self.client.get("/api/files").json()["files"]}
+
+        self.assertTrue(files["already_lecturecut.mp4"]["processed"])
+        self.assertFalse(files["lecture.mp4"]["processed"])
+
+    def test_processed_index_caches_by_size_and_mtime(self):
+        calls = []
+
+        def counting(path):
+            calls.append(path)
+            return False
+
+        index = webui.ProcessedIndex()
+        with unittest.mock.patch.object(webui.core, "is_already_processed", counting):
+            index.flags([self.root / "lecture.mp4"])
+            index.flags([self.root / "lecture.mp4"])
+            self.assertEqual(len(calls), 1)
+
+            # Re-rendering the file changes its size, which must invalidate.
+            (self.root / "lecture.mp4").write_bytes(b"a different length entirely")
+            index.flags([self.root / "lecture.mp4"])
+
+        self.assertEqual(len(calls), 2)
+
     def test_paths_outside_the_roots_are_refused(self):
         response = self.client.get(
             "/api/probe", params={"path": str(self.outside / "secret.mp4")}
@@ -261,6 +287,47 @@ class QueueTests(unittest.TestCase):
     def tearDown(self):
         self.client.close()
         self.temp.cleanup()
+
+    def test_output_dir_lets_the_core_name_each_file(self):
+        response = self.client.post(
+            "/api/jobs",
+            json={
+                "source": str(self.root / "a.mp4"),
+                "settings": {},
+                "output_dir": str(self.root),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        job = self.client.get(f"/api/jobs/{response.json()['id']}").json()
+        self.assertEqual(
+            job["settings"]["output"], str(self.root / "a_lecturecut.mp4")
+        )
+
+    def test_output_dir_is_refused_outside_the_roots(self):
+        response = self.client.post(
+            "/api/jobs",
+            json={
+                "source": str(self.root / "a.mp4"),
+                "settings": {},
+                "output_dir": "/etc",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_explicit_output_wins_over_the_folder(self):
+        response = self.client.post(
+            "/api/jobs",
+            json={
+                "source": str(self.root / "a.mp4"),
+                "settings": {"output": str(self.root / "chosen.mp4")},
+                "output_dir": str(self.root),
+            },
+        )
+        job = self.client.get(f"/api/jobs/{response.json()['id']}").json()
+
+        self.assertEqual(job["settings"]["output"], str(self.root / "chosen.mp4"))
 
     def test_multiple_jobs_queue_up_and_are_all_listed(self):
         ids = []

@@ -10,6 +10,7 @@ set of defaults and one validator for both entry points.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextvars
 import json
 import queue
@@ -46,6 +47,9 @@ MEDIA_SUFFIXES = {
     ".flac",
 }
 UPLOAD_CHUNK = 1024 * 1024
+PROBE_WORKERS = 8
+# A listing should stay responsive even when pointed at a large archive.
+PROBE_LIMIT = 400
 EVENT_HISTORY_LIMIT = 2000
 SSE_KEEPALIVE_SECONDS = 15.0
 
@@ -84,6 +88,7 @@ class Job:
             "id": self.id,
             "kind": self.kind,
             "source": self.source,
+            "settings": self.settings,
             "status": self.status,
             "phase": self.phase,
             "overall": self.overall,
@@ -309,7 +314,52 @@ def resolve_within_roots(raw: str, config: Config) -> Path:
     raise HTTPException(status_code=403, detail=f"Path is outside the allowed roots: {raw}")
 
 
-def list_media(config: Config) -> list[dict[str, Any]]:
+class ProcessedIndex:
+    """Remembers which files already carry a LectureCut tag.
+
+    Reading the tag costs an ffprobe call - around 30 ms - which is nothing once,
+    and far too much on every listing of a full archive. Results are keyed by
+    path, size and mtime, so a re-render invalidates its own entry.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, int, float], bool] = {}
+        self._lock = threading.Lock()
+
+    def flags(self, paths: list[Path]) -> dict[str, bool]:
+        keys: dict[str, tuple[str, int, float]] = {}
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            keys[str(path)] = (str(path), stat.st_size, stat.st_mtime)
+
+        with self._lock:
+            unknown = [
+                (path, key)
+                for path, key in keys.items()
+                if key not in self._cache
+            ][:PROBE_LIMIT]
+
+        if unknown:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=PROBE_WORKERS
+            ) as pool:
+                results = list(
+                    pool.map(
+                        lambda item: core.is_already_processed(Path(item[0])), unknown
+                    )
+                )
+            with self._lock:
+                for (_, key), value in zip(unknown, results):
+                    self._cache[key] = value
+
+        with self._lock:
+            return {path: self._cache.get(key, False) for path, key in keys.items()}
+
+
+def list_media(config: Config, index: ProcessedIndex | None = None) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for root in config.roots:
         if not root.exists():
@@ -328,6 +378,10 @@ def list_media(config: Config) -> list[dict[str, Any]]:
                     "mtime": stat.st_mtime,
                 }
             )
+    if index is not None:
+        flags = index.flags([Path(entry["path"]) for entry in entries])
+        for entry in entries:
+            entry["processed"] = flags.get(entry["path"], False)
     entries.sort(key=lambda entry: entry["mtime"], reverse=True)
     return entries
 
@@ -335,8 +389,10 @@ def list_media(config: Config) -> list[dict[str, Any]]:
 def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     app = FastAPI(title="LectureCut", docs_url=None, redoc_url=None)
     manager = jobs or JobManager()
+    processed = ProcessedIndex()
     app.state.config = config
     app.state.jobs = manager
+    app.state.processed = processed
 
     @app.get("/api/schema")
     def schema() -> dict[str, Any]:
@@ -349,7 +405,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
 
     @app.get("/api/files")
     def files() -> dict[str, Any]:
-        return {"files": list_media(config)}
+        return {"files": list_media(config, processed)}
 
     @app.get("/api/probe")
     def probe(path: str = Query(...)) -> dict[str, Any]:
@@ -441,6 +497,11 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             destination = Path(str(output)).expanduser()
             parent = resolve_within_roots(str(destination.parent), config)
             settings["output"] = str(parent / destination.name)
+        elif payload.get("output_dir"):
+            # Batches cannot share one file name, so the folder is chosen and the
+            # name is left to the core - keeping that rule in one place.
+            folder = resolve_within_roots(str(payload["output_dir"]), config)
+            settings["output"] = str(folder / core.default_output_path(str(source)).name)
 
         try:
             argv = core.settings_to_argv(str(source), settings)
