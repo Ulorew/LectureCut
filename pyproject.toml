@@ -5,8 +5,13 @@ description = "Python + FFmpeg lecture cleanup pipeline"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Only the web UI needs these; the CLI stays dependency-free.
+web = ["fastapi>=0.110", "uvicorn>=0.27"]
+
 [project.scripts]
 lecturecut = "main:main"
+lecturecut-web = "webui:serve"
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "webui"]

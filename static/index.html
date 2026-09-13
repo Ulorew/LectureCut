@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LectureCut</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>LectureCut</h1>
+  <p id="roots" class="muted"></p>
+</header>
+
+<main>
+  <section class="panel" id="source-panel">
+    <h2>Источник</h2>
+    <div id="dropzone" class="dropzone">
+      Перетащите файл сюда или выберите из списка
+      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди доступных папок</span>
+    </div>
+    <input type="search" id="file-filter" placeholder="Фильтр по имени">
+    <ul id="file-list" class="file-list"></ul>
+    <div id="selected" class="selected hidden">
+      <strong id="selected-name"></strong>
+      <span id="selected-meta" class="muted small"></span>
+    </div>
+  </section>
+
+  <section class="panel" id="settings-panel">
+    <h2>Настройки</h2>
+    <div class="grid" id="basic-settings">
+      <label>Скорость
+        <input type="number" id="set-speed" step="0.05" min="0.5">
+      </label>
+      <label>Целевая громкость, LUFS
+        <input type="number" id="set-target-lufs" step="0.5">
+      </label>
+      <label>Денойз
+        <select id="set-denoise"></select>
+      </label>
+      <label>Порог тишины
+        <span class="inline">
+          <input type="checkbox" id="set-silence-auto" checked>
+          <span class="small">авто</span>
+          <input type="text" id="set-silence-threshold" placeholder="-45dB" disabled>
+        </span>
+      </label>
+      <label>С секунды (необязательно)
+        <input type="number" id="set-start" step="1" min="0" placeholder="0">
+      </label>
+      <label>Длительность, с (необязательно)
+        <input type="number" id="set-limit" step="1" min="1" placeholder="весь файл">
+      </label>
+      <label class="inline-label">
+        <input type="checkbox" id="set-mono">
+        <span>Свести в моно</span>
+      </label>
+      <label class="wide">Выходной файл
+        <input type="text" id="set-output" placeholder="рядом с источником">
+      </label>
+    </div>
+
+    <details id="advanced">
+      <summary>Дополнительно</summary>
+      <div id="advanced-settings"></div>
+    </details>
+
+    <div class="actions">
+      <button id="convert" disabled>Конвертировать</button>
+      <button id="cancel" class="secondary hidden">Отмена</button>
+    </div>
+  </section>
+
+  <section class="panel" id="run-panel">
+    <h2>Выполнение</h2>
+    <div class="progress-wrap">
+      <div class="progress"><div id="bar"></div></div>
+      <div class="progress-meta">
+        <span id="phase">—</span>
+        <span id="percent" class="muted"></span>
+      </div>
+    </div>
+    <div id="analysis" class="analysis hidden"></div>
+    <div id="result" class="result hidden"></div>
+    <pre id="log" class="log"></pre>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
