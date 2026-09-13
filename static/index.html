@@ -56,8 +56,14 @@
         <input type="checkbox" id="set-mono">
         <span>Свести в моно</span>
       </label>
-      <label class="wide">Выходной файл
-        <input type="text" id="set-output" placeholder="рядом с источником">
+      <label class="wide">Папка результата
+        <span class="inline">
+          <select id="set-output-dir"></select>
+          <button type="button" id="open-output-dir" class="secondary tiny" title="Открыть папку">Открыть</button>
+        </span>
+      </label>
+      <label class="wide">Имя файла
+        <input type="text" id="set-output-name" placeholder="как у источника">
       </label>
     </div>
 
@@ -68,22 +74,27 @@
 
     <div class="actions">
       <button id="convert" disabled>Конвертировать</button>
-      <button id="cancel" class="secondary hidden">Отмена</button>
+      <span class="muted small" id="queue-hint">можно ставить несколько подряд — они выполнятся по очереди</span>
     </div>
   </section>
 
   <section class="panel" id="run-panel">
-    <h2>Выполнение</h2>
-    <div class="progress-wrap">
-      <div class="progress"><div id="bar"></div></div>
-      <div class="progress-meta">
-        <span id="phase">—</span>
-        <span id="percent" class="muted"></span>
+    <h2>Очередь</h2>
+    <ul id="job-list" class="job-list"></ul>
+
+    <div id="watch" class="hidden">
+      <h2 class="spaced">Ход выполнения</h2>
+      <div class="progress-wrap">
+        <div class="progress"><div id="bar"></div></div>
+        <div class="progress-meta">
+          <span id="phase">—</span>
+          <span id="percent" class="muted"></span>
+        </div>
       </div>
+      <div id="analysis" class="analysis hidden"></div>
+      <div id="result" class="result hidden"></div>
+      <pre id="log" class="log"></pre>
     </div>
-    <div id="analysis" class="analysis hidden"></div>
-    <div id="result" class="result hidden"></div>
-    <pre id="log" class="log"></pre>
   </section>
 </main>
 

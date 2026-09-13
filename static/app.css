@@ -173,3 +173,65 @@ button.secondary { background: var(--panel-2); color: var(--text); border: 1px s
   word-break: break-word;
 }
 .log .err { color: var(--err); }
+
+/* --- job queue ------------------------------------------------------------ */
+
+h2.spaced { margin-top: 18px; }
+
+.job-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.job {
+  padding: 9px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.job.active { border-left-color: var(--accent); }
+.job.done { border-left-color: var(--ok); }
+.job.error, .job.cancelled { border-left-color: var(--err); }
+.job-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.job-head .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.running { background: rgba(90, 169, 230, .2); color: var(--accent); }
+.badge.done { background: rgba(107, 207, 127, .18); color: var(--ok); }
+.badge.error, .badge.cancelled { background: rgba(232, 115, 94, .18); color: var(--err); }
+
+.progress.mini { height: 4px; margin-top: 7px; }
+.progress.mini > div { height: 100%; background: var(--accent); transition: width .2s; }
+.progress.mini > div.done { background: var(--ok); }
+.progress.mini > div.error { background: var(--err); }
+
+.job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  empty-cells: hide;
+}
+.job-actions:empty { display: none; }
+
+button.tiny { padding: 3px 9px; font-size: 12px; font-weight: 500; }
+.tiny-link { font-size: 12px; color: var(--accent); text-decoration: none; }
+.tiny-link:hover { text-decoration: underline; }
+.err { color: var(--err); }
+
+#set-output-dir { min-width: 0; }

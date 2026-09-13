@@ -192,6 +192,17 @@ The form is generated from the CLI parser, so defaults, choices and help text
 come from one place and cannot drift: settings are turned back into argv and
 validated by the same `parse_args` the CLI uses.
 
+Runs queue up: press «Конвертировать» as many times as you like and they are
+drained one at a time, because a single render already saturates the encoder.
+Each row in the queue carries its own progress and can be cancelled on its own;
+clicking one shows its log. Finished runs offer «Открыть» and «Папка», which
+hand the file to this desktop's own handler - a browser cannot follow a
+`file://` link from an http page, and the server is on the same machine
+anyway - plus a plain download link. Pass `--no-open` to turn that off.
+
+The output folder is chosen from the same roots; leaving it on «рядом с
+источником» keeps the CLI's default of writing next to the input.
+
 ## Interrupting a run
 
 `Ctrl+C` stops the current ffmpeg and cleans up the partial file instead of

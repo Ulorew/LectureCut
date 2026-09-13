@@ -14,14 +14,27 @@ const BASIC_DESTS = new Set([
 ]);
 // The preview sweep is a separate flow, not part of this screen.
 const SKIPPED_GROUPS = new Set(["preview sweep"]);
+const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const JOB_POLL_MS = 1500;
+
+const STATUS_LABELS = {
+  queued: "в очереди",
+  running: "выполняется",
+  done: "готово",
+  error: "ошибка",
+  cancelled: "отменено",
+};
 
 const state = {
   schema: null,
   defaults: {},
   files: [],
+  dirs: [],
   selected: null,
-  jobId: null,
+  jobs: [],
+  watching: null,
   stream: null,
+  poller: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -61,6 +74,16 @@ function formatDuration(seconds) {
   return h > 0
     ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
     : `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function baseName(path) {
+  return String(path).split("/").pop();
+}
+
+function dirName(path) {
+  const parts = String(path).split("/");
+  parts.pop();
+  return parts.join("/") || "/";
 }
 
 // ---------------------------------------------------------------- settings form
@@ -128,7 +151,7 @@ function applyDefaults() {
   el("set-mono").checked = Boolean(d.mono);
   const denoise = el("set-denoise");
   denoise.textContent = "";
-  for (const choice of state.defaults.__denoise_choices || []) {
+  for (const choice of d.__denoise_choices || []) {
     const option = document.createElement("option");
     option.value = choice;
     option.textContent = choice;
@@ -139,6 +162,35 @@ function applyDefaults() {
   el("set-silence-auto").checked = auto;
   el("set-silence-threshold").disabled = auto;
   el("set-silence-threshold").value = auto ? "" : d.silence_threshold;
+}
+
+function renderDirs() {
+  const select = el("set-output-dir");
+  const previous = select.value;
+  select.textContent = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "рядом с источником";
+  select.appendChild(auto);
+  for (const dir of state.dirs) {
+    const option = document.createElement("option");
+    option.value = dir.path;
+    option.textContent = dir.label;
+    select.appendChild(option);
+  }
+  if (previous) select.value = previous;
+}
+
+function outputPath() {
+  const dir = el("set-output-dir").value;
+  const name = el("set-output-name").value.trim();
+  if (!dir && !name) return null;
+  const base =
+    name ||
+    (state.selected ? baseName(state.selected.defaultOutput || state.selected.name) : "");
+  if (!base) return null;
+  const folder = dir || (state.selected ? dirName(state.selected.path) : "");
+  return `${folder}/${base}`;
 }
 
 function collectSettings() {
@@ -163,7 +215,7 @@ function collectSettings() {
   if (start !== "") put("start", Number(start));
   const limit = el("set-limit").value;
   if (limit !== "") settings.limit = Number(limit);
-  const output = el("set-output").value.trim();
+  const output = outputPath();
   if (output) settings.output = output;
 
   for (const group of state.schema.groups) {
@@ -200,7 +252,9 @@ function renderFiles() {
   if (!matches.length) {
     const empty = document.createElement("li");
     empty.className = "muted";
-    empty.textContent = state.files.length ? "Ничего не найдено" : "В доступных папках нет медиафайлов";
+    empty.textContent = state.files.length
+      ? "Ничего не найдено"
+      : "В доступных папках нет медиафайлов";
     list.appendChild(empty);
     return;
   }
@@ -230,12 +284,13 @@ async function selectFile(file) {
   el("convert").disabled = false;
   try {
     const info = await api(`/api/probe?path=${encodeURIComponent(file.path)}`);
+    file.defaultOutput = info.default_output;
     const parts = [formatSize(file.size)];
     if (info.duration) parts.push(formatDuration(info.duration));
     if (!info.has_audio) parts.push("без аудио!");
     if (!info.has_video) parts.push("без видео!");
     el("selected-meta").textContent = `${parts.join(" · ")} · ${file.path}`;
-    el("set-output").placeholder = info.default_output;
+    el("set-output-name").placeholder = baseName(info.default_output);
   } catch (error) {
     el("selected-meta").textContent = `${formatSize(file.size)} · ${error.message}`;
   }
@@ -245,6 +300,12 @@ async function loadFiles() {
   const data = await api("/api/files");
   state.files = data.files;
   renderFiles();
+}
+
+async function loadDirs() {
+  const data = await api("/api/dirs");
+  state.dirs = data.dirs;
+  renderDirs();
 }
 
 async function handleDrop(fileHandle) {
@@ -260,17 +321,145 @@ async function handleDrop(fileHandle) {
     return;
   }
   appendLog(`Файл ${fileHandle.name} вне доступных папок, загружаю...`);
-  const uploaded = await api(
-    `/api/upload?name=${encodeURIComponent(fileHandle.name)}`,
-    { method: "POST", body: fileHandle }
-  );
+  const uploaded = await api(`/api/upload?name=${encodeURIComponent(fileHandle.name)}`, {
+    method: "POST",
+    body: fileHandle,
+  });
   appendLog(`Загружено: ${uploaded.path}`);
   await loadFiles();
   const match2 = state.files.find((file) => file.path === uploaded.path);
   if (match2) await selectFile(match2);
 }
 
-// ------------------------------------------------------------------------- run
+// ----------------------------------------------------------------- job queue
+
+function statusLabel(status) {
+  return STATUS_LABELS[status] || status;
+}
+
+function renderJobs() {
+  const list = el("job-list");
+  list.textContent = "";
+  if (!state.jobs.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "Очередь пуста";
+    list.appendChild(empty);
+    return;
+  }
+  for (const job of state.jobs) {
+    const item = document.createElement("li");
+    item.className = `job ${job.status}`;
+    if (job.id === state.watching) item.classList.add("active");
+
+    const head = document.createElement("div");
+    head.className = "job-head";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = baseName(job.source);
+    name.title = job.source;
+    const badge = document.createElement("span");
+    badge.className = `badge ${job.status}`;
+    badge.textContent = statusLabel(job.status);
+    head.append(name, badge);
+    item.appendChild(head);
+
+    const bar = document.createElement("div");
+    bar.className = "progress mini";
+    const fill = document.createElement("div");
+    fill.style.width = `${Math.round((job.overall || 0) * 100)}%`;
+    if (job.status === "done") fill.classList.add("done");
+    if (job.status === "error" || job.status === "cancelled") fill.classList.add("error");
+    bar.appendChild(fill);
+    item.appendChild(bar);
+
+    const actions = document.createElement("div");
+    actions.className = "job-actions";
+    if (ACTIVE_STATUSES.has(job.status)) {
+      actions.appendChild(
+        button("Отмена", "secondary tiny", async (event) => {
+          event.stopPropagation();
+          await api(`/api/jobs/${job.id}/cancel`, { method: "POST" });
+          await refreshJobs();
+        })
+      );
+    }
+    if (job.status === "done" && job.result && job.result.output) {
+      const output = job.result.output;
+      if (state.schema.allow_open) {
+        actions.appendChild(
+          button("Открыть", "tiny", (event) => {
+            event.stopPropagation();
+            openPath(output, false);
+          })
+        );
+        actions.appendChild(
+          button("Папка", "secondary tiny", (event) => {
+            event.stopPropagation();
+            openPath(output, true);
+          })
+        );
+      }
+      const link = document.createElement("a");
+      link.className = "tiny-link";
+      link.href = `/api/file?path=${encodeURIComponent(output)}`;
+      link.textContent = "Скачать";
+      link.addEventListener("click", (event) => event.stopPropagation());
+      actions.appendChild(link);
+    }
+    if (job.status === "error" && job.error) {
+      const why = document.createElement("span");
+      why.className = "small err";
+      why.textContent = job.error;
+      actions.appendChild(why);
+    }
+    item.appendChild(actions);
+
+    item.addEventListener("click", () => watchJob(job.id));
+    list.appendChild(item);
+  }
+}
+
+function button(text, className, handler) {
+  const node = document.createElement("button");
+  node.type = "button";
+  node.className = className;
+  node.textContent = text;
+  node.addEventListener("click", handler);
+  return node;
+}
+
+async function openPath(path, reveal) {
+  try {
+    await api("/api/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, reveal }),
+    });
+  } catch (error) {
+    appendLog(`Не удалось открыть: ${error.message}`, true);
+  }
+}
+
+async function refreshJobs() {
+  try {
+    const data = await api("/api/jobs");
+    state.jobs = data.jobs;
+    renderJobs();
+    // Results land in folders the picker may not have listed yet.
+    if (state.jobs.some((job) => job.status === "done")) {
+      const known = new Set(state.files.map((file) => file.path));
+      const fresh = state.jobs.some(
+        (job) => job.result && job.result.output && !known.has(job.result.output)
+      );
+      if (fresh) await loadFiles();
+    }
+  } catch (error) {
+    /* the poller keeps trying */
+  }
+}
+
+// --------------------------------------------------------------- watched job
 
 function appendLog(text, isError) {
   const log = el("log");
@@ -292,10 +481,16 @@ function renderAnalysis(fields) {
   box.classList.remove("hidden");
   box.textContent = "";
   const rows = [
-    ["Речь", `${fields.speech_lufs_median.toFixed(1)} LUFS (тихие места ${fields.speech_lufs.toFixed(1)})`],
+    [
+      "Речь",
+      `${fields.speech_lufs_median.toFixed(1)} LUFS (тихие места ${fields.speech_lufs.toFixed(1)})`,
+    ],
     ["Шумовой пол", `${fields.noise_floor_db.toFixed(1)} дБ, SNR ${fields.snr_db.toFixed(1)} дБ`],
     ["Пик", `${fields.true_peak_db.toFixed(1)} dBFS, запас ${fields.headroom_db.toFixed(1)} дБ`],
-    ["Динамика", `LRA до ${fields.lra.toFixed(1)} LU, каналы ${fields.channel_imbalance_db.toFixed(1)} дБ`],
+    [
+      "Динамика",
+      `LRA до ${fields.lra.toFixed(1)} LU, каналы ${fields.channel_imbalance_db.toFixed(1)} дБ`,
+    ],
   ];
   for (const [label, value] of rows) {
     const row = document.createElement("div");
@@ -323,33 +518,21 @@ function renderResult(fields) {
   ].join("\n");
 }
 
-function finishRun(status, message) {
-  el("cancel").classList.add("hidden");
-  el("convert").disabled = !state.selected;
-  el("phase").textContent =
-    status === "done" ? "Готово" : status === "cancelled" ? "Отменено" : "Ошибка";
-  const bar = el("bar");
-  bar.classList.remove("done", "error");
-  if (status === "done") {
-    bar.classList.add("done");
-    setProgress(1);
-  } else if (status === "error") {
-    bar.classList.add("error");
-  }
-  if (message) {
-    const box = el("result");
-    box.classList.remove("hidden");
-    box.className = `result ${status === "done" ? "ok" : "err"}`;
-    box.textContent = message;
-  }
+function watchJob(jobId) {
   if (state.stream) {
     state.stream.close();
     state.stream = null;
   }
-}
+  state.watching = jobId;
+  el("watch").classList.remove("hidden");
+  el("log").textContent = "";
+  el("analysis").classList.add("hidden");
+  el("result").classList.add("hidden");
+  el("bar").className = "";
+  setProgress(0);
+  el("phase").textContent = "—";
+  renderJobs();
 
-function listen(jobId) {
-  if (state.stream) state.stream.close();
   const stream = new EventSource(`/api/jobs/${jobId}/events`);
   state.stream = stream;
   stream.onmessage = (message) => {
@@ -372,16 +555,25 @@ function listen(jobId) {
         renderResult(event);
         break;
       case "status":
-        if (event.status === "done") finishRun("done");
-        else if (event.status === "cancelled") finishRun("cancelled", "Задача отменена");
-        else if (event.status === "error") finishRun("error");
+        if (event.status === "done") {
+          el("phase").textContent = "Готово";
+          el("bar").className = "done";
+          setProgress(1);
+        } else if (event.status === "cancelled") {
+          el("phase").textContent = "Отменено";
+          el("bar").className = "error";
+        } else if (event.status === "error") {
+          el("phase").textContent = "Ошибка";
+          el("bar").className = "error";
+        }
+        refreshJobs();
         break;
       default:
         break;
     }
   };
   stream.onerror = () => {
-    // The server closes the stream when the job ends; that is not a failure.
+    // The server closes the stream once a job is finished; not a failure.
     stream.close();
     if (state.stream === stream) state.stream = null;
   };
@@ -389,38 +581,22 @@ function listen(jobId) {
 
 async function convert() {
   if (!state.selected) return;
-  el("log").textContent = "";
-  el("analysis").classList.add("hidden");
-  el("result").classList.add("hidden");
-  el("bar").classList.remove("done", "error");
-  setProgress(0);
-  el("phase").textContent = "В очереди";
-  el("convert").disabled = true;
-  el("cancel").classList.remove("hidden");
-
+  const button = el("convert");
+  button.disabled = true;
   try {
     const job = await api("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source: state.selected.path, settings: collectSettings() }),
     });
-    state.jobId = job.id;
-    listen(job.id);
+    await refreshJobs();
+    watchJob(job.id);
   } catch (error) {
-    appendLog(error.message, true);
-    finishRun("error", error.message);
-  }
-}
-
-async function cancel() {
-  if (!state.jobId) return;
-  el("cancel").disabled = true;
-  try {
-    await api(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
-  } catch (error) {
+    el("watch").classList.remove("hidden");
     appendLog(error.message, true);
   } finally {
-    el("cancel").disabled = false;
+    // Queueing more runs is the point: the button comes straight back.
+    button.disabled = !state.selected;
   }
 }
 
@@ -437,14 +613,20 @@ async function init() {
   }
   applyDefaults();
   buildAdvanced();
-  await loadFiles();
+  await Promise.all([loadFiles(), loadDirs()]);
+  await refreshJobs();
 
   el("file-filter").addEventListener("input", renderFiles);
   el("convert").addEventListener("click", convert);
-  el("cancel").addEventListener("click", cancel);
   el("set-silence-auto").addEventListener("change", (event) => {
     el("set-silence-threshold").disabled = event.target.checked;
   });
+  el("open-output-dir").addEventListener("click", () => {
+    const dir = el("set-output-dir").value;
+    const target = dir || (state.selected ? dirName(state.selected.path) : "");
+    if (target) openPath(target, false);
+  });
+  if (!state.schema.allow_open) el("open-output-dir").classList.add("hidden");
 
   const zone = el("dropzone");
   zone.addEventListener("click", () => el("file-filter").focus());
@@ -464,11 +646,14 @@ async function init() {
     try {
       await handleDrop(file);
     } catch (error) {
+      el("watch").classList.remove("hidden");
       appendLog(error.message, true);
     }
   });
   window.addEventListener("dragover", (event) => event.preventDefault());
   window.addEventListener("drop", (event) => event.preventDefault());
+
+  state.poller = setInterval(refreshJobs, JOB_POLL_MS);
 }
 
 init().catch((error) => {

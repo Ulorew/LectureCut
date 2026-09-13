@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 try:
@@ -137,6 +138,161 @@ class WebUITests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class OutputAndOpenTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "media"
+        (self.root / "done").mkdir(parents=True)
+        (self.root / ".hidden").mkdir()
+        (self.root / "done" / "out.mp4").write_bytes(b"rendered")
+        self.outside = Path(self.temp.name) / "outside"
+        self.outside.mkdir()
+        (self.outside / "other.mp4").write_bytes(b"nope")
+        self.config = webui.Config(
+            roots=[self.root.resolve()],
+            upload_dir=(Path(self.temp.name) / "uploads").resolve(),
+        )
+        self.client = TestClient(webui.create_app(self.config))
+        self.opened = []
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def fake_popen(self, command, **kwargs):
+        self.opened.append(command)
+
+        class Handle:
+            pass
+
+        return Handle()
+
+    def test_dirs_offers_roots_and_their_subfolders(self):
+        dirs = self.client.get("/api/dirs").json()["dirs"]
+        paths = [entry["path"] for entry in dirs]
+
+        self.assertEqual(paths[0], str(self.root.resolve()))
+        self.assertTrue(dirs[0]["is_root"])
+        self.assertIn(str((self.root / "done").resolve()), paths)
+        self.assertFalse(any(".hidden" in path for path in paths))
+
+    def test_open_hands_the_file_to_the_desktop(self):
+        with unittest.mock.patch.object(webui.subprocess, "Popen", self.fake_popen):
+            response = self.client.post(
+                "/api/open", json={"path": str(self.root / "done" / "out.mp4")}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.opened), 1)
+        self.assertIn(str(self.root / "done" / "out.mp4"), self.opened[0][-1])
+
+    def test_open_can_reveal_the_containing_folder(self):
+        with unittest.mock.patch.object(webui.subprocess, "Popen", self.fake_popen):
+            self.client.post(
+                "/api/open",
+                json={"path": str(self.root / "done" / "out.mp4"), "reveal": True},
+            )
+
+        self.assertEqual(self.opened[0][-1], str((self.root / "done").resolve()))
+
+    def test_open_refuses_paths_outside_the_roots(self):
+        with unittest.mock.patch.object(webui.subprocess, "Popen", self.fake_popen):
+            response = self.client.post(
+                "/api/open", json={"path": str(self.outside / "other.mp4")}
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.opened, [])
+
+    def test_open_can_be_disabled(self):
+        self.config.allow_open = False
+        with unittest.mock.patch.object(webui.subprocess, "Popen", self.fake_popen):
+            response = self.client.post(
+                "/api/open", json={"path": str(self.root / "done" / "out.mp4")}
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.opened, [])
+
+    def test_schema_advertises_whether_opening_is_allowed(self):
+        self.assertTrue(self.client.get("/api/schema").json()["allow_open"])
+
+    def test_download_serves_a_result(self):
+        response = self.client.get(
+            "/api/file", params={"path": str(self.root / "done" / "out.mp4")}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"rendered")
+
+    def test_download_refuses_paths_outside_the_roots(self):
+        response = self.client.get(
+            "/api/file", params={"path": str(self.outside / "other.mp4")}
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_desktop_open_command_per_platform(self):
+        with unittest.mock.patch.object(webui.sys, "platform", "linux"):
+            self.assertEqual(webui.desktop_open_command(Path("/x"))[0], "xdg-open")
+        with unittest.mock.patch.object(webui.sys, "platform", "darwin"):
+            self.assertEqual(webui.desktop_open_command(Path("/x"))[0], "open")
+        with unittest.mock.patch.object(webui.sys, "platform", "win32"):
+            self.assertEqual(webui.desktop_open_command(Path("/x"))[0], "explorer")
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class QueueTests(unittest.TestCase):
+    """Several runs may be queued; one worker drains them in order."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        for name in ("a.mp4", "b.mp4", "c.mp4"):
+            (self.root / name).write_bytes(b"x")
+        self.config = webui.Config(
+            roots=[self.root.resolve()], upload_dir=(self.root / "up").resolve()
+        )
+        self.client = TestClient(webui.create_app(self.config))
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def test_multiple_jobs_queue_up_and_are_all_listed(self):
+        ids = []
+        for name in ("a.mp4", "b.mp4", "c.mp4"):
+            response = self.client.post(
+                "/api/jobs", json={"source": str(self.root / name), "settings": {}}
+            )
+            self.assertEqual(response.status_code, 200)
+            ids.append(response.json()["id"])
+
+        listed = self.client.get("/api/jobs").json()["jobs"]
+        self.assertEqual(len(listed), 3)
+        # newest first, so the listing is the reverse of submission order
+        self.assertEqual([job["id"] for job in listed], list(reversed(ids)))
+        self.assertEqual(len(set(ids)), 3)
+
+    def test_events_stream_closes_for_a_finished_job(self):
+        job_id = self.client.post(
+            "/api/jobs", json={"source": str(self.root / "a.mp4"), "settings": {}}
+        ).json()["id"]
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status = self.client.get(f"/api/jobs/{job_id}").json()["status"]
+            if status in {"done", "error", "cancelled"}:
+                break
+            time.sleep(0.05)
+
+        # Without an explicit close this request would hang on keepalives.
+        with self.client.stream("GET", f"/api/jobs/{job_id}/events") as response:
+            body = "".join(response.iter_text())
+
+        self.assertIn("status", body)
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")

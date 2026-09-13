@@ -14,6 +14,8 @@ import contextvars
 import json
 import queue
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import main as core
@@ -252,6 +254,42 @@ class Config:
     roots: list[Path]
     upload_dir: Path
     allow_upload: bool = True
+    allow_open: bool = True
+
+
+def desktop_open_command(target: Path) -> list[str]:
+    """The platform's 'open this with whatever handles it' command."""
+
+    if sys.platform == "darwin":
+        return ["open", str(target)]
+    if sys.platform.startswith("win"):
+        return ["explorer", str(target)]
+    return ["xdg-open", str(target)]
+
+
+def list_directories(config: Config) -> list[dict[str, Any]]:
+    """Candidate output folders: every root plus the directories inside them."""
+
+    entries: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for root in config.roots:
+        if not root.exists():
+            continue
+        candidates = [root, *(path for path in root.rglob("*") if path.is_dir())]
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved in seen or any(part.startswith(".") for part in resolved.parts):
+                continue
+            seen.add(resolved)
+            entries.append(
+                {
+                    "path": str(resolved),
+                    "label": str(resolved),
+                    "is_root": resolved == root,
+                }
+            )
+    entries.sort(key=lambda entry: (not entry["is_root"], entry["path"]))
+    return entries
 
 
 def resolve_within_roots(raw: str, config: Config) -> Path:
@@ -306,6 +344,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "groups": core.parser_schema(),
             "roots": [str(root) for root in config.roots],
             "allow_upload": config.allow_upload,
+            "allow_open": config.allow_open,
         }
 
     @app.get("/api/files")
@@ -350,6 +389,40 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
                 handle.write(chunk)
                 written += len(chunk)
         return {"path": str(target), "name": safe_name, "size": written}
+
+    @app.get("/api/dirs")
+    def dirs() -> dict[str, Any]:
+        return {"dirs": list_directories(config)}
+
+    @app.post("/api/open")
+    def open_path(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """Hand a finished file to the desktop.
+
+        The browser cannot follow a file:// link from an http page, and this
+        server runs on the same machine as the person using it, so opening it
+        here is the shortest honest path to "show me the result".
+        """
+
+        if not config.allow_open:
+            raise HTTPException(status_code=403, detail="Opening files is disabled")
+        target = resolve_within_roots(str(payload.get("path") or ""), config)
+        if payload.get("reveal"):
+            target = target.parent
+        try:
+            subprocess.Popen(
+                desktop_open_command(target),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from None
+        return {"opened": str(target)}
+
+    @app.get("/api/file")
+    def download(path: str = Query(...)) -> FileResponse:
+        resolved = resolve_within_roots(path, config)
+        return FileResponse(str(resolved), filename=resolved.name)
 
     @app.get("/api/jobs")
     def job_list() -> dict[str, Any]:
@@ -400,8 +473,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             try:
                 for event in history:
                     yield sse(event)
-                if job.status in terminal and not job.subscribers:
-                    yield sse({"type": "status", "status": job.status})
+                # A finished job has nothing more to send: replay its history and
+                # close, or the browser holds an open connection per job viewed.
+                if job.status in terminal:
                     return
                 while True:
                     try:
@@ -461,6 +535,11 @@ def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Refuse browser uploads and only serve files from the roots",
     )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not let the page open finished files on this desktop",
+    )
     return parser.parse_args(argv)
 
 
@@ -480,7 +559,12 @@ def build_config(args: argparse.Namespace) -> Config:
     # Uploads must be selectable afterwards, so their directory is a root too.
     if upload_dir not in roots:
         roots.append(upload_dir)
-    return Config(roots=roots, upload_dir=upload_dir, allow_upload=not args.no_upload)
+    return Config(
+        roots=roots,
+        upload_dir=upload_dir,
+        allow_upload=not args.no_upload,
+        allow_open=not args.no_open,
+    )
 
 
 def serve(argv: list[str] | None = None) -> int:
