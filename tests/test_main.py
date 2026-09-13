@@ -133,6 +133,37 @@ class LectureCutTests(unittest.TestCase):
         self.assertEqual(args.preview_thresholds, "-45dB")
         self.assertEqual(args.preview_denoise, "auto")
 
+    def test_default_output_name_uses_an_underscore_suffix(self):
+        self.assertEqual(
+            main.default_output_path("/x/data/lec1.mp4").name, "lec1_lecturecut.mp4"
+        )
+        self.assertEqual(
+            main.default_output_path("https://youtu.be/abc").name,
+            "lecturecut-output.mp4",
+        )
+
+    def test_render_command_stamps_the_output(self):
+        args = main.parse_args(["in.mp4"])
+        command = main.render_command(
+            input_path=main.Path("in.mp4"),
+            output_path=main.Path("out.mp4"),
+            filtergraph_path=main.Path("graph.ffmpeg"),
+            encoder="libx264",
+            args=args,
+        )
+        joined = " ".join(command)
+
+        self.assertIn(f"{main.LECTURECUT_TAG}={main.LECTURECUT_VERSION}", command)
+        # Without this flag the mov muxer drops unknown keys and the tag is lost.
+        self.assertIn("+faststart+use_metadata_tags", joined)
+
+    def test_name_hint_recognises_outputs_old_and_new(self):
+        self.assertTrue(main.name_suggests_output(main.Path("a_lecturecut.mp4")))
+        self.assertTrue(main.name_suggests_output(main.Path("b.lecturecut.mp4")))
+        self.assertTrue(main.name_suggests_output(main.Path("c_LectureCut.mp4")))
+        self.assertFalse(main.name_suggests_output(main.Path("Lecture_01.MOV")))
+        self.assertFalse(main.name_suggests_output(main.Path("notes.mp4")))
+
     def test_percentile_interpolates(self):
         self.assertEqual(main.percentile([1.0], 0.5), 1.0)
         self.assertEqual(main.percentile([0.0, 10.0], 0.5), 5.0)

@@ -218,6 +218,12 @@ SILENCE_END_RE = re.compile(
 
 SUPPRESS_DEST = "source"
 
+LECTURECUT_VERSION = "0.1.0"
+# Stamped into the output so a finished lecture can be recognised by more than
+# the shape of its file name, which a rename would destroy.
+LECTURECUT_TAG = "lecturecut"
+OUTPUT_SUFFIX = "_lecturecut"
+
 AUDIO_DENOISE_MODES = ("auto", "afftdn", "anlmdn", "arnndn", "none")
 AUDIO_LOUDNESS_MODES = ("dynaudnorm", "speechnorm", "loudnorm", "none")
 
@@ -856,7 +862,48 @@ def default_output_path(source: str) -> Path:
     if is_url(source):
         return Path("lecturecut-output.mp4")
     input_path = Path(source)
-    return input_path.with_name(f"{input_path.stem}.lecturecut.mp4")
+    return input_path.with_name(f"{input_path.stem}{OUTPUT_SUFFIX}.mp4")
+
+
+def read_lecturecut_tag(path: Path) -> str | None:
+    """Return the version stamped into a finished render, if there is one."""
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        f"format_tags={LECTURECUT_TAG}",
+        "-of",
+        "default=nw=1:nk=1",
+        str(path),
+    ]
+    try:
+        result = run_command(command, capture=True, check=False)
+    except (OSError, PipelineCancelled):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def name_suggests_output(path: Path) -> bool:
+    """Fallback for renders made before the tag existed - or renamed since.
+
+    The tag is the reliable signal; a name only hints, since anyone can call a
+    file whatever they like. It is still better than offering an obvious output
+    back for reprocessing.
+    """
+
+    stem = path.stem.lower()
+    return stem.endswith(OUTPUT_SUFFIX) or stem.endswith(".lecturecut")
+
+
+def is_already_processed(path: Path) -> bool:
+    if read_lecturecut_tag(path) is not None:
+        return True
+    return name_suggests_output(path)
 
 
 def prepare_input(source: str, workdir: Path, download_format: str) -> Path:
@@ -1810,8 +1857,13 @@ def render_command(
         "aac",
         "-b:a",
         args.audio_bitrate,
+        "-metadata",
+        f"{LECTURECUT_TAG}={LECTURECUT_VERSION}",
+        "-metadata",
+        f"comment=Processed by LectureCut {LECTURECUT_VERSION}",
+        # Without use_metadata_tags the mov muxer silently drops unknown keys.
         "-movflags",
-        "+faststart",
+        "+faststart+use_metadata_tags",
         str(output_path),
     ]
 
@@ -2115,6 +2167,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
             raise PipelineError("Input has no audio stream")
 
         ACTIVE_PROGRESS.set(plan_progress_weights(duration=media.duration, args=args))
+
+        if is_already_processed(input_path):
+            report(
+                "Note: this input already carries a LectureCut tag, so it has "
+                "been processed before"
+            )
 
         analysis = None
         if not args.no_analyze:
