@@ -118,6 +118,10 @@ The same recording also shows why `--silence-threshold` is measured: at the old
 -35dB default, 35% of a speech-dense window reads as silence, so cutting would
 chew through syllables. `auto` derived -49.1dB for it.
 
+Calibration aims for a typical share of removed pauses, which is a starting
+point rather than an answer - so `--silence-bias` shifts it by ear. Positive
+cuts more pauses, negative keeps more; a few dB either way is the usual range.
+
 If the gap to `--target-lufs` is larger than a couple of decibels, a slow
 compressor takes up the slack, because peak normalization cannot raise loudness
 past the crest factor of the material. Loudness lands within about 1.5 dB of the
@@ -192,8 +196,9 @@ The form is generated from the CLI parser, so defaults, choices and help text
 come from one place and cannot drift: settings are turned back into argv and
 validated by the same `parse_args` the CLI uses.
 
-Runs queue up: press «Конвертировать» as many times as you like and they are
-drained one at a time, because a single render already saturates the encoder.
+Select as many files as you like - clicking a row toggles it - and they queue
+up, drained one at a time because a single render already saturates the encoder.
+For a batch the file names come from the core, so only the folder is chosen.
 Each row in the queue carries its own progress and can be cancelled on its own;
 clicking one shows its log. Finished runs offer «Открыть» and «Папка», which
 hand the file to this desktop's own handler - a browser cannot follow a
@@ -201,7 +206,27 @@ hand the file to this desktop's own handler - a browser cannot follow a
 anyway - plus a plain download link. Pass `--no-open` to turn that off.
 
 The output folder is chosen from the same roots; leaving it on «рядом с
-источником» keeps the CLI's default of writing next to the input.
+источником» keeps the CLI's default of writing next to the input. Settings are
+remembered between visits, except `--start`, `--limit` and the output file
+name, which belong to one particular file - silently reusing them would quietly
+process 60 seconds of the next lecture. «Сбросить» restores the defaults.
+
+Finished lectures are marked, and hidden from the source list by default, so
+they are not offered back for a second pass.
+
+## Recognising a finished render
+
+Every output is named `<stem>_lecturecut.mp4` and carries a `lecturecut`
+metadata tag naming the version that produced it:
+
+```bash
+ffprobe -v error -show_entries format_tags=lecturecut -of default=nw=1:nk=1 out.mp4
+```
+
+The tag is the reliable signal; the name only a hint, since anyone can rename a
+file. The name is still checked as a fallback, which is what recognises renders
+made before tagging existed. The CLI says so when handed an input it has
+processed before.
 
 ## Interrupting a run
 

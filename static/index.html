@@ -20,6 +20,15 @@
       <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди доступных папок</span>
     </div>
     <input type="search" id="file-filter" placeholder="Фильтр по имени">
+    <div class="list-tools">
+      <button type="button" id="check-all" class="secondary tiny">Выбрать все</button>
+      <button type="button" id="check-none" class="secondary tiny">Снять выбор</button>
+      <span id="checked-count" class="muted small"></span>
+    </div>
+    <label class="inline-label small">
+      <input type="checkbox" id="hide-processed" checked>
+      <span>Скрывать уже обработанные</span>
+    </label>
     <ul id="file-list" class="file-list"></ul>
     <div id="selected" class="selected hidden">
       <strong id="selected-name"></strong>
@@ -45,6 +54,13 @@
           <span class="small">авто</span>
           <input type="text" id="set-silence-threshold" placeholder="-45dB" disabled>
         </span>
+      </label>
+      <label id="silence-bias-label">Поправка к авто, дБ
+        <span class="inline">
+          <input type="range" id="set-silence-bias" min="-10" max="10" step="0.5" value="0">
+          <output id="silence-bias-value" class="small">0.0</output>
+        </span>
+        <span class="muted small">больше — режет больше пауз</span>
       </label>
       <label>С секунды (необязательно)
         <input type="number" id="set-start" step="1" min="0" placeholder="0">
@@ -74,7 +90,8 @@
 
     <div class="actions">
       <button id="convert" disabled>Конвертировать</button>
-      <span class="muted small" id="queue-hint">можно ставить несколько подряд — они выполнятся по очереди</span>
+      <button type="button" id="reset-settings" class="secondary tiny">Сбросить</button>
+      <span class="muted small" id="queue-hint">выбирайте несколько файлов — они выполнятся по очереди</span>
     </div>
   </section>
 

@@ -7,6 +7,7 @@ const BASIC_DESTS = new Set([
   "target_lufs",
   "denoise",
   "silence_threshold",
+  "silence_bias",
   "start",
   "limit",
   "mono",
@@ -15,6 +16,10 @@ const BASIC_DESTS = new Set([
 // The preview sweep is a separate flow, not part of this screen.
 const SKIPPED_GROUPS = new Set(["preview sweep"]);
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
+const SETTINGS_KEY = "lecturecut.settings.v1";
+// Deliberately not remembered: they belong to one particular file, and silently
+// reusing them would quietly process 60 seconds of the next lecture.
+const NEVER_REMEMBERED = new Set(["set-output-name", "set-start", "set-limit"]);
 const JOB_POLL_MS = 1500;
 
 const STATUS_LABELS = {
@@ -31,6 +36,8 @@ const state = {
   files: [],
   dirs: [],
   selected: null,
+  primary: null,
+  checked: new Set(),
   jobs: [],
   watching: null,
   stream: null,
@@ -162,6 +169,16 @@ function applyDefaults() {
   el("set-silence-auto").checked = auto;
   el("set-silence-threshold").disabled = auto;
   el("set-silence-threshold").value = auto ? "" : d.silence_threshold;
+  el("set-silence-bias").value = d.silence_bias ?? 0;
+  syncSilenceControls();
+}
+
+function syncSilenceControls() {
+  const auto = el("set-silence-auto").checked;
+  el("set-silence-threshold").disabled = auto;
+  // The bias shifts the calibrated value, so it means nothing for a fixed one.
+  el("silence-bias-label").classList.toggle("disabled", !auto);
+  el("silence-bias-value").textContent = Number(el("set-silence-bias").value).toFixed(1);
 }
 
 function renderDirs() {
@@ -206,10 +223,9 @@ function collectSettings() {
   put("denoise", el("set-denoise").value);
   if (el("set-mono").checked) settings.mono = true;
 
-  const threshold = el("set-silence-auto").checked
-    ? "auto"
-    : el("set-silence-threshold").value.trim();
-  put("silence_threshold", threshold);
+  const auto = el("set-silence-auto").checked;
+  put("silence_threshold", auto ? "auto" : el("set-silence-threshold").value.trim());
+  if (auto) put("silence_bias", Number(el("set-silence-bias").value));
 
   const start = el("set-start").value;
   if (start !== "") put("start", Number(start));
@@ -240,59 +256,197 @@ function collectSettings() {
   return settings;
 }
 
+// ------------------------------------------------------------ saved settings
+
+function settingsControls() {
+  return [
+    ...document.querySelectorAll(
+      "#basic-settings input, #basic-settings select, " +
+        "#advanced-settings input, #advanced-settings select, #hide-processed"
+    ),
+  ].filter((node) => node.id && !NEVER_REMEMBERED.has(node.id));
+}
+
+function saveFormState() {
+  const data = {};
+  for (const node of settingsControls()) {
+    data[node.id] = node.type === "checkbox" ? node.checked : node.value;
+  }
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
+  } catch (error) {
+    /* a full or disabled store is not worth interrupting the run for */
+  }
+}
+
+function restoreFormState() {
+  let data;
+  try {
+    data = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+  } catch (error) {
+    data = null;
+  }
+  if (!data) return;
+  for (const node of settingsControls()) {
+    if (!(node.id in data)) continue;
+    if (node.type === "checkbox") node.checked = Boolean(data[node.id]);
+    else node.value = data[node.id];
+  }
+  // A folder that has since disappeared leaves the select empty, which is the
+  // "next to the source" entry - the same thing a fresh install would show.
+  syncSilenceControls();
+}
+
+function resetFormState() {
+  try {
+    localStorage.removeItem(SETTINGS_KEY);
+  } catch (error) {
+    /* nothing to clear */
+  }
+  applyDefaults();
+  buildAdvanced();
+  el("set-output-dir").value = "";
+  el("set-output-name").value = "";
+  el("hide-processed").checked = true;
+  renderFiles();
+  refreshPrimary();
+}
+
 // ------------------------------------------------------------------ file picker
 
 function renderFiles() {
-  const filter = el("file-filter").value.trim().toLowerCase();
   const list = el("file-list");
   list.textContent = "";
-  const matches = state.files.filter(
-    (file) => !filter || file.name.toLowerCase().includes(filter)
-  );
+  const matches = visibleFiles();
   if (!matches.length) {
     const empty = document.createElement("li");
     empty.className = "muted";
+    const hidden = state.files.length - visibleFiles({ ignoreProcessed: true }).length;
     empty.textContent = state.files.length
       ? "Ничего не найдено"
       : "В доступных папках нет медиафайлов";
+    if (state.files.length && hidden > 0) {
+      empty.textContent = "Все подходящие файлы уже обработаны";
+    }
     list.appendChild(empty);
     return;
   }
   for (const file of matches) {
     const item = document.createElement("li");
-    if (state.selected && state.selected.path === file.path) item.className = "active";
+    if (state.checked.has(file.path)) item.classList.add("checked");
+    if (state.primary === file.path) item.classList.add("active");
+
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = file.relative || file.name;
     name.title = file.path;
+    item.appendChild(name);
+    if (file.processed) {
+      const done = document.createElement("span");
+      done.className = "badge done";
+      done.textContent = "обработано";
+      done.title = "У файла есть метка LectureCut либо имя результата";
+      item.appendChild(done);
+    }
     const size = document.createElement("span");
     size.className = "muted small";
     size.textContent = formatSize(file.size);
-    item.append(name, size);
-    item.addEventListener("click", () => selectFile(file));
+    item.appendChild(size);
+
+    // One way to choose things: the whole row toggles. A second mechanism next
+    // to it only raises the question of which of the two actually counts.
+    item.addEventListener("click", () => toggleFile(file));
     list.appendChild(item);
   }
 }
 
-async function selectFile(file) {
-  state.selected = file;
+function toggleFile(file) {
+  if (state.checked.has(file.path)) {
+    state.checked.delete(file.path);
+    if (state.primary === file.path) state.primary = null;
+  } else {
+    state.checked.add(file.path);
+    state.primary = file.path;
+  }
   renderFiles();
+  refreshPrimary();
+}
+
+function primaryFile() {
+  const chosen = batchTargets();
+  if (!chosen.length) return null;
+  const byPath = chosen.find((file) => file.path === state.primary);
+  return byPath || chosen[chosen.length - 1];
+}
+
+async function refreshPrimary() {
+  const file = primaryFile();
+  state.selected = file;
+  updateConvertButton();
   const box = el("selected");
+  if (!file) {
+    box.classList.add("hidden");
+    return;
+  }
   box.classList.remove("hidden");
-  el("selected-name").textContent = file.name;
+  const chosen = batchTargets();
+  el("selected-name").textContent =
+    chosen.length > 1 ? `${chosen.length} файла(ов) выбрано` : file.name;
   el("selected-meta").textContent = `${formatSize(file.size)} · ${file.path}`;
-  el("convert").disabled = false;
+  await describeFile(file);
+}
+
+function visibleFiles(options) {
+  const filter = el("file-filter").value.trim().toLowerCase();
+  const hideProcessed =
+    !(options && options.ignoreProcessed) && el("hide-processed").checked;
+  return state.files.filter((file) => {
+    if (filter && !file.name.toLowerCase().includes(filter)) return false;
+    // A file that already carries the tag is a result, not a source.
+    if (hideProcessed && file.processed) return false;
+    return true;
+  });
+}
+
+function batchTargets() {
+  return state.files.filter((file) => state.checked.has(file.path));
+}
+
+function updateConvertButton() {
+  const targets = batchTargets();
+  const button = el("convert");
+  button.disabled = targets.length === 0;
+  button.textContent =
+    targets.length > 1 ? `Конвертировать (${targets.length})` : "Конвертировать";
+  el("checked-count").textContent = state.checked.size
+    ? `выбрано: ${state.checked.size}`
+    : "";
+  // One explicit name cannot serve a batch; the core names each output instead.
+  const name = el("set-output-name");
+  name.disabled = targets.length > 1;
+  name.placeholder =
+    targets.length > 1
+      ? "имена задаются по каждому источнику"
+      : state.selected && state.selected.defaultOutput
+        ? baseName(state.selected.defaultOutput)
+        : "как у источника";
+}
+
+async function describeFile(file) {
   try {
     const info = await api(`/api/probe?path=${encodeURIComponent(file.path)}`);
     file.defaultOutput = info.default_output;
+    if (state.selected !== file) return;
     const parts = [formatSize(file.size)];
     if (info.duration) parts.push(formatDuration(info.duration));
     if (!info.has_audio) parts.push("без аудио!");
     if (!info.has_video) parts.push("без видео!");
     el("selected-meta").textContent = `${parts.join(" · ")} · ${file.path}`;
-    el("set-output-name").placeholder = baseName(info.default_output);
+    updateConvertButton();
   } catch (error) {
-    el("selected-meta").textContent = `${formatSize(file.size)} · ${error.message}`;
+    if (state.selected === file) {
+      el("selected-meta").textContent = `${formatSize(file.size)} · ${error.message}`;
+    }
   }
 }
 
@@ -313,7 +467,7 @@ async function handleDrop(fileHandle) {
     (file) => file.name === fileHandle.name && file.size === fileHandle.size
   );
   if (match) {
-    await selectFile(match);
+    if (!state.checked.has(match.path)) toggleFile(match);
     return;
   }
   if (!state.schema.allow_upload) {
@@ -328,7 +482,7 @@ async function handleDrop(fileHandle) {
   appendLog(`Загружено: ${uploaded.path}`);
   await loadFiles();
   const match2 = state.files.find((file) => file.path === uploaded.path);
-  if (match2) await selectFile(match2);
+  if (match2 && !state.checked.has(match2.path)) toggleFile(match2);
 }
 
 // ----------------------------------------------------------------- job queue
@@ -580,24 +734,42 @@ function watchJob(jobId) {
 }
 
 async function convert() {
-  if (!state.selected) return;
+  const targets = batchTargets();
+  if (!targets.length) return;
   const button = el("convert");
   button.disabled = true;
-  try {
-    const job = await api("/api/jobs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source: state.selected.path, settings: collectSettings() }),
-    });
-    await refreshJobs();
-    watchJob(job.id);
-  } catch (error) {
-    el("watch").classList.remove("hidden");
-    appendLog(error.message, true);
-  } finally {
-    // Queueing more runs is the point: the button comes straight back.
-    button.disabled = !state.selected;
+  const batch = targets.length > 1;
+  const settings = collectSettings();
+  const dir = el("set-output-dir").value;
+  if (batch) delete settings.output;
+
+  let first = null;
+  let failed = 0;
+  for (const target of targets) {
+    const payload = { source: target.path, settings };
+    // In a batch the folder travels separately and the server names each file.
+    if (batch && dir) payload.output_dir = dir;
+    try {
+      const job = await api("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!first) first = job.id;
+    } catch (error) {
+      failed += 1;
+      el("watch").classList.remove("hidden");
+      appendLog(`${baseName(target.path)}: ${error.message}`, true);
+    }
   }
+
+  await refreshJobs();
+  if (first && !failed) watchJob(first);
+  state.checked.clear();
+  state.primary = null;
+  renderFiles();
+  // Queueing more runs is the point: the button comes straight back.
+  refreshPrimary();
 }
 
 // ------------------------------------------------------------------------ init
@@ -614,12 +786,39 @@ async function init() {
   applyDefaults();
   buildAdvanced();
   await Promise.all([loadFiles(), loadDirs()]);
+  restoreFormState();
   await refreshJobs();
 
   el("file-filter").addEventListener("input", renderFiles);
+  el("hide-processed").addEventListener("change", () => {
+    // Hidden rows must not stay queued from a previous state of the filter.
+    const shown = new Set(visibleFiles().map((file) => file.path));
+    for (const path of [...state.checked]) {
+      if (!shown.has(path)) state.checked.delete(path);
+    }
+    renderFiles();
+    refreshPrimary();
+  });
+  updateConvertButton();
   el("convert").addEventListener("click", convert);
-  el("set-silence-auto").addEventListener("change", (event) => {
-    el("set-silence-threshold").disabled = event.target.checked;
+  el("set-silence-auto").addEventListener("change", syncSilenceControls);
+  el("set-silence-bias").addEventListener("input", syncSilenceControls);
+  el("reset-settings").addEventListener("click", resetFormState);
+  for (const container of ["settings-panel", "source-panel"]) {
+    for (const name of ["change", "input"]) {
+      el(container).addEventListener(name, saveFormState);
+    }
+  }
+  el("check-all").addEventListener("click", () => {
+    for (const file of visibleFiles()) state.checked.add(file.path);
+    renderFiles();
+    refreshPrimary();
+  });
+  el("check-none").addEventListener("click", () => {
+    state.checked.clear();
+    state.primary = null;
+    renderFiles();
+    refreshPrimary();
   });
   el("open-output-dir").addEventListener("click", () => {
     const dir = el("set-output-dir").value;

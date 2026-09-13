@@ -235,3 +235,18 @@ button.tiny { padding: 3px 9px; font-size: 12px; font-weight: 500; }
 .err { color: var(--err); }
 
 #set-output-dir { min-width: 0; }
+
+/* --- multi-select and the bias slider ------------------------------------- */
+
+.list-tools { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.list-tools .muted { margin-left: auto; }
+
+.file-list li { align-items: center; }
+.file-list li .name { flex: 1 1 auto; }
+.file-list li.checked { background: rgba(90, 169, 230, .14); }
+.file-list li.checked .name { color: var(--text); font-weight: 600; }
+.file-list li.active { box-shadow: inset 3px 0 0 var(--accent); }
+
+input[type="range"] { width: 100%; margin-top: 0; padding: 0; accent-color: var(--accent); }
+#silence-bias-value { min-width: 34px; text-align: right; color: var(--text); }
+#silence-bias-label.disabled { opacity: .45; pointer-events: none; }
