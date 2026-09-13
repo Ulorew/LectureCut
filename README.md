@@ -127,15 +127,32 @@ compressor takes up the slack, because peak normalization cannot raise loudness
 past the crest factor of the material. Loudness lands within about 1.5 dB of the
 target, erring quiet; raise `--target-lufs` if you want more.
 
-Denoiser options, cheapest first: `afftdn` (default, adaptive `nr`/`nf`),
-`anlmdn` (slower, broadband), and `arnndn` — speech-aware and the best of the
-three, but it needs a model file:
+Denoiser options:
+
+| mode | what it is |
+| --- | --- |
+| `auto` | `arnndn` when a model is given, otherwise `afftdn` |
+| `afftdn` | spectral gate, fast; `nr` and `nf` are set from the measured floor |
+| `anlmdn` | non-local means, slower, sometimes cleaner on broadband hiss |
+| `arnndn` | recurrent network trained on speech, the best of these; needs a model |
+| `none` | leave the noise alone |
+
+`arnndn` needs a `.rnnn` model file, which ships separately from FFmpeg — get
+one from [rnnoise-models](https://github.com/GregorR/rnnoise-models):
 
 ```bash
 python3 main.py data/lec1.mp4 -o out.mp4 --denoise arnndn --arnndn-model ~/models/sh.rnnn
 ```
 
-Models ship separately from FFmpeg; point `--arnndn-model` at any `.rnnn` file.
+Without a model the run is refused immediately, before any measuring, rather
+than failing once it reaches the filter chain. The web UI lists every `.rnnn`
+file it finds under the roots and offers them as a dropdown.
+
+## Repeating a run
+
+An output that already exists is not overwritten: the next free name is used
+instead, so `lec1_lecturecut.mp4` is followed by `lec1_lecturecut_2.mp4`.
+`--if-exists overwrite` (or `--force`) replaces it, `--if-exists error` refuses.
 
 Useful knobs:
 

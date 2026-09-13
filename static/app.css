@@ -250,3 +250,25 @@ button.tiny { padding: 3px 9px; font-size: 12px; font-weight: 500; }
 input[type="range"] { width: 100%; margin-top: 0; padding: 0; accent-color: var(--accent); }
 #silence-bias-value { min-width: 34px; text-align: right; color: var(--text); }
 #silence-bias-label.disabled { opacity: .45; pointer-events: none; }
+
+/* --- a file list that reaches the bottom of the panel --------------------- */
+
+#source-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 118px);
+}
+#source-panel .file-list {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 180px;
+}
+#source-panel .selected { flex: 0 0 auto; }
+
+@media (max-width: 1100px) {
+  #source-panel { max-height: none; }
+  #source-panel .file-list { max-height: 50vh; }
+}
+
+.warn { color: var(--warn); }
+#denoise-help, #model-hint { display: block; margin-top: 4px; }

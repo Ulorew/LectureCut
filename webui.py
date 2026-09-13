@@ -48,6 +48,11 @@ MEDIA_SUFFIXES = {
 }
 UPLOAD_CHUNK = 1024 * 1024
 PROBE_WORKERS = 8
+ARNNDN_MODEL_HINT = (
+    "Модели arnndn поставляются отдельно от FFmpeg. Положите файл "
+    f"{core.ARNNDN_MODEL_SUFFIX} в одну из доступных папок — например, взяв его "
+    "из https://github.com/GregorR/rnnoise-models"
+)
 # A listing should stay responsive even when pointed at a large archive.
 PROBE_LIMIT = 400
 EVENT_HISTORY_LIMIT = 2000
@@ -314,6 +319,23 @@ def resolve_within_roots(raw: str, config: Config) -> Path:
     raise HTTPException(status_code=403, detail=f"Path is outside the allowed roots: {raw}")
 
 
+def list_arnndn_models(config: Config) -> list[dict[str, Any]]:
+    """Find .rnnn models so arnndn can be offered only when it can actually run."""
+
+    found: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for root in config.roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob(f"*{core.ARNNDN_MODEL_SUFFIX}")):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            found.append({"path": str(resolved), "name": resolved.name})
+    return found
+
+
 class ProcessedIndex:
     """Remembers which files already carry a LectureCut tag.
 
@@ -401,6 +423,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "roots": [str(root) for root in config.roots],
             "allow_upload": config.allow_upload,
             "allow_open": config.allow_open,
+            "denoise_help": core.AUDIO_DENOISE_HELP,
+            "models": list_arnndn_models(config),
+            "model_hint": ARNNDN_MODEL_HINT,
         }
 
     @app.get("/api/files")
@@ -505,7 +530,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
 
         try:
             argv = core.settings_to_argv(str(source), settings)
-            core.parse_args(argv)
+            # Refuse a job the pipeline cannot run before it reaches the queue,
+            # so a missing denoiser model is a 400 and not a failed render.
+            core.validate_denoise_settings(core.parse_args(argv))
         except core.PipelineError as error:
             raise HTTPException(status_code=400, detail=str(error)) from None
         except SystemExit:

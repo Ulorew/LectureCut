@@ -225,6 +225,17 @@ LECTURECUT_TAG = "lecturecut"
 OUTPUT_SUFFIX = "_lecturecut"
 
 AUDIO_DENOISE_MODES = ("auto", "afftdn", "anlmdn", "arnndn", "none")
+# What each denoiser is for, so a UI can explain the choice without a second
+# copy of the reasoning living next to the buttons.
+AUDIO_DENOISE_HELP = {
+    "auto": "arnndn when a model is given, otherwise afftdn",
+    "afftdn": "spectral gate, fast; nr and nf are set from the measured floor",
+    "anlmdn": "non-local means, slower, sometimes cleaner on broadband hiss",
+    "arnndn": "recurrent network trained on speech, the best of these; needs a .rnnn model file",
+    "none": "leave the noise alone",
+}
+OUTPUT_EXISTS_MODES = ("suffix", "overwrite", "error")
+ARNNDN_MODEL_SUFFIX = ".rnnn"
 AUDIO_LOUDNESS_MODES = ("dynaudnorm", "speechnorm", "loudnorm", "none")
 
 # Used when measurement is skipped or fails. The silence threshold is well below
@@ -330,7 +341,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("source", help="Local media file or video URL")
     parser.add_argument("-o", "--output", type=Path, help="Output MP4 path")
-    parser.add_argument("--force", action="store_true", help="Overwrite output if it exists")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output if it exists; same as --if-exists overwrite",
+    )
+    parser.add_argument(
+        "--if-exists",
+        choices=OUTPUT_EXISTS_MODES,
+        default="suffix",
+        help=(
+            "What to do when the output path is taken: add _2, _3 and so on, "
+            "overwrite it, or refuse"
+        ),
+    )
     parser.add_argument(
         "--filtergraph-mode",
         choices=("select", "concat"),
@@ -1452,11 +1476,8 @@ def denoise_filters(
     if mode == "none":
         return []
     if mode == "arnndn":
-        if not args.arnndn_model:
-            raise PipelineError("--denoise arnndn requires --arnndn-model")
-        model = Path(args.arnndn_model).expanduser()
-        if not model.exists():
-            raise PipelineError(f"arnndn model not found: {model}")
+        model = validate_denoise_settings(args)
+        assert model is not None
         return [f"arnndn=m={filter_escape(str(model))}"]
     if mode == "anlmdn":
         return [f"anlmdn=s={args.anlmdn_strength:g}:p=0.002:r=0.006"]
@@ -1468,6 +1489,62 @@ def denoise_filters(
     noise_profile = clamp(round(noise_floor_db + 6.0), -80.0, -20.0)
     reduction = clamp(round(45.0 - snr_db), 10.0, 28.0)
     return [f"afftdn=nr={reduction:g}:nf={noise_profile:g}:tn=1"]
+
+
+def resolved_denoise_mode(args: argparse.Namespace) -> str:
+    if args.denoise != "auto":
+        return args.denoise
+    return "arnndn" if args.arnndn_model else "afftdn"
+
+
+def validate_denoise_settings(args: argparse.Namespace) -> Path | None:
+    """Check the denoiser can actually run, and return its model if it needs one.
+
+    Called before any work starts as well as from the chain builder, so a missing
+    model is refused up front instead of halfway through a job.
+    """
+
+    if resolved_denoise_mode(args) != "arnndn":
+        return None
+    if not args.arnndn_model:
+        raise PipelineError(
+            "--denoise arnndn needs a model: pass --arnndn-model /path/to/model"
+            f"{ARNNDN_MODEL_SUFFIX}. Models ship separately from FFmpeg; see "
+            "https://github.com/GregorR/rnnoise-models"
+        )
+    model = Path(args.arnndn_model).expanduser()
+    if not model.exists():
+        raise PipelineError(f"arnndn model not found: {model}")
+    return model
+
+
+def unique_output_path(path: Path) -> Path:
+    """Find a free name next to `path` by appending _2, _3 and so on."""
+
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise PipelineError(f"Could not find a free name next to {path}")
+
+
+def resolve_output_path(path: Path, args: argparse.Namespace) -> Path:
+    """Decide where to write when the chosen name is already taken."""
+
+    if not path.exists():
+        return path
+    if args.force or args.if_exists == "overwrite":
+        return path
+    if args.if_exists == "error":
+        if args.dry_run:
+            report(f"Note: output already exists: {path}")
+            return path
+        raise PipelineError(
+            f"Output already exists, pass --force to overwrite: {path}"
+        )
+    fresh = unique_output_path(path)
+    report(f"Output exists, writing {fresh.name} instead of overwriting it")
+    return fresh
 
 
 def gate_filter(*, noise_floor_db: float) -> str:
@@ -2147,15 +2224,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         workdir = args.workdir
         workdir.mkdir(parents=True, exist_ok=True)
 
+    validate_denoise_settings(args)
     try:
         input_path = prepare_input(args.source, workdir, args.download_format)
         if args.preview_dir is not None:
             return run_preview_sweep(input_path=input_path, workdir=workdir, args=args)
 
         output_path = args.output or default_output_path(args.source)
-        output_path = output_path.expanduser()
-        if output_path.exists() and not args.force and not args.dry_run:
-            raise PipelineError(f"Output already exists, pass --force to overwrite: {output_path}")
+        output_path = resolve_output_path(output_path.expanduser(), args)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         media = probe_media(input_path, start=args.start, limit=args.limit)

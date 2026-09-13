@@ -45,8 +45,13 @@
       <label>Целевая громкость, LUFS
         <input type="number" id="set-target-lufs" step="0.5">
       </label>
-      <label>Денойз
+      <label class="wide">Денойз
         <select id="set-denoise"></select>
+        <span id="denoise-help" class="muted small"></span>
+      </label>
+      <label class="wide hidden" id="model-label">Модель arnndn
+        <select id="set-arnndn-model"></select>
+        <span id="model-hint" class="muted small"></span>
       </label>
       <label>Порог тишины
         <span class="inline">

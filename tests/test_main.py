@@ -3,9 +3,11 @@ import contextlib
 import io
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 import main
 
@@ -156,6 +158,91 @@ class LectureCutTests(unittest.TestCase):
         self.assertIn(f"{main.LECTURECUT_TAG}={main.LECTURECUT_VERSION}", command)
         # Without this flag the mov muxer drops unknown keys and the tag is lost.
         self.assertIn("+faststart+use_metadata_tags", joined)
+
+    def test_repeat_runs_get_a_suffix_instead_of_overwriting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "lecture_lecturecut.mp4"
+            target.write_bytes(b"first")
+            args = main.parse_args(["in.mp4"])
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                second = main.resolve_output_path(target, args)
+                second.write_bytes(b"second")
+                third = main.resolve_output_path(target, args)
+
+            self.assertEqual(second.name, "lecture_lecturecut_2.mp4")
+            self.assertEqual(third.name, "lecture_lecturecut_3.mp4")
+            self.assertEqual(target.read_bytes(), b"first")
+
+    def test_force_and_overwrite_keep_the_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "out.mp4"
+            target.write_bytes(b"x")
+
+            forced = main.resolve_output_path(target, main.parse_args(["in.mp4", "--force"]))
+            chosen = main.resolve_output_path(
+                target, main.parse_args(["in.mp4", "--if-exists", "overwrite"])
+            )
+
+            self.assertEqual(forced, target)
+            self.assertEqual(chosen, target)
+
+    def test_if_exists_error_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "out.mp4"
+            target.write_bytes(b"x")
+            args = main.parse_args(["in.mp4", "--if-exists", "error"])
+
+            with self.assertRaises(main.PipelineError):
+                main.resolve_output_path(target, args)
+
+    def test_a_free_name_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "out.mp4"
+
+            self.assertEqual(
+                main.resolve_output_path(target, main.parse_args(["in.mp4"])), target
+            )
+
+    def test_suffix_is_the_default(self):
+        self.assertEqual(main.parse_args(["in.mp4"]).if_exists, "suffix")
+
+    def test_arnndn_without_a_model_is_refused_up_front(self):
+        with self.assertRaises(main.PipelineError) as caught:
+            main.validate_denoise_settings(main.parse_args(["in.mp4", "--denoise", "arnndn"]))
+
+        # The message has to say what to do about it, not just what is wrong.
+        self.assertIn("--arnndn-model", str(caught.exception))
+        self.assertIn("rnnoise-models", str(caught.exception))
+
+    def test_arnndn_with_a_missing_model_file_is_refused(self):
+        args = main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", "/nope.rnnn"])
+
+        with self.assertRaises(main.PipelineError):
+            main.validate_denoise_settings(args)
+
+    def test_auto_denoise_needs_no_model(self):
+        self.assertIsNone(main.validate_denoise_settings(main.parse_args(["in.mp4"])))
+        self.assertEqual(main.resolved_denoise_mode(main.parse_args(["in.mp4"])), "afftdn")
+
+    def test_auto_denoise_prefers_arnndn_when_a_model_exists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            model = Path(temp) / "sh.rnnn"
+            model.write_bytes(b"model")
+            args = main.parse_args(["in.mp4", "--arnndn-model", str(model)])
+
+            self.assertEqual(main.resolved_denoise_mode(args), "arnndn")
+            self.assertEqual(main.validate_denoise_settings(args), model)
+            self.assertEqual(
+                main.denoise_filters(args, noise_floor_db=-57.0, snr_db=20.0),
+                [f"arnndn=m={main.filter_escape(str(model))}"],
+            )
+
+    def test_every_denoise_mode_is_explained(self):
+        self.assertEqual(
+            set(main.AUDIO_DENOISE_HELP), set(main.AUDIO_DENOISE_MODES)
+        )
+        self.assertTrue(all(main.AUDIO_DENOISE_HELP.values()))
 
     def test_name_hint_recognises_outputs_old_and_new(self):
         self.assertTrue(main.name_suggests_output(main.Path("a_lecturecut.mp4")))

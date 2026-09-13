@@ -134,6 +134,30 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_schema_explains_the_denoisers_and_lists_models(self):
+        (self.root / "sh.rnnn").write_bytes(b"model")
+        body = self.client.get("/api/schema").json()
+
+        self.assertEqual(set(body["denoise_help"]), set(main.AUDIO_DENOISE_MODES))
+        self.assertEqual([m["name"] for m in body["models"]], ["sh.rnnn"])
+        self.assertIn("rnnoise-models", body["model_hint"])
+
+    def test_no_models_is_reported_as_an_empty_list(self):
+        self.assertEqual(self.client.get("/api/schema").json()["models"], [])
+
+    def test_arnndn_without_a_model_is_a_400_not_a_failed_job(self):
+        response = self.client.post(
+            "/api/jobs",
+            json={
+                "source": str(self.root / "lecture.mp4"),
+                "settings": {"denoise": "arnndn"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("--arnndn-model", response.json()["detail"])
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+
     def test_job_creation_requires_a_source(self):
         response = self.client.post("/api/jobs", json={"settings": {}})
 

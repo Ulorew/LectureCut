@@ -8,6 +8,8 @@ const BASIC_DESTS = new Set([
   "denoise",
   "silence_threshold",
   "silence_bias",
+  "arnndn_model",
+  "if_exists",
   "start",
   "limit",
   "mono",
@@ -165,12 +167,55 @@ function applyDefaults() {
     denoise.appendChild(option);
   }
   denoise.value = d.denoise;
+  renderModels();
+  syncDenoiseHelp();
   const auto = String(d.silence_threshold).toLowerCase() === "auto";
   el("set-silence-auto").checked = auto;
   el("set-silence-threshold").disabled = auto;
   el("set-silence-threshold").value = auto ? "" : d.silence_threshold;
   el("set-silence-bias").value = d.silence_bias ?? 0;
   syncSilenceControls();
+}
+
+function syncDenoiseHelp() {
+  const mode = el("set-denoise").value;
+  const help = (state.schema.denoise_help || {})[mode] || "";
+  const models = state.schema.models || [];
+  // arnndn is the best of the three and the only one that needs a file, so the
+  // model picker appears exactly when it is about to be used.
+  const needsModel = mode === "arnndn" || (mode === "auto" && models.length > 0);
+  el("model-label").classList.toggle("hidden", !needsModel);
+  let note = help;
+  if (mode === "arnndn" && !models.length) {
+    note = `${help}. Модель не найдена — ${state.schema.model_hint}`;
+  }
+  el("denoise-help").textContent = note;
+  el("denoise-help").classList.toggle("warn", mode === "arnndn" && !models.length);
+}
+
+function renderModels() {
+  const select = el("set-arnndn-model");
+  const previous = select.value;
+  select.textContent = "";
+  const models = state.schema.models || [];
+  if (!models.length) {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "моделей не найдено";
+    select.appendChild(empty);
+    select.disabled = true;
+  } else {
+    select.disabled = false;
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model.path;
+      option.textContent = model.name;
+      option.title = model.path;
+      select.appendChild(option);
+    }
+    select.value = previous || models[0].path;
+  }
+  el("model-hint").textContent = models.length ? "" : state.schema.model_hint;
 }
 
 function syncSilenceControls() {
@@ -221,6 +266,10 @@ function collectSettings() {
   put("speed", Number(el("set-speed").value));
   put("target_lufs", Number(el("set-target-lufs").value));
   put("denoise", el("set-denoise").value);
+  const model = el("set-arnndn-model").value;
+  if (model && !el("model-label").classList.contains("hidden")) {
+    settings.arnndn_model = model;
+  }
   if (el("set-mono").checked) settings.mono = true;
 
   const auto = el("set-silence-auto").checked;
@@ -251,8 +300,8 @@ function collectSettings() {
       if (value !== field.default) settings[field.dest] = value;
     }
   }
-  // Overwriting is the expected behaviour when a name is chosen deliberately.
-  settings.force = true;
+  // Repeating a run should not destroy the previous result; the core picks the
+  // next free name instead. Advanced exposes --if-exists to change that.
   return settings;
 }
 
@@ -801,6 +850,7 @@ async function init() {
   });
   updateConvertButton();
   el("convert").addEventListener("click", convert);
+  el("set-denoise").addEventListener("change", syncDenoiseHelp);
   el("set-silence-auto").addEventListener("change", syncSilenceControls);
   el("set-silence-bias").addEventListener("input", syncSilenceControls);
   el("reset-settings").addEventListener("click", resetFormState);
