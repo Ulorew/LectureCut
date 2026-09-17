@@ -9,15 +9,24 @@
 <body>
 <header>
   <h1>LectureCut</h1>
-  <p id="roots" class="muted"></p>
 </header>
 
 <main>
   <section class="panel" id="source-panel">
     <h2>Источник</h2>
+    <div class="source-dir">
+      <div class="source-dir-path">
+        <span class="muted small">Папка с лекциями</span>
+        <strong id="source-dir-path"></strong>
+      </div>
+      <div class="inline" id="source-dir-tools">
+        <button type="button" id="change-source-dir" class="secondary tiny">Сменить…</button>
+        <select id="recent-source-dirs" title="Недавние папки"></select>
+      </div>
+    </div>
     <div id="dropzone" class="dropzone">
       Перетащите файл сюда или выберите из списка
-      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди доступных папок</span>
+      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру в выбранной папке</span>
     </div>
     <input type="search" id="file-filter" placeholder="Фильтр по имени">
     <div class="list-tools">
@@ -123,6 +132,24 @@
     </div>
   </section>
 </main>
+
+<dialog id="folder-dialog">
+  <div class="folder-browser">
+    <h2>Папка с лекциями</h2>
+    <div class="inline">
+      <button type="button" id="folder-up" class="secondary tiny" title="На уровень выше">↑</button>
+      <button type="button" id="folder-home" class="secondary tiny">Домой</button>
+      <input type="text" id="folder-path" spellcheck="false" autocomplete="off">
+      <button type="button" id="folder-go" class="secondary tiny">Перейти</button>
+    </div>
+    <p id="folder-note" class="muted small"></p>
+    <ul id="folder-list" class="folder-list"></ul>
+    <div class="actions">
+      <button type="button" id="folder-choose">Выбрать эту папку</button>
+      <button type="button" id="folder-cancel" class="secondary">Отмена</button>
+    </div>
+  </div>
+</dialog>
 
 <script src="app.js"></script>
 </body>

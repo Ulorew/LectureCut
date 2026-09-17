@@ -43,6 +43,7 @@ const state = {
   dirs: [],
   selected: null,
   primary: null,
+  browsing: null,
   checked: new Set(),
   jobs: [],
   watching: null,
@@ -52,8 +53,14 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+// Sent on every request. The server refuses changes without it, and a page on
+// another site cannot add a custom header without a CORS approval it never gets.
+const GUARD_HEADER = "X-LectureCut";
+
 async function api(path, options) {
-  const response = await fetch(path, options);
+  const request = { ...(options || {}) };
+  request.headers = { ...(request.headers || {}), [GUARD_HEADER]: "1" };
+  const response = await fetch(path, request);
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -414,7 +421,7 @@ function renderFiles() {
     const hidden = state.files.length - visibleFiles({ ignoreProcessed: true }).length;
     empty.textContent = state.files.length
       ? "Ничего не найдено"
-      : "В доступных папках нет медиафайлов";
+      : "В этой папке нет медиафайлов";
     if (state.files.length && hidden > 0) {
       empty.textContent = "Все подходящие файлы уже обработаны";
     }
@@ -543,7 +550,105 @@ async function describeFile(file) {
 async function loadFiles() {
   const data = await api("/api/files");
   state.files = data.files;
+  state.schema.source_dir = data.source_dir;
+  renderSourceDir();
   renderFiles();
+}
+
+// ------------------------------------------------------------ input folder
+
+function renderSourceDir() {
+  const path = state.schema.source_dir || "";
+  const label = el("source-dir-path");
+  label.textContent = path;
+  label.title = path;
+
+  const recent = (state.schema.recent_source_dirs || []).filter((dir) => dir !== path);
+  const select = el("recent-source-dirs");
+  select.textContent = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = recent.length ? "Недавние…" : "недавних нет";
+  select.appendChild(placeholder);
+  for (const dir of recent) {
+    const option = document.createElement("option");
+    option.value = dir;
+    option.textContent = dir;
+    select.appendChild(option);
+  }
+  select.disabled = recent.length === 0;
+  el("source-dir-tools").classList.toggle("hidden", !state.schema.allow_browse);
+}
+
+async function navigateFolder(path) {
+  const note = el("folder-note");
+  try {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const data = await api(`/api/browse${query}`);
+    state.browsing = data;
+    el("folder-path").value = data.path;
+    el("folder-up").disabled = !data.parent;
+    note.classList.remove("warn");
+    note.textContent = data.media_here
+      ? `Здесь медиафайлов: ${data.media_here}`
+      : "Здесь медиафайлов нет — возможно, они во вложенных папках";
+
+    const list = el("folder-list");
+    list.textContent = "";
+    if (!data.dirs.length) {
+      const empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "Вложенных папок нет";
+      list.appendChild(empty);
+    }
+    for (const dir of data.dirs) {
+      const item = document.createElement("li");
+      item.textContent = dir.name;
+      item.title = dir.path;
+      item.addEventListener("click", () => navigateFolder(dir.path));
+      list.appendChild(item);
+    }
+  } catch (error) {
+    note.classList.add("warn");
+    note.textContent = error.message;
+  }
+}
+
+function openFolderBrowser() {
+  el("folder-dialog").showModal();
+  navigateFolder(state.schema.source_dir);
+}
+
+async function chooseFolder(path) {
+  if (!path) return;
+  try {
+    const data = await api("/api/source-dir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    state.schema.source_dir = data.source_dir;
+    state.schema.recent_source_dirs = data.recent_source_dirs;
+    state.files = data.files;
+    // Selections belong to the folder they were made in.
+    state.checked.clear();
+    state.primary = null;
+    renderSourceDir();
+    renderFiles();
+    refreshPrimary();
+    // The new folder is now a place outputs may go, too.
+    await loadDirs();
+    if (el("folder-dialog").open) el("folder-dialog").close();
+  } catch (error) {
+    const message = `Не удалось выбрать папку: ${error.message}`;
+    if (el("folder-dialog").open) {
+      el("folder-note").classList.add("warn");
+      el("folder-note").textContent = message;
+    } else {
+      el("watch").classList.remove("hidden");
+      appendLog(message, true);
+    }
+  }
 }
 
 async function loadDirs() {
@@ -866,7 +971,6 @@ async function convert() {
 
 async function init() {
   state.schema = await api("/api/schema");
-  el("roots").textContent = `Доступные папки: ${state.schema.roots.join(", ")}`;
   for (const group of state.schema.groups) {
     for (const field of group.fields) {
       state.defaults[field.dest] = field.default;
@@ -880,6 +984,31 @@ async function init() {
   await refreshJobs();
 
   el("file-filter").addEventListener("input", renderFiles);
+  el("change-source-dir").addEventListener("click", openFolderBrowser);
+  el("recent-source-dirs").addEventListener("change", (event) => {
+    const path = event.target.value;
+    event.target.value = "";
+    chooseFolder(path);
+  });
+  el("folder-up").addEventListener("click", () => {
+    if (state.browsing && state.browsing.parent) navigateFolder(state.browsing.parent);
+  });
+  el("folder-home").addEventListener("click", () => {
+    navigateFolder(state.browsing ? state.browsing.home : "");
+  });
+  el("folder-go").addEventListener("click", () =>
+    navigateFolder(el("folder-path").value.trim())
+  );
+  el("folder-path").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      navigateFolder(el("folder-path").value.trim());
+    }
+  });
+  el("folder-choose").addEventListener("click", () => {
+    if (state.browsing) chooseFolder(state.browsing.path);
+  });
+  el("folder-cancel").addEventListener("click", () => el("folder-dialog").close());
   el("hide-processed").addEventListener("change", () => {
     // Hidden rows must not stay queued from a previous state of the filter.
     const shown = new Set(visibleFiles().map((file) => file.path));

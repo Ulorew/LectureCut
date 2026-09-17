@@ -272,3 +272,56 @@ input[type="range"] { width: 100%; margin-top: 0; padding: 0; accent-color: var(
 
 .warn { color: var(--warn); }
 #denoise-help, #model-hint { display: block; margin-top: 4px; }
+
+/* --- input folder ----------------------------------------------------------- */
+
+.source-dir {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px;
+  background: var(--panel-2);
+  border-radius: 8px;
+}
+.source-dir-path { display: flex; flex-direction: column; min-width: 0; }
+.source-dir-path strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;          /* keep the end of a long path, which is what differs */
+  text-align: left;
+}
+.source-dir .inline { margin-top: 0; }
+#recent-source-dirs { margin-top: 0; }
+
+dialog#folder-dialog {
+  width: min(640px, 92vw);
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+dialog#folder-dialog::backdrop { background: rgba(0, 0, 0, .55); }
+.folder-browser { padding: 16px; }
+.folder-browser .inline input { margin-top: 0; }
+.folder-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.folder-list li {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.folder-list li::before { content: "📁 "; }
+.folder-list li.muted { cursor: default; }
+.folder-list li.muted::before { content: ""; }
+.folder-list li:last-child { border-bottom: 0; }
+.folder-list li:hover { background: var(--panel-2); }

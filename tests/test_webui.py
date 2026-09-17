@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -273,6 +274,200 @@ class WebUITests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class SourceFolderTests(unittest.TestCase):
+    """Choosing the input folder from the page, and remembering the choice."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(self.temp.name)
+        self.project = base / "project"
+        self.project.mkdir()
+        (self.project / "old.mp4").write_bytes(b"x")
+        self.downloads = base / "Downloads"
+        (self.downloads / "course" / "week1").mkdir(parents=True)
+        (self.downloads / ".cache").mkdir()
+        (self.downloads / "lecture03.MOV").write_bytes(b"x")
+        (self.downloads / "course" / "week1" / "lecture04.mp4").write_bytes(b"x")
+        (self.downloads / "notes.pdf").write_bytes(b"x")
+        self.state = base / "config" / "webui.json"
+        self.config = webui.Config(
+            roots=[self.project.resolve()],
+            upload_dir=(base / "uploads").resolve(),
+            state_path=self.state,
+        )
+        self.client = TestClient(webui.create_app(self.config))
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def names(self):
+        return sorted(f["name"] for f in self.client.get("/api/files").json()["files"])
+
+    def test_browse_lists_folders_and_counts_media(self):
+        body = self.client.get("/api/browse", params={"path": str(self.downloads)}).json()
+
+        self.assertEqual([d["name"] for d in body["dirs"]], ["course"])
+        self.assertEqual(body["media_here"], 1)
+        self.assertEqual(body["parent"], str(self.downloads.resolve().parent))
+
+    def test_browse_hides_hidden_folders(self):
+        body = self.client.get("/api/browse", params={"path": str(self.downloads)}).json()
+
+        self.assertNotIn(".cache", [d["name"] for d in body["dirs"]])
+
+    def test_browse_rejects_missing_paths_and_files(self):
+        missing = self.client.get("/api/browse", params={"path": str(self.downloads / "nope")})
+        a_file = self.client.get(
+            "/api/browse", params={"path": str(self.downloads / "lecture03.MOV")}
+        )
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(a_file.status_code, 400)
+
+    def test_choosing_a_folder_switches_the_listing(self):
+        self.assertEqual(self.names(), ["old.mp4"])
+
+        response = self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.names(), ["lecture03.MOV", "lecture04.mp4"])
+
+    def test_a_chosen_folder_becomes_readable(self):
+        target = self.downloads / "lecture03.MOV"
+        before = self.client.get("/api/probe", params={"path": str(target)})
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        after = self.client.get("/api/file", params={"path": str(target)})
+
+        self.assertEqual(before.status_code, 403)
+        self.assertEqual(after.status_code, 200)
+
+    def test_the_choice_survives_a_restart(self):
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+
+        reborn = webui.Config(
+            roots=[self.project.resolve()],
+            upload_dir=self.config.upload_dir,
+            state_path=self.state,
+        )
+        reborn.load_state()
+
+        self.assertEqual(reborn.current_source_dir(), self.downloads.resolve())
+        self.assertIn(self.downloads.resolve(), reborn.roots)
+
+    def test_recent_folders_are_deduplicated_newest_first(self):
+        for folder in (self.downloads, self.project, self.downloads):
+            self.client.post("/api/source-dir", json={"path": str(folder)})
+
+        recent = self.client.get("/api/schema").json()["recent_source_dirs"]
+
+        self.assertEqual(recent, [str(self.downloads.resolve()), str(self.project.resolve())])
+
+    def test_a_vanished_folder_is_forgotten_on_restart(self):
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        shutil.rmtree(self.downloads)
+
+        reborn = webui.Config(
+            roots=[self.project.resolve()],
+            upload_dir=self.config.upload_dir,
+            state_path=self.state,
+        )
+        reborn.load_state()
+
+        self.assertEqual(reborn.current_source_dir(), self.project.resolve())
+        self.assertEqual(reborn.recent_source_dirs, [])
+
+    def test_browsing_can_be_disabled(self):
+        self.config.allow_browse = False
+
+        browse = self.client.get("/api/browse", params={"path": str(self.downloads)})
+        choose = self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+
+        self.assertEqual(browse.status_code, 403)
+        self.assertEqual(choose.status_code, 403)
+        self.assertEqual(self.names(), ["old.mp4"])
+
+    def test_listing_is_bounded_in_depth(self):
+        deep = self.downloads / "a" / "b" / "c" / "d"
+        deep.mkdir(parents=True)
+        (deep / "too_deep.mp4").write_bytes(b"x")
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+
+        self.assertNotIn("too_deep.mp4", self.names())
+
+    def test_walk_limited_stops_at_its_limit(self):
+        for index in range(10):
+            (self.project / f"clip{index}.mp4").write_bytes(b"x")
+
+        found = list(
+            webui.walk_limited(self.project, max_depth=1, limit=4, want_dirs=False)
+        )
+
+        self.assertEqual(len(found), 4)
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class RequestGuardTests(unittest.TestCase):
+    """The server must not be drivable from another site."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        (root / "a.mp4").write_bytes(b"x")
+        self.config = webui.Config(
+            roots=[root.resolve()],
+            upload_dir=(root / "up").resolve(),
+            allowed_hosts=webui.allowed_hosts_for("127.0.0.1", 8765),
+            require_csrf_header=True,
+        )
+        self.app = webui.create_app(self.config)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def client(self, host="127.0.0.1:8765"):
+        return TestClient(self.app, base_url=f"http://{host}")
+
+    def test_a_rebound_hostname_is_refused(self):
+        with self.client(host="evil.example:8765") as client:
+            response = client.get("/api/files")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_loopback_names_are_accepted(self):
+        for host in ("127.0.0.1:8765", "localhost:8765"):
+            with self.client(host=host) as client:
+                self.assertEqual(client.get("/api/files").status_code, 200)
+
+    def test_a_post_without_the_header_is_refused(self):
+        with self.client() as client:
+            response = client.post("/api/models", json={"keys": ["bogus"]})
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_post_with_the_header_goes_through(self):
+        with self.client() as client:
+            response = client.post(
+                "/api/models", json={"keys": ["bogus"]}, headers={webui.CSRF_HEADER: "1"}
+            )
+
+        # 400 comes from the handler itself, so the guard let it through.
+        self.assertEqual(response.status_code, 400)
+
+    def test_reads_do_not_need_the_header(self):
+        with self.client() as client:
+            self.assertEqual(client.get("/api/schema").status_code, 200)
+
+    def test_schema_tells_the_page_which_header_to_send(self):
+        with self.client() as client:
+            self.assertEqual(client.get("/api/schema").json()["csrf_header"], webui.CSRF_HEADER)
+
+    def test_a_wildcard_bind_turns_the_host_check_off(self):
+        self.assertIsNone(webui.allowed_hosts_for("0.0.0.0", 8765))
+        self.assertIn("localhost:8765", webui.allowed_hosts_for("127.0.0.1", 8765))
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")

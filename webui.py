@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import contextvars
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -48,15 +49,16 @@ MEDIA_SUFFIXES = {
 }
 UPLOAD_CHUNK = 1024 * 1024
 PROBE_WORKERS = 8
-def model_hint() -> str:
-    """Built per request: the cache location follows the environment."""
-
-    return (
-        f"Модели по ~300 КБ, скачиваются по кнопке в кэш {core.model_cache_dir()}. "
-        "Хеши зашиты, так что загрузка проверяется"
-    )
 # A listing should stay responsive even when pointed at a large archive.
 PROBE_LIMIT = 400
+# A chosen folder can be a home directory; walking all of it would stall the page.
+LIST_DEPTH = 3
+LIST_FILE_LIMIT = 2000
+DIR_LIST_LIMIT = 500
+RECENT_SOURCE_DIRS = 8
+# Mutating requests must carry this header. A cross-site page cannot add a custom
+# header without a CORS preflight, which this server never approves.
+CSRF_HEADER = "X-LectureCut"
 EVENT_HISTORY_LIMIT = 2000
 SSE_KEEPALIVE_SECONDS = 15.0
 
@@ -67,6 +69,20 @@ STATUS_ERROR = "error"
 STATUS_CANCELLED = "cancelled"
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def model_hint() -> str:
+    """Built per request: the cache location follows the environment."""
+
+    return (
+        f"Модели по ~300 КБ, скачиваются по кнопке в кэш {core.model_cache_dir()}. "
+        "Хеши зашиты, так что загрузка проверяется"
+    )
+
+
+def state_file_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "lecturecut" / "webui.json"
 
 
 @dataclass
@@ -263,10 +279,147 @@ class JobManager:
 
 @dataclass
 class Config:
+    """Server settings.
+
+    The two request guards default to off so a Config built by hand - in a test,
+    say - stays simple; build_config() turns both on for the real server.
+    """
+
     roots: list[Path]
     upload_dir: Path
     allow_upload: bool = True
     allow_open: bool = True
+    # Whether the page may point the server at folders outside the given roots.
+    allow_browse: bool = True
+    source_dir: Path | None = None
+    recent_source_dirs: list[Path] = field(default_factory=list)
+    state_path: Path | None = None
+    allowed_hosts: set[str] | None = None
+    require_csrf_header: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def current_source_dir(self) -> Path:
+        if self.source_dir is not None and self.source_dir.is_dir():
+            return self.source_dir
+        for root in self.roots:
+            if root.is_dir() and root != self.upload_dir:
+                return root
+        return self.roots[0]
+
+    def choose_source_dir(self, folder: Path) -> None:
+        """Make a folder the input folder, and let the server read from it."""
+
+        with self.lock:
+            self.source_dir = folder
+            if folder not in self.roots:
+                self.roots.append(folder)
+            recent = [folder, *(d for d in self.recent_source_dirs if d != folder)]
+            self.recent_source_dirs = recent[:RECENT_SOURCE_DIRS]
+        self.save_state()
+
+    def save_state(self) -> None:
+        if self.state_path is None:
+            return
+        payload = {
+            "source_dir": str(self.source_dir) if self.source_dir else None,
+            "recent_source_dirs": [str(d) for d in self.recent_source_dirs],
+        }
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.state_path.with_name(f".{self.state_path.name}.part")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+            os.replace(temporary, self.state_path)
+        except OSError:
+            pass  # losing the remembered folder is not worth failing a request
+
+    def load_state(self) -> None:
+        """Restore the chosen folders; a folder that has since vanished is dropped."""
+
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text())
+        except (OSError, ValueError):
+            return
+        if not self.allow_browse:
+            return
+        recent = [Path(p) for p in payload.get("recent_source_dirs") or []]
+        self.recent_source_dirs = [d for d in recent if d.is_dir()][:RECENT_SOURCE_DIRS]
+        for folder in self.recent_source_dirs:
+            if folder not in self.roots:
+                self.roots.append(folder)
+        chosen = payload.get("source_dir")
+        if chosen and Path(chosen).is_dir():
+            self.source_dir = Path(chosen)
+            if self.source_dir not in self.roots:
+                self.roots.append(self.source_dir)
+
+
+def walk_limited(
+    root: Path, *, max_depth: int, limit: int, want_dirs: bool
+) -> Iterator[Path]:
+    """Yield files (or directories) under root, bounded in depth and count.
+
+    A chosen input folder can be as broad as a home directory. rglob would walk
+    every cache and dependency tree underneath it before the page could answer.
+    Hidden directories are skipped for the same reason.
+    """
+
+    produced = 0
+    for current, dirnames, filenames in os.walk(root):
+        depth = len(Path(current).relative_to(root).parts)
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        if depth >= max_depth:
+            dirnames[:] = []
+        names = dirnames if want_dirs else sorted(filenames)
+        for name in names:
+            if produced >= limit:
+                return
+            produced += 1
+            yield Path(current) / name
+
+
+def browse_directory(raw: str | None, config: Config) -> dict[str, Any]:
+    """List the subfolders of one directory, for choosing an input folder.
+
+    Only folder names and media counts are exposed, never file contents, and
+    only when browsing is allowed at all.
+    """
+
+    if not config.allow_browse:
+        raise HTTPException(status_code=403, detail="Choosing folders is disabled")
+    base = Path(raw).expanduser() if raw else config.current_source_dir()
+    try:
+        folder = base.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        raise HTTPException(status_code=404, detail=f"No such folder: {raw}") from None
+    if not folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"Not a folder: {folder}")
+
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(folder.iterdir(), key=lambda child: child.name.lower())
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"No permission to read {folder}") from None
+    media_here = 0
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            if child.is_dir():
+                if len(entries) < DIR_LIST_LIMIT:
+                    entries.append({"name": child.name, "path": str(child)})
+            elif child.suffix.lower() in MEDIA_SUFFIXES:
+                media_here += 1
+        except OSError:
+            continue
+    return {
+        "path": str(folder),
+        "parent": str(folder.parent) if folder.parent != folder else None,
+        "home": str(Path.home()),
+        "dirs": entries,
+        "media_here": media_here,
+    }
 
 
 def desktop_open_command(target: Path) -> list[str]:
@@ -284,10 +437,13 @@ def list_directories(config: Config) -> list[dict[str, Any]]:
 
     entries: list[dict[str, Any]] = []
     seen: set[Path] = set()
-    for root in config.roots:
+    for root in list(config.roots):
         if not root.exists():
             continue
-        candidates = [root, *(path for path in root.rglob("*") if path.is_dir())]
+        candidates = [
+            root,
+            *walk_limited(root, max_depth=2, limit=DIR_LIST_LIMIT, want_dirs=True),
+        ]
         for path in candidates:
             resolved = path.resolve()
             if resolved in seen or any(part.startswith(".") for part in resolved.parts):
@@ -335,7 +491,13 @@ def list_arnndn_models(config: Config) -> list[dict[str, Any]]:
         paths = (
             sorted(directory.glob(f"*{core.ARNNDN_MODEL_SUFFIX}"))
             if directory == core.model_cache_dir()
-            else sorted(directory.rglob(f"*{core.ARNNDN_MODEL_SUFFIX}"))
+            else sorted(
+                path
+                for path in walk_limited(
+                    directory, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+                )
+                if path.suffix == core.ARNNDN_MODEL_SUFFIX
+            )
         )
         for path in paths:
             resolved = path.resolve()
@@ -421,14 +583,20 @@ class ProcessedIndex:
 
 
 def list_media(config: Config, index: ProcessedIndex | None = None) -> list[dict[str, Any]]:
+    """Media in the current input folder - one folder, like a file picker."""
+
     entries: list[dict[str, Any]] = []
-    for root in config.roots:
-        if not root.exists():
-            continue
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in MEDIA_SUFFIXES:
+    root = config.current_source_dir()
+    if root.exists():
+        for path in walk_limited(
+            root, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+        ):
+            if path.suffix.lower() not in MEDIA_SUFFIXES:
                 continue
-            stat = path.stat()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
             entries.append(
                 {
                     "path": str(path),
@@ -449,6 +617,25 @@ def list_media(config: Config, index: ProcessedIndex | None = None) -> list[dict
 
 def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     app = FastAPI(title="LectureCut", docs_url=None, redoc_url=None)
+
+    @app.middleware("http")
+    async def guard_requests(request: Request, call_next: Any) -> Any:
+        # DNS rebinding: a hostile page can resolve its own name to 127.0.0.1 and
+        # then read this server as same-origin. The Host header gives it away.
+        if config.allowed_hosts is not None:
+            host = (request.headers.get("host") or "").lower()
+            if host not in config.allowed_hosts:
+                return JSONResponse({"detail": "Unexpected Host header"}, status_code=403)
+        if (
+            config.require_csrf_header
+            and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and request.headers.get(CSRF_HEADER) != "1"
+        ):
+            return JSONResponse(
+                {"detail": f"Missing {CSRF_HEADER} header"}, status_code=403
+            )
+        return await call_next(request)
+
     manager = jobs or JobManager()
     processed = ProcessedIndex()
     app.state.config = config
@@ -460,6 +647,10 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         return {
             "groups": core.parser_schema(),
             "roots": [str(root) for root in config.roots],
+            "source_dir": str(config.current_source_dir()),
+            "recent_source_dirs": [str(d) for d in config.recent_source_dirs],
+            "allow_browse": config.allow_browse,
+            "csrf_header": CSRF_HEADER,
             "allow_upload": config.allow_upload,
             "allow_open": config.allow_open,
             "denoise_help": core.AUDIO_DENOISE_HELP,
@@ -471,7 +662,32 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
 
     @app.get("/api/files")
     def files() -> dict[str, Any]:
-        return {"files": list_media(config, processed)}
+        return {
+            "source_dir": str(config.current_source_dir()),
+            "files": list_media(config, processed),
+        }
+
+    @app.get("/api/browse")
+    def browse(path: str | None = Query(default=None)) -> dict[str, Any]:
+        return browse_directory(path, config)
+
+    @app.post("/api/source-dir")
+    def set_source_dir(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        if not config.allow_browse:
+            raise HTTPException(status_code=403, detail="Choosing folders is disabled")
+        raw = str(payload.get("path") or "")
+        try:
+            folder = Path(raw).expanduser().resolve(strict=True)
+        except (FileNotFoundError, RuntimeError):
+            raise HTTPException(status_code=404, detail=f"No such folder: {raw}") from None
+        if not folder.is_dir():
+            raise HTTPException(status_code=400, detail=f"Not a folder: {folder}")
+        config.choose_source_dir(folder)
+        return {
+            "source_dir": str(folder),
+            "recent_source_dirs": [str(d) for d in config.recent_source_dirs],
+            "files": list_media(config, processed),
+        }
 
     @app.get("/api/probe")
     def probe(path: str = Query(...)) -> dict[str, Any]:
@@ -695,17 +911,25 @@ def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not let the page open finished files on this desktop",
     )
+    parser.add_argument(
+        "--no-browse",
+        action="store_true",
+        help="Keep the page to the given roots instead of letting it choose folders",
+    )
     return parser.parse_args(argv)
 
 
 def build_config(args: argparse.Namespace) -> Config:
     roots = [path.expanduser().resolve() for path in (args.root or [])]
+    default_source: Path | None = None
     if not roots:
         cwd = Path.cwd().resolve()
         roots = [cwd]
         data_dir = cwd / "data"
         if data_dir.exists() and data_dir not in roots:
             roots.append(data_dir.resolve())
+            # Where the lectures conventionally live, rather than the whole project.
+            default_source = data_dir.resolve()
     upload_dir = (
         args.upload_dir.expanduser().resolve()
         if args.upload_dir
@@ -714,12 +938,33 @@ def build_config(args: argparse.Namespace) -> Config:
     # Uploads must be selectable afterwards, so their directory is a root too.
     if upload_dir not in roots:
         roots.append(upload_dir)
-    return Config(
+    config = Config(
         roots=roots,
         upload_dir=upload_dir,
         allow_upload=not args.no_upload,
         allow_open=not args.no_open,
+        allow_browse=not args.no_browse,
+        state_path=state_file_path(),
+        allowed_hosts=allowed_hosts_for(args.host, args.port),
+        require_csrf_header=True,
+        source_dir=default_source,
     )
+    config.load_state()
+    return config
+
+
+def allowed_hosts_for(host: str, port: int) -> set[str] | None:
+    """Host headers this server answers to.
+
+    Bound to a wildcard address the server is reachable under names it cannot
+    predict, so the check is dropped - binding it that way is a deliberate choice
+    to expose it.
+    """
+
+    if host in {"0.0.0.0", "::", ""}:
+        return None
+    names = {host, "127.0.0.1", "localhost", "[::1]"}
+    return {f"{name}:{port}".lower() for name in names}
 
 
 def serve(argv: list[str] | None = None) -> int:
@@ -730,9 +975,12 @@ def serve(argv: list[str] | None = None) -> int:
         print("Warning: ffmpeg was not found on PATH; jobs will fail.")
     config = build_config(args)
     app = create_app(config)
-    print(f"LectureCut UI on http://{args.host}:{args.port}")
+    print(f"LectureCut UI on http://{args.host}:{args.port}", flush=True)
+    print(f"  input folder: {config.current_source_dir()}", flush=True)
     for root in config.roots:
-        print(f"  root: {root}")
+        print(f"  root: {root}", flush=True)
+    if config.allowed_hosts is None:
+        print("  Warning: bound to all interfaces; the Host check is off", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

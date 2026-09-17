@@ -244,10 +244,22 @@ Then open http://127.0.0.1:8765. Pick a file, set the knobs, press
 
 Sources are chosen **on the server**: a browser hands over a dropped file's
 contents but never its path, and copying a multi-gigabyte lecture through HTTP
-to the same machine would be pointless. The page lists media under the
-configured roots (by default the working directory and `data/`), and a dropped
-file is matched against that index by name and size. Anything outside the roots
-is refused, and can be uploaded instead if that is what you want.
+to the same machine would be pointless. The page lists media in one input
+folder — `data/` to begin with — and a dropped file is matched against that list
+by name and size.
+
+«Сменить…» opens a folder browser, so the input folder can be anywhere on disk,
+`~/Downloads` included. The choice and a short list of recent folders are kept in
+`~/.config/lecturecut/webui.json` and restored on the next start. Listing stops
+three folders deep and at 2000 files, so pointing it at a home directory does not
+stall the page. `--no-browse` keeps the page to the roots given with `--root`.
+
+Because the page can point the server at any folder, the server checks that
+requests are really its own. The `Host` header must name the loopback address it
+is bound to, which stops a hostile site from reaching it through DNS rebinding,
+and every request that changes something must carry an `X-LectureCut` header,
+which a cross-site page cannot add. Binding to `0.0.0.0` turns the `Host` check
+off, since the server is then deliberately reachable under other names.
 
 The form is generated from the CLI parser, so defaults, choices and help text
 come from one place and cannot drift: settings are turned back into argv and
@@ -303,7 +315,9 @@ python3 -m unittest discover -v
 python3 -m py_compile main.py webui.py tests/test_main.py
 ```
 
-The web tests skip themselves unless the `web` extra is installed.
+The web tests skip themselves unless the `web` extra is installed, so run the
+suite with the interpreter that has it and check that the summary does not end
+in `skipped=`.
 
 ## Repository Notes
 

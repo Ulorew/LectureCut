@@ -347,7 +347,7 @@ class LectureCutTests(unittest.TestCase):
         with unittest.mock.patch.object(
             main, "measure_denoise_effect", lambda *a, **k: check
         ):
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
                     main.Path("in.mp4"), args=args, analysis=self.analysis()
                 )
@@ -361,7 +361,7 @@ class LectureCutTests(unittest.TestCase):
         with unittest.mock.patch.object(
             main, "measure_denoise_effect", lambda *a, **k: check
         ):
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
                     main.Path("in.mp4"), args=args, analysis=self.analysis()
                 )
@@ -375,7 +375,7 @@ class LectureCutTests(unittest.TestCase):
         with unittest.mock.patch.object(
             main, "measure_denoise_effect", lambda *a, **k: check
         ):
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
                     main.Path("in.mp4"), args=args, analysis=self.analysis()
                 )
