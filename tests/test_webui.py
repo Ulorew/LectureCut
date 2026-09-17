@@ -410,6 +410,95 @@ class SourceFolderTests(unittest.TestCase):
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class DroppedFileTests(unittest.TestCase):
+    """A dropped file arrives without its path; find it instead of copying it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(self.temp.name)
+        self.here = base / "here"
+        self.elsewhere = base / "elsewhere"
+        for folder in (self.here, self.elsewhere):
+            folder.mkdir()
+        (self.here / "near.mp4").write_bytes(b"a" * 10)
+        (self.elsewhere / "far.mp4").write_bytes(b"b" * 25)
+        (self.elsewhere / "same_name.mp4").write_bytes(b"c" * 30)
+        self.config = webui.Config(
+            roots=[self.here.resolve(), self.elsewhere.resolve()],
+            upload_dir=(base / "uploads").resolve(),
+            source_dir=self.here.resolve(),
+        )
+        self.client = TestClient(webui.create_app(self.config))
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def locate(self, name, size):
+        return self.client.get("/api/locate", params={"name": name, "size": size}).json()
+
+    def test_a_file_in_the_current_folder_is_found(self):
+        found = self.locate("near.mp4", 10)
+
+        self.assertTrue(found["found"])
+        self.assertEqual(found["path"], str(self.here / "near.mp4"))
+
+    def test_a_file_in_another_known_folder_is_found_with_its_folder(self):
+        found = self.locate("far.mp4", 25)
+
+        self.assertTrue(found["found"])
+        self.assertEqual(found["dir"], str(self.elsewhere))
+
+    def test_the_size_has_to_match_too(self):
+        self.assertFalse(self.locate("same_name.mp4", 31)["found"])
+        self.assertTrue(self.locate("same_name.mp4", 30)["found"])
+
+    def test_an_unknown_file_is_simply_not_found(self):
+        self.assertFalse(self.locate("nowhere.mp4", 7)["found"])
+
+    def test_a_path_in_the_name_cannot_escape(self):
+        self.assertFalse(self.locate("../../etc/passwd", 10)["found"])
+
+    def test_upload_says_where_it_put_the_file(self):
+        body = self.client.post(
+            "/api/upload", params={"name": "dropped.mp4"}, content=b"payload"
+        ).json()
+
+        # The page switches to that folder, or the upload would stay invisible.
+        self.assertEqual(body["dir"], str(self.config.upload_dir))
+        self.assertEqual(body["path"], str(self.config.upload_dir / "dropped.mp4"))
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class CachingTests(unittest.TestCase):
+    """The page and its script must never be served from a browser's cache."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        (root / "a.mp4").write_bytes(b"x")
+        self.config = webui.Config(roots=[root.resolve()], upload_dir=(root / "up").resolve())
+        self.client = TestClient(webui.create_app(self.config))
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def test_the_page_and_its_assets_are_not_cached(self):
+        for path in ("/", "/app.js", "/app.css"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("no-store", response.headers.get("cache-control", ""))
+
+    def test_api_responses_keep_their_own_headers(self):
+        # /api/file serves finished videos, where ranges and caching matter.
+        response = self.client.get("/api/schema")
+
+        self.assertNotIn("no-store", response.headers.get("cache-control", ""))
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
 class RequestGuardTests(unittest.TestCase):
     """The server must not be drivable from another site."""
 

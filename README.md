@@ -277,6 +277,12 @@ to the same machine would be pointless. The page lists media in one input
 folder — `data/` to begin with — and a dropped file is matched against that list
 by name and size.
 
+A dropped file is looked for by name and size in the current folder first, then
+in every folder already known; finding it there switches to that folder and
+selects it, with nothing copied. Only when it is nowhere on that list does the
+page offer to upload it, and it asks first, because the file is usually already
+on this machine.
+
 «Сменить…» opens a folder browser, so the input folder can be anywhere on disk,
 `~/Downloads` included. The choice and a short list of recent folders are kept in
 `~/.config/lecturecut/webui.json` and restored on the next start. Listing stops

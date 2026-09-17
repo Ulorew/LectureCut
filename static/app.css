@@ -343,3 +343,5 @@ dialog#folder-dialog::backdrop { background: rgba(0, 0, 0, .55); }
   margin-top: 6px;
 }
 .player-bar .muted { flex: 1 1 auto; }
+
+.dropzone.warn { border-color: var(--warn); color: var(--warn); }

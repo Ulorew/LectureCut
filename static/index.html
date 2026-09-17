@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LectureCut</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%E2%9C%82%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -25,8 +26,8 @@
       </div>
     </div>
     <div id="dropzone" class="dropzone">
-      Перетащите файл сюда или выберите из списка
-      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру в выбранной папке</span>
+      <span id="drop-note">Перетащите файл сюда или выберите из списка</span>
+      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди известных папок</span>
     </div>
     <input type="search" id="file-filter" placeholder="Фильтр по имени">
     <div class="list-tools">

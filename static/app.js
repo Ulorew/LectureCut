@@ -659,27 +659,64 @@ async function loadDirs() {
   renderDirs();
 }
 
+function dropNote(text, isError) {
+  el("dropzone").classList.toggle("warn", Boolean(isError));
+  el("drop-note").textContent = text;
+}
+
+async function selectByPath(path) {
+  const match = state.files.find((file) => file.path === path);
+  if (match && !state.checked.has(match.path)) toggleFile(match);
+  return Boolean(match);
+}
+
 async function handleDrop(fileHandle) {
-  const match = state.files.find(
+  const here = state.files.find(
     (file) => file.name === fileHandle.name && file.size === fileHandle.size
   );
-  if (match) {
-    if (!state.checked.has(match.path)) toggleFile(match);
+  if (here) {
+    if (!state.checked.has(here.path)) toggleFile(here);
+    dropNote(`Выбран ${fileHandle.name}`);
     return;
   }
+
+  // The browser withheld the path, but the file is on this machine: look for it
+  // where the server can already read, rather than copying it over localhost.
+  dropNote(`Ищу ${fileHandle.name} в известных папках…`);
+  const found = await api(
+    `/api/locate?name=${encodeURIComponent(fileHandle.name)}&size=${fileHandle.size}`
+  );
+  if (found.found) {
+    await chooseFolder(found.dir);
+    await selectByPath(found.path);
+    dropNote(`Выбран ${fileHandle.name} из ${found.dir}`);
+    return;
+  }
+
   if (!state.schema.allow_upload) {
-    appendLog(`Файл ${fileHandle.name} не найден в доступных папках, а загрузка отключена`, true);
+    dropNote(`${fileHandle.name} нет в известных папках, а загрузка отключена`, true);
     return;
   }
-  appendLog(`Файл ${fileHandle.name} вне доступных папок, загружаю...`);
+  const size = formatSize(fileHandle.size);
+  const proceed = window.confirm(
+    `${fileHandle.name} нет в известных папках.\n\n` +
+      `Скопировать его сюда через браузер (${size})?\n` +
+      "Быстрее выбрать его папку кнопкой «Сменить…»."
+  );
+  if (!proceed) {
+    dropNote("Выберите папку с этим файлом кнопкой «Сменить…»", true);
+    return;
+  }
+
+  dropNote(`Загружаю ${fileHandle.name} (${size})…`);
   const uploaded = await api(`/api/upload?name=${encodeURIComponent(fileHandle.name)}`, {
     method: "POST",
     body: fileHandle,
   });
-  appendLog(`Загружено: ${uploaded.path}`);
-  await loadFiles();
-  const match2 = state.files.find((file) => file.path === uploaded.path);
-  if (match2 && !state.checked.has(match2.path)) toggleFile(match2);
+  // The upload lands in its own folder, so switch to it or the file stays unseen.
+  await chooseFolder(uploaded.dir);
+  await selectByPath(uploaded.path);
+  dropNote(`Загружен ${fileHandle.name}`);
 }
 
 // ----------------------------------------------------------------- job queue
@@ -1055,7 +1092,33 @@ async function convert() {
 
 // ------------------------------------------------------------------------ init
 
+// Every element the script expects to find. A page served from cache can be
+// older than the script that runs on it, and "el(...) is null" says nothing
+// useful about that.
+const REQUIRED_ELEMENTS = [
+  "source-dir-path",
+  "source-dir-tools",
+  "drop-note",
+  "file-list",
+  "folder-dialog",
+  "video",
+  "player",
+  "job-list",
+  "convert",
+];
+
+function checkPageMatchesScript() {
+  const missing = REQUIRED_ELEMENTS.filter((id) => !el(id));
+  if (missing.length) {
+    throw new Error(
+      "страница из кэша браузера старее скрипта — обновите её с Ctrl+Shift+R " +
+        `(не хватает: ${missing.join(", ")})`
+    );
+  }
+}
+
 async function init() {
+  checkPageMatchesScript();
   state.schema = await api("/api/schema");
   for (const group of state.schema.groups) {
     for (const field of group.fields) {
@@ -1156,8 +1219,7 @@ async function init() {
     try {
       await handleDrop(file);
     } catch (error) {
-      el("watch").classList.remove("hidden");
-      appendLog(error.message, true);
+      dropNote(`Не получилось: ${error.message}`, true);
     }
   });
   window.addEventListener("dragover", (event) => event.preventDefault());

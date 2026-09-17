@@ -710,7 +710,13 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             return JSONResponse(
                 {"detail": f"Missing {CSRF_HEADER} header"}, status_code=403
             )
-        return await call_next(request)
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            # The page and its script are one unit. A browser that keeps an old
+            # index.html while fetching a new app.js gets a script reaching for
+            # elements that are not there - which is how this rule came about.
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
 
     manager = jobs or JobManager()
     processed = ProcessedIndex()
@@ -743,6 +749,29 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "source_dir": str(config.current_source_dir()),
             "files": list_media(config, processed),
         }
+
+    @app.get("/api/locate")
+    def locate(name: str = Query(...), size: int = Query(...)) -> dict[str, Any]:
+        """Find a dropped file among the folders already known.
+
+        A browser hands over a dropped file's bytes but not its path, so the
+        alternative is copying gigabytes across localhost to a place the server
+        can already read from.
+        """
+
+        wanted = Path(name).name
+        for root in [config.current_source_dir(), *config.roots]:
+            if not root.is_dir():
+                continue
+            for path in walk_limited(
+                root, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+            ):
+                try:
+                    if path.name == wanted and path.stat().st_size == size:
+                        return {"found": True, "path": str(path), "dir": str(path.parent)}
+                except OSError:
+                    continue
+        return {"found": False}
 
     @app.get("/api/browse")
     def browse(path: str | None = Query(default=None)) -> dict[str, Any]:
@@ -803,7 +832,12 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             async for chunk in request.stream():
                 handle.write(chunk)
                 written += len(chunk)
-        return {"path": str(target), "name": safe_name, "size": written}
+        return {
+            "path": str(target),
+            "dir": str(config.upload_dir),
+            "name": safe_name,
+            "size": written,
+        }
 
     @app.post("/api/models")
     def fetch_models(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
