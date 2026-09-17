@@ -188,6 +188,35 @@ with ~10 dB of signal-to-noise that rule put the gate *inside* the speech and
 silenced whole passages. The gate now also has to sit 12 dB below the speech
 level, and is dropped entirely when no such gap exists.
 
+## Watching a render in progress
+
+A render outruns playback by several times over, so there is no reason to wait
+for it. Press «Смотреть» on a running job and it plays from the beginning while
+the rest is still being produced, seekable up to wherever the render has got to.
+When the job finishes the player swaps to the finished file at the same
+position.
+
+This works because the render is muxed as an HLS event playlist of fMP4 segments
+rather than straight to MP4, then remuxed into the usual faststart MP4 with a
+stream copy. An ordinary MP4 cannot be played while it is being written - its
+index is only written at the end - and a growing fragmented MP4 plays but cannot
+be sought. Measured in Chrome, the playlist gives a seekable range from zero to
+the render's edge.
+
+It is free: on the same two-minute slice the direct MP4 took 43.3 and 42.3 s
+against 42.8 and 40.0 s for the playlist, and remuxing a three-minute result
+took 0.9 s. Segments live in `~/.cache/lecturecut/live` and are removed fifteen
+minutes after the job ends, so a job needs its output size free there as well.
+`--no-live-preview` renders straight to MP4 instead. Browsers cannot play HEVC,
+so a job encoding with `hevc_nvenc` gets no preview.
+
+From the command line the same playlist works with any player that reads HLS:
+
+```bash
+python3 main.py data/lec1.mp4 --live-dir /tmp/lec1-live &
+mpv /tmp/lec1-live/index.m3u8
+```
+
 ## Repeating a run
 
 An output that already exists is not overwritten: the next free name is used

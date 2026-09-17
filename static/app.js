@@ -16,7 +16,8 @@ const BASIC_DESTS = new Set([
   "output",
 ]);
 // The preview sweep is a separate flow, not part of this screen.
-const SKIPPED_GROUPS = new Set(["preview sweep"]);
+// The preview sweep is a separate flow; live preview is wired by the server.
+const SKIPPED_GROUPS = new Set(["preview sweep", "live preview"]);
 // The upstream table maps what a model expects to hear against what it expects
 // to filter out; the core passes those two keys and the wording lives here.
 const SIGNAL_WORDS = { speech: "речь", voice: "речь и смех", general: "любой звук" };
@@ -47,6 +48,7 @@ const state = {
   checked: new Set(),
   jobs: [],
   watching: null,
+  player: { jobId: null, mode: null, hls: null },
   stream: null,
   poller: null,
 };
@@ -733,8 +735,22 @@ function renderJobs() {
         })
       );
     }
+    if (job.live && ACTIVE_STATUSES.has(job.status)) {
+      actions.appendChild(
+        button("Смотреть", "tiny", (event) => {
+          event.stopPropagation();
+          playJob(job);
+        })
+      );
+    }
     if (job.status === "done" && job.result && job.result.output) {
       const output = job.result.output;
+      actions.appendChild(
+        button("Смотреть", "tiny", (event) => {
+          event.stopPropagation();
+          playJob(job);
+        })
+      );
       if (state.schema.allow_open) {
         actions.appendChild(
           button("Открыть", "tiny", (event) => {
@@ -790,9 +806,79 @@ async function openPath(path, reveal) {
   }
 }
 
+// ------------------------------------------------------------------- player
+
+function stopPlayer() {
+  const video = el("video");
+  if (state.player.hls) {
+    state.player.hls.destroy();
+    state.player.hls = null;
+  }
+  video.removeAttribute("src");
+  video.load();
+  state.player = { jobId: null, mode: null, hls: null };
+  el("player").classList.add("hidden");
+}
+
+function playJob(job) {
+  const video = el("video");
+  el("player").classList.remove("hidden");
+  if (state.player.hls) {
+    state.player.hls.destroy();
+    state.player.hls = null;
+  }
+
+  if (job.status === "done" && job.result && job.result.output) {
+    state.player = { jobId: job.id, mode: "file", hls: null };
+    video.src = `/api/file?path=${encodeURIComponent(job.result.output)}`;
+    el("player-note").textContent = `Готово: ${baseName(job.result.output)}`;
+    video.play().catch(() => {});
+    return;
+  }
+
+  const playlist = `/api/jobs/${job.id}/live/index.m3u8`;
+  el("player-note").textContent =
+    "Идёт конвертация — смотреть можно с начала, перемотка до отрендеренного места";
+  if (window.Hls && window.Hls.isSupported()) {
+    // startPosition 0: an event playlist would otherwise open at its live edge,
+    // which for a render running at 10x is nowhere near the beginning.
+    const hls = new window.Hls({ startPosition: 0 });
+    hls.loadSource(playlist);
+    hls.attachMedia(video);
+    hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    state.player = { jobId: job.id, mode: "live", hls };
+  } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = playlist;
+    video.play().catch(() => {});
+    state.player = { jobId: job.id, mode: "live", hls: null };
+  } else {
+    el("player-note").textContent = "Браузер не умеет проигрывать HLS";
+  }
+}
+
+function swapToFinishedFile(job) {
+  // Keep the viewer where they were: the playlist and the file share a timeline.
+  const video = el("video");
+  const at = video.currentTime;
+  const wasPlaying = !video.paused;
+  playJob(job);
+  const resume = () => {
+    video.removeEventListener("loadedmetadata", resume);
+    if (at > 0 && at < (video.duration || Infinity)) video.currentTime = at;
+    if (wasPlaying) video.play().catch(() => {});
+  };
+  video.addEventListener("loadedmetadata", resume);
+}
+
 async function refreshJobs() {
   try {
     const data = await api("/api/jobs");
+    const watched = state.player.jobId
+      ? data.jobs.find((job) => job.id === state.player.jobId)
+      : null;
+    if (watched && state.player.mode === "live" && watched.status === "done") {
+      swapToFinishedFile(watched);
+    }
     state.jobs = data.jobs;
     renderJobs();
     // Results land in folders the picker may not have listed yet.
@@ -1009,6 +1095,7 @@ async function init() {
     if (state.browsing) chooseFolder(state.browsing.path);
   });
   el("folder-cancel").addEventListener("click", () => el("folder-dialog").close());
+  el("player-close").addEventListener("click", stopPlayer);
   el("hide-processed").addEventListener("change", () => {
     // Hidden rows must not stay queued from a previous state of the filter.
     const shown = new Set(visibleFiles().map((file) => file.path));

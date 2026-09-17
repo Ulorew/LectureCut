@@ -117,6 +117,14 @@
     <h2>Очередь</h2>
     <ul id="job-list" class="job-list"></ul>
 
+    <div id="player" class="player hidden">
+      <video id="video" controls playsinline></video>
+      <div class="player-bar">
+        <span id="player-note" class="muted small"></span>
+        <button type="button" id="player-close" class="secondary tiny">Закрыть</button>
+      </div>
+    </div>
+
     <div id="watch" class="hidden">
       <h2 class="spaced">Ход выполнения</h2>
       <div class="progress-wrap">
@@ -151,6 +159,7 @@
   </div>
 </dialog>
 
+<script src="vendor/hls.light.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -667,6 +667,149 @@ class QueueTests(unittest.TestCase):
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class LivePreviewTests(unittest.TestCase):
+    """Watching a job while it renders."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "media"
+        self.root.mkdir()
+        (self.root / "a.mp4").write_bytes(b"x")
+        cache = unittest.mock.patch.dict(
+            os.environ, {"XDG_CACHE_HOME": str(Path(self.temp.name) / "cache")}
+        )
+        cache.start()
+        self.addCleanup(cache.stop)
+        self.config = webui.Config(
+            roots=[self.root.resolve()], upload_dir=(self.root / "up").resolve()
+        )
+        self.manager = webui.JobManager()
+        self.client = TestClient(webui.create_app(self.config, self.manager))
+
+    def tearDown(self):
+        self.client.close()
+        self.temp.cleanup()
+
+    def create(self, settings=None):
+        return self.client.post(
+            "/api/jobs",
+            json={"source": str(self.root / "a.mp4"), "settings": settings or {}},
+        ).json()
+
+    def test_a_job_gets_a_playlist_folder_of_its_own(self):
+        job = self.client.get(f"/api/jobs/{self.create()['id']}").json()
+
+        self.assertTrue(job["settings"]["live_dir"].startswith(str(webui.live_root())))
+        # The pipeline must not delete segments a viewer may still be reading.
+        self.assertTrue(job["settings"]["keep_live_dir"])
+
+    def test_the_page_cannot_choose_where_segments_are_written(self):
+        job = self.client.get(
+            f"/api/jobs/{self.create({'live_dir': '/etc', 'keep_live_dir': True})['id']}"
+        ).json()
+
+        self.assertNotEqual(job["settings"]["live_dir"], "/etc")
+        self.assertTrue(job["settings"]["live_dir"].startswith(str(webui.live_root())))
+
+    def test_no_preview_for_a_codec_browsers_cannot_play(self):
+        job = self.client.get(f"/api/jobs/{self.create({'encoder': 'hevc_nvenc'})['id']}").json()
+
+        self.assertNotIn("live_dir", job["settings"])
+        self.assertFalse(job["live"])
+
+    def test_previews_can_be_turned_off(self):
+        self.config.live_preview = False
+        job = self.client.get(f"/api/jobs/{self.create()['id']}").json()
+
+        self.assertNotIn("live_dir", job["settings"])
+
+    def staged_job(self):
+        folder = Path(self.temp.name) / "live"
+        folder.mkdir()
+        job = self.manager.submit(
+            kind="convert", source="/missing.mp4", settings={}, live_dir=folder
+        )
+        return job, folder
+
+    def test_a_job_is_watchable_only_once_the_playlist_exists(self):
+        job, folder = self.staged_job()
+
+        self.assertFalse(job.summary()["live"])
+        (folder / "index.m3u8").write_text("#EXTM3U")
+        self.assertTrue(job.summary()["live"])
+
+    def test_the_playlist_is_served_without_caching(self):
+        job, folder = self.staged_job()
+        (folder / "index.m3u8").write_text("#EXTM3U")
+
+        response = self.client.get(f"/api/jobs/{job.id}/live/index.m3u8")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "#EXTM3U")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_segments_are_served(self):
+        job, folder = self.staged_job()
+        (folder / "seg_00007.m4s").write_bytes(b"segment")
+
+        response = self.client.get(f"/api/jobs/{job.id}/live/seg_00007.m4s")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"segment")
+
+    def test_only_playlist_names_are_served(self):
+        job, folder = self.staged_job()
+        (folder / "secret.txt").write_text("nope")
+        (folder / "seg_00001.m4s.tmp").write_text("half written")
+
+        for name in ("secret.txt", "seg_00001.m4s.tmp", "..%2f..%2fetc%2fpasswd"):
+            with self.subTest(name=name):
+                response = self.client.get(f"/api/jobs/{job.id}/live/{name}")
+                self.assertEqual(response.status_code, 404)
+
+    def test_a_missing_file_is_a_404_not_a_crash(self):
+        job, _ = self.staged_job()
+
+        self.assertEqual(
+            self.client.get(f"/api/jobs/{job.id}/live/index.m3u8").status_code, 404
+        )
+
+    def test_segments_are_cleared_after_a_grace_period(self):
+        job, folder = self.staged_job()
+        (folder / "index.m3u8").write_text("#EXTM3U")
+        scheduled = []
+
+        class FakeTimer:
+            def __init__(self, delay, action):
+                scheduled.append((delay, action))
+                self.daemon = True
+
+            def start(self):
+                pass
+
+        with unittest.mock.patch.object(webui.threading, "Timer", FakeTimer):
+            self.manager._finish(job, webui.STATUS_DONE)
+
+        self.assertEqual(scheduled[0][0], webui.PREVIEW_GRACE_SECONDS)
+        self.assertTrue(folder.exists())  # not yet: a viewer may still be watching
+        scheduled[0][1]()
+        self.assertFalse(folder.exists())
+
+    def test_stale_folders_from_a_crash_are_purged_on_start(self):
+        root = webui.live_root()
+        old, fresh = root / "old", root / "fresh"
+        for folder in (old, fresh):
+            folder.mkdir(parents=True)
+            (folder / "index.m3u8").write_text("x")
+        os.utime(old, (0, 0))
+
+        webui.purge_stale_previews()
+
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
 class JobLifecycleTests(unittest.TestCase):
     """Drive the manager directly: no ffmpeg, just the state machine."""
 

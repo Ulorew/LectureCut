@@ -15,6 +15,7 @@ import contextvars
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,12 @@ RECENT_SOURCE_DIRS = 8
 # Mutating requests must carry this header. A cross-site page cannot add a custom
 # header without a CORS preflight, which this server never approves.
 CSRF_HEADER = "X-LectureCut"
+# Segments are kept for a while after a job ends: a viewer may still be watching
+# the playlist when the final MP4 appears, and the page needs a moment to swap.
+PREVIEW_GRACE_SECONDS = 15 * 60
+LIVE_SERVE_RE = re.compile(r"^(index\.m3u8|init\.mp4|seg_\d{5}\.m4s)$")
+# Browsers will not play HEVC; a preview of one would be a black box.
+LIVE_ENCODER_BLOCKLIST = {"hevc_nvenc"}
 EVENT_HISTORY_LIMIT = 2000
 SSE_KEEPALIVE_SECONDS = 15.0
 
@@ -80,6 +87,10 @@ def model_hint() -> str:
     )
 
 
+def live_root() -> Path:
+    return core.model_cache_dir().parent / "live"
+
+
 def state_file_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     return base / "lecturecut" / "webui.json"
@@ -93,6 +104,7 @@ class Job:
     kind: str
     source: str
     settings: dict[str, Any]
+    live_dir: Path | None = None
     status: str = STATUS_QUEUED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -106,9 +118,18 @@ class Job:
     cancel: threading.Event = field(default_factory=threading.Event)
     subscribers: list["queue.Queue[Any]"] = field(default_factory=list)
 
+    def live_playlist(self) -> Path | None:
+        """The playlist, once the render has actually written one."""
+
+        if self.live_dir is None:
+            return None
+        playlist = self.live_dir / core.LIVE_PLAYLIST
+        return playlist if playlist.exists() else None
+
     def summary(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "live": self.live_playlist() is not None,
             "kind": self.kind,
             "source": self.source,
             "settings": self.settings,
@@ -141,8 +162,21 @@ class JobManager:
 
     # -- public API -----------------------------------------------------------
 
-    def submit(self, *, kind: str, source: str, settings: dict[str, Any]) -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], kind=kind, source=source, settings=settings)
+    def submit(
+        self,
+        *,
+        kind: str,
+        source: str,
+        settings: dict[str, Any],
+        live_dir: Path | None = None,
+    ) -> Job:
+        job = Job(
+            id=uuid.uuid4().hex[:12],
+            kind=kind,
+            source=source,
+            settings=settings,
+            live_dir=live_dir,
+        )
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
@@ -193,9 +227,28 @@ class JobManager:
         for channel in channels:
             channel.put(event)
 
+    def _schedule_preview_cleanup(self, job: Job) -> None:
+        """Drop the segments later, not the moment the job ends.
+
+        Deleting them at once would pull the playlist out from under a viewer who
+        is still watching it while the page switches over to the finished file.
+        """
+
+        folder = job.live_dir
+        if folder is None:
+            return
+
+        def remove() -> None:
+            shutil.rmtree(folder, ignore_errors=True)
+
+        timer = threading.Timer(PREVIEW_GRACE_SECONDS, remove)
+        timer.daemon = True
+        timer.start()
+
     def _finish(self, job: Job, status: str) -> None:
         job.status = status
         job.finished_at = time.time()
+        self._schedule_preview_cleanup(job)
         if status == STATUS_DONE:
             job.overall = 1.0
         self._publish(job, {"type": "status", "status": status})
@@ -291,6 +344,8 @@ class Config:
     allow_open: bool = True
     # Whether the page may point the server at folders outside the given roots.
     allow_browse: bool = True
+    # Render through a playlist so a job can be watched while it runs.
+    live_preview: bool = True
     source_dir: Path | None = None
     recent_source_dirs: list[Path] = field(default_factory=list)
     state_path: Path | None = None
@@ -615,6 +670,27 @@ def list_media(config: Config, index: ProcessedIndex | None = None) -> list[dict
     return entries
 
 
+def purge_stale_previews(grace: float = PREVIEW_GRACE_SECONDS) -> None:
+    """Clear segment folders left behind by a crash or a kill."""
+
+    root = live_root()
+    if not root.is_dir():
+        return
+    cutoff = time.time() - grace
+    for folder in root.iterdir():
+        try:
+            if folder.is_dir() and folder.stat().st_mtime < cutoff:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def live_preview_allowed(config: Config, settings: dict[str, Any]) -> bool:
+    if not config.live_preview:
+        return False
+    return str(settings.get("encoder") or "auto") not in LIVE_ENCODER_BLOCKLIST
+
+
 def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     app = FastAPI(title="LectureCut", docs_url=None, redoc_url=None)
 
@@ -650,6 +726,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "source_dir": str(config.current_source_dir()),
             "recent_source_dirs": [str(d) for d in config.recent_source_dirs],
             "allow_browse": config.allow_browse,
+            "live_preview": config.live_preview,
             "csrf_header": CSRF_HEADER,
             "allow_upload": config.allow_upload,
             "allow_open": config.allow_open,
@@ -799,6 +876,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         source = resolve_within_roots(str(raw_source), config)
 
         settings = dict(payload.get("settings") or {})
+        # Where segments are written is the server's business, not the page's.
+        settings.pop("live_dir", None)
+        settings.pop("keep_live_dir", None)
         output = settings.get("output")
         if output:
             destination = Path(str(output)).expanduser()
@@ -823,7 +903,16 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
                 status_code=400, detail="argparse rejected these settings"
             ) from None
 
-        job = manager.submit(kind="convert", source=str(source), settings=settings)
+        live_dir: Path | None = None
+        if live_preview_allowed(config, settings):
+            live_dir = live_root() / uuid.uuid4().hex[:12]
+            settings["live_dir"] = str(live_dir)
+            # The viewer, not the pipeline, decides when the segments go.
+            settings["keep_live_dir"] = True
+
+        job = manager.submit(
+            kind="convert", source=str(source), settings=settings, live_dir=live_dir
+        )
         return job.summary()
 
     @app.get("/api/jobs/{job_id}")
@@ -834,6 +923,24 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str) -> dict[str, Any]:
         return manager.cancel(job_id).summary()
+
+    @app.get("/api/jobs/{job_id}/live/{name}")
+    def live_segment(job_id: str, name: str) -> FileResponse:
+        """Serve one playlist or segment of a job being rendered."""
+
+        job = manager.get(job_id)
+        if job.live_dir is None or not LIVE_SERVE_RE.match(name):
+            raise HTTPException(status_code=404, detail="No such preview file")
+        path = job.live_dir / name
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Not written yet")
+        kind = (
+            "application/vnd.apple.mpegurl"
+            if name.endswith(".m3u8")
+            else "video/iso.segment"
+        )
+        # The playlist grows; a cached copy would freeze the preview.
+        return FileResponse(path, media_type=kind, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/jobs/{job_id}/events")
     def job_events(job_id: str) -> StreamingResponse:
@@ -912,6 +1019,11 @@ def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not let the page open finished files on this desktop",
     )
     parser.add_argument(
+        "--no-live-preview",
+        action="store_true",
+        help="Do not render through a playlist; results can only be watched when done",
+    )
+    parser.add_argument(
         "--no-browse",
         action="store_true",
         help="Keep the page to the given roots instead of letting it choose folders",
@@ -944,6 +1056,7 @@ def build_config(args: argparse.Namespace) -> Config:
         allow_upload=not args.no_upload,
         allow_open=not args.no_open,
         allow_browse=not args.no_browse,
+        live_preview=not args.no_live_preview,
         state_path=state_file_path(),
         allowed_hosts=allowed_hosts_for(args.host, args.port),
         require_csrf_header=True,
@@ -974,6 +1087,7 @@ def serve(argv: list[str] | None = None) -> int:
     if shutil.which("ffmpeg") is None:
         print("Warning: ffmpeg was not found on PATH; jobs will fail.")
     config = build_config(args)
+    purge_stale_previews()
     app = create_app(config)
     print(f"LectureCut UI on http://{args.host}:{args.port}", flush=True)
     print(f"  input folder: {config.current_source_dir()}", flush=True)
