@@ -238,6 +238,16 @@ AUDIO_DENOISE_HELP = {
     "none": "leave the noise alone",
 }
 OUTPUT_EXISTS_MODES = ("suffix", "overwrite", "error")
+
+# Live preview. A render written as an HLS event playlist can be watched - and
+# sought through - while it is still being produced, which an ordinary MP4
+# cannot: its index is only written at the very end. The playlist is remuxed into
+# a normal MP4 afterwards, which is a stream copy and takes seconds.
+LIVE_PLAYLIST = "index.m3u8"
+LIVE_INIT_SEGMENT = "init.mp4"
+LIVE_SEGMENT_PATTERN = "seg_%05d.m4s"
+LIVE_SEGMENT_SECONDS = 4
+LIVE_FILE_RE = re.compile(r"^(index\.m3u8|init\.mp4|seg_\d{5}\.m4s)(\.tmp)?$")
 ARNNDN_MODEL_SUFFIX = ".rnnn"
 
 # The rnnoise-nu models. They are ~300 KB each and not subject to copyright per
@@ -695,6 +705,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=23,
         help="libx264 CRF value",
+    )
+
+    live_group = parser.add_argument_group("live preview")
+    live_group.add_argument(
+        "--live-dir",
+        type=Path,
+        help=(
+            "Render into an HLS playlist in this folder so the result can be watched "
+            "while it is still being produced (e.g. mpv DIR/index.m3u8), then remux it "
+            "into the final MP4"
+        ),
+    )
+    live_group.add_argument(
+        "--keep-live-dir",
+        action="store_true",
+        help="Leave the playlist and segments in --live-dir after the remux",
     )
 
     analysis_group = parser.add_argument_group("analysis")
@@ -2275,6 +2301,46 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
     raise ValueError(f"Unsupported encoder: {encoder}")
 
 
+def lecturecut_metadata_args() -> list[str]:
+    return [
+        "-metadata",
+        f"{LECTURECUT_TAG}={LECTURECUT_VERSION}",
+        "-metadata",
+        f"comment=Processed by LectureCut {LECTURECUT_VERSION}",
+        # Without use_metadata_tags the mov muxer silently drops unknown keys.
+        "-movflags",
+        "+faststart+use_metadata_tags",
+    ]
+
+
+def live_output_args(live_dir: Path) -> list[str]:
+    """Mux as an HLS event playlist of fMP4 segments, playable as it grows.
+
+    temp_file makes each segment appear only once it is complete, so a player
+    reading the playlist never fetches half a segment.
+    """
+
+    return [
+        "-f",
+        "hls",
+        "-hls_time",
+        str(LIVE_SEGMENT_SECONDS),
+        "-hls_list_size",
+        "0",
+        "-hls_playlist_type",
+        "event",
+        "-hls_segment_type",
+        "fmp4",
+        "-hls_fmp4_init_filename",
+        LIVE_INIT_SEGMENT,
+        "-hls_flags",
+        "independent_segments+temp_file",
+        "-hls_segment_filename",
+        str(live_dir / LIVE_SEGMENT_PATTERN),
+        str(live_dir / LIVE_PLAYLIST),
+    ]
+
+
 def render_command(
     *,
     input_path: Path,
@@ -2282,8 +2348,9 @@ def render_command(
     filtergraph_path: Path,
     encoder: str,
     args: argparse.Namespace,
+    live_dir: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         "ffmpeg",
         "-hide_banner",
         "-y",
@@ -2302,15 +2369,52 @@ def render_command(
         "aac",
         "-b:a",
         args.audio_bitrate,
-        "-metadata",
-        f"{LECTURECUT_TAG}={LECTURECUT_VERSION}",
-        "-metadata",
-        f"comment=Processed by LectureCut {LECTURECUT_VERSION}",
-        # Without use_metadata_tags the mov muxer silently drops unknown keys.
-        "-movflags",
-        "+faststart+use_metadata_tags",
+    ]
+    if live_dir is not None:
+        # Tags are added by the remux instead; the segments cannot carry them.
+        return [*command, *live_output_args(live_dir)]
+    return [*command, *lecturecut_metadata_args(), str(output_path)]
+
+
+def remux_live_command(*, live_dir: Path, source: Path, output_path: Path) -> list[str]:
+    """Copy the finished playlist into one ordinary MP4.
+
+    The original input is opened only for its metadata, so a phone recording
+    keeps its creation date the way the direct render path does.
+    """
+
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-nostdin",
+        "-i",
+        str(live_dir / LIVE_PLAYLIST),
+        "-i",
+        str(source),
+        "-map",
+        "0",
+        "-map_metadata",
+        "1",
+        "-c",
+        "copy",
+        *lecturecut_metadata_args(),
         str(output_path),
     ]
+
+
+def clear_live_dir(live_dir: Path) -> None:
+    """Remove a previous playlist and its segments - and nothing else.
+
+    The folder is caller-supplied, so only files this pipeline writes are ever
+    deleted from it.
+    """
+
+    if not live_dir.is_dir():
+        return
+    for entry in live_dir.iterdir():
+        if entry.is_file() and LIVE_FILE_RE.match(entry.name):
+            entry.unlink()
 
 
 def render_with_fallback(
@@ -2326,6 +2430,7 @@ def render_with_fallback(
     temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
     if temp_output.exists():
         temp_output.unlink()
+    live_dir: Path | None = args.live_dir.expanduser() if args.live_dir else None
 
     for index, encoder in enumerate(candidates):
         command = render_command(
@@ -2334,11 +2439,23 @@ def render_with_fallback(
             filtergraph_path=filtergraph_path,
             encoder=encoder,
             args=args,
+            live_dir=live_dir,
         )
         if args.dry_run:
             report("\nRender command:")
             report(shell_join(command))
             return encoder, 0.0
+
+        if live_dir is not None:
+            live_dir.mkdir(parents=True, exist_ok=True)
+            # A fallback attempt starts a new playlist; a player must reload.
+            clear_live_dir(live_dir)
+            report_event(
+                "live",
+                playlist=str(live_dir / LIVE_PLAYLIST),
+                encoder=encoder,
+                attempt=index + 1,
+            )
 
         start_phase(PHASE_RENDER)
         report(f"Rendering with {encoder}...")
@@ -2347,6 +2464,14 @@ def render_with_fallback(
             result = run_command(
                 command, check=False, progress_total=expected_duration
             )
+            if result.returncode == 0 and live_dir is not None:
+                report("Remuxing the live playlist into the final MP4...")
+                run_command(
+                    remux_live_command(
+                        live_dir=live_dir, source=input_path, output_path=temp_output
+                    ),
+                    capture=True,
+                )
         except PipelineCancelled:
             # A cancelled render must not look like a failed encoder: the loop
             # below would otherwise start the whole job again on libx264.
@@ -2356,6 +2481,8 @@ def render_with_fallback(
         elapsed = time.monotonic() - start
         if result.returncode == 0:
             os.replace(temp_output, output_path)
+            if live_dir is not None and not args.keep_live_dir:
+                clear_live_dir(live_dir)
             return encoder, elapsed
 
         last_error = subprocess.CalledProcessError(result.returncode, command)

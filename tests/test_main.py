@@ -620,6 +620,148 @@ class LectureCutTests(unittest.TestCase):
         self.assertEqual(main.build_audio_filters(args), ["anull"])
 
 
+class LivePreviewTests(unittest.TestCase):
+    """Rendering into a playlist that can be watched while it grows."""
+
+    def render(self, **overrides):
+        values = {
+            "input_path": Path("in.MOV"),
+            "output_path": Path("out.tmp.mp4"),
+            "filtergraph_path": Path("graph.ffmpeg"),
+            "encoder": "libx264",
+            "args": main.parse_args(["in.MOV"]),
+        }
+        values.update(overrides)
+        return main.render_command(**values)
+
+    def test_live_render_writes_an_event_playlist(self):
+        command = self.render(live_dir=Path("/live"))
+        joined = " ".join(command)
+
+        self.assertIn("-f hls", joined)
+        self.assertIn("-hls_playlist_type event", joined)
+        self.assertIn("-hls_segment_type fmp4", joined)
+        # Segments appear only once complete, so a player never reads half of one.
+        self.assertIn("temp_file", joined)
+        self.assertEqual(command[-1], "/live/index.m3u8")
+
+    def test_live_render_leaves_tags_to_the_remux(self):
+        joined = " ".join(self.render(live_dir=Path("/live")))
+
+        self.assertNotIn("-metadata", joined)
+        self.assertNotIn("faststart", joined)
+
+    def test_direct_render_is_unchanged(self):
+        command = self.render()
+
+        self.assertEqual(command[-1], "out.tmp.mp4")
+        self.assertIn("+faststart+use_metadata_tags", command)
+        self.assertNotIn("hls", " ".join(command))
+
+    def test_remux_copies_streams_and_keeps_the_source_metadata(self):
+        command = main.remux_live_command(
+            live_dir=Path("/live"), source=Path("/in.MOV"), output_path=Path("/out.mp4")
+        )
+        joined = " ".join(command)
+
+        self.assertIn("-i /live/index.m3u8 -i /in.MOV", joined)
+        self.assertIn("-map 0 -map_metadata 1", joined)
+        self.assertIn("-c copy", joined)
+        self.assertIn(f"{main.LECTURECUT_TAG}={main.LECTURECUT_VERSION}", command)
+        self.assertIn("+faststart+use_metadata_tags", command)
+        self.assertEqual(command[-1], "/out.mp4")
+
+    def test_clearing_the_live_dir_removes_only_our_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            ours = ["index.m3u8", "init.mp4", "seg_00000.m4s", "seg_00007.m4s.tmp"]
+            theirs = ["unrelated.txt", "seg_1.m4s", "index.m3u8.bak", "movie.mp4"]
+            for name in ours + theirs:
+                (folder / name).write_text("x")
+
+            main.clear_live_dir(folder)
+
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted(theirs))
+
+    def test_clearing_a_missing_dir_is_harmless(self):
+        main.clear_live_dir(Path("/definitely/not/here"))
+
+    def fallback_run(self, *, returncodes, keep=False):
+        """Drive render_with_fallback with a fake ffmpeg; return what happened."""
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        live = base / "live"
+        output = base / "out.mp4"
+        argv = ["in.MOV", "--live-dir", str(live), "--encoder", "auto"]
+        if keep:
+            argv.append("--keep-live-dir")
+        args = main.parse_args(argv)
+        codes = iter(returncodes)
+        commands, events = [], []
+
+        def fake_run(command, capture=False, check=True, progress_total=None):
+            commands.append(command)
+            if "hls" in command:
+                (live / "index.m3u8").write_text("#EXTM3U")
+                (live / "seg_00000.m4s").write_text("segment")
+                code = next(codes)
+            else:  # the remux writes the temporary MP4
+                Path(command[-1]).write_text("final")
+                code = 0
+            return subprocess.CompletedProcess(command, code, "", "")
+
+        reporter = main.Reporter(
+            on_line=lambda text, error: None,
+            on_event=lambda kind, fields: events.append((kind, fields)),
+        )
+        token = main.ACTIVE_REPORTER.set(reporter)
+        try:
+            with unittest.mock.patch.object(main, "run_command", fake_run), \
+                    unittest.mock.patch.object(
+                        main, "encoder_candidates", lambda args: ["h264_nvenc", "libx264"]
+                    ):
+                encoder, _ = main.render_with_fallback(
+                    input_path=Path("in.MOV"),
+                    output_path=output,
+                    filtergraph_path=base / "graph",
+                    args=args,
+                )
+        finally:
+            main.ACTIVE_REPORTER.reset(token)
+        return encoder, commands, events, live, output
+
+    def test_a_live_render_is_remuxed_into_the_output(self):
+        encoder, commands, events, live, output = self.fallback_run(returncodes=[0])
+
+        self.assertEqual(encoder, "h264_nvenc")
+        self.assertEqual(output.read_text(), "final")
+        self.assertIn("-c", commands[-1])
+        self.assertEqual([k for k, _ in events if k == "live"], ["live"])
+        # Segments are cleaned up once the MP4 exists...
+        self.assertEqual(list(live.iterdir()), [])
+
+    def test_the_caller_can_keep_the_playlist(self):
+        _, _, _, live, _ = self.fallback_run(returncodes=[0], keep=True)
+
+        # ...unless a viewer may still be reading them.
+        self.assertTrue((live / "index.m3u8").exists())
+
+    def test_a_fallback_attempt_starts_a_fresh_playlist(self):
+        encoder, _, events, _, _ = self.fallback_run(returncodes=[1, 0])
+        attempts = [fields["attempt"] for kind, fields in events if kind == "live"]
+
+        self.assertEqual(encoder, "libx264")
+        # A player must reload: the second encoder writes a new playlist.
+        self.assertEqual(attempts, [1, 2])
+
+    def test_live_options_are_grouped_for_the_page_to_skip(self):
+        titles = [group["title"] for group in main.parser_schema()]
+
+        self.assertIn("live preview", titles)
+
+
 class ParserSchemaTests(unittest.TestCase):
     def test_schema_exposes_groups_and_field_kinds(self):
         schema = main.parser_schema()
