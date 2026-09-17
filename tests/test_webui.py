@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -896,6 +897,186 @@ class LivePreviewTests(unittest.TestCase):
 
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
+
+
+class TimeEstimateTests(unittest.TestCase):
+    """How long a job, and the whole queue, still has to go."""
+
+    def model(self, **values):
+        return webui.ThroughputModel(**values)
+
+    def job(self, **values):
+        base = {"id": "j", "kind": "convert", "source": "/in.mp4", "settings": {}}
+        base.update(values)
+        return webui.Job(**base)
+
+    def test_a_queued_job_is_estimated_from_its_length(self):
+        model = self.model(analysis_seconds=40, silence_rate=0.03, render_rate=0.3)
+        job = self.job(input_duration=1000.0)
+
+        # 40 s of analysis + 30 s of silence detection + 300 s of rendering
+        self.assertAlmostEqual(job.remaining_seconds(model, now=0.0), 370.0)
+
+    def test_skipped_stages_cost_nothing(self):
+        model = self.model(analysis_seconds=40, silence_rate=0.03, render_rate=0.3)
+        job = self.job(
+            input_duration=1000.0, settings={"no_analyze": True, "no_cut_silence": True}
+        )
+
+        self.assertAlmostEqual(job.remaining_seconds(model, now=0.0), 300.0)
+
+    def test_an_unknown_length_gives_no_estimate(self):
+        self.assertIsNone(self.job().remaining_seconds(self.model(), now=0.0))
+
+    def test_a_running_render_is_extrapolated_from_its_own_pace(self):
+        # The model thinks rendering takes 300 s, but this one is going twice as
+        # fast: 25% done after 37.5 s. Its own pace is what should count.
+        model = self.model(render_rate=0.3)
+        job = self.job(input_duration=1000.0, status=webui.STATUS_RUNNING)
+        job.enter_phase(main.PHASE_RENDER, now=100.0)
+        job.phase_fraction = 0.25
+
+        self.assertAlmostEqual(job.remaining_seconds(model, now=137.5), 112.5)
+
+    def test_too_early_in_a_phase_the_model_is_used_instead(self):
+        model = self.model(render_rate=0.3)
+        job = self.job(input_duration=1000.0, status=webui.STATUS_RUNNING)
+        job.enter_phase(main.PHASE_RENDER, now=100.0)
+        job.phase_fraction = 0.01
+
+        self.assertAlmostEqual(job.remaining_seconds(model, now=101.0), 299.0)
+
+    def test_during_analysis_the_later_stages_are_added(self):
+        model = self.model(analysis_seconds=40, silence_rate=0.03, render_rate=0.3)
+        job = self.job(input_duration=1000.0, status=webui.STATUS_RUNNING)
+        job.enter_phase(main.PHASE_MEASURE, now=0.0)
+        job.enter_phase(main.PHASE_CALIBRATE, now=15.0)  # same bucket, same clock
+
+        self.assertAlmostEqual(job.remaining_seconds(model, now=25.0), 15.0 + 30.0 + 300.0)
+
+    def test_a_finished_job_has_nothing_left(self):
+        job = self.job(input_duration=1000.0, status=webui.STATUS_DONE)
+
+        self.assertEqual(job.remaining_seconds(self.model(), now=0.0), 0.0)
+
+    def test_bucket_time_is_accounted_across_phases(self):
+        job = self.job(input_duration=1000.0, status=webui.STATUS_RUNNING)
+        job.enter_phase(main.PHASE_MEASURE, now=0.0)
+        job.enter_phase(main.PHASE_CALIBRATE, now=10.0)
+        job.enter_phase(main.PHASE_SILENCE, now=35.0)
+        job.enter_phase(main.PHASE_RENDER, now=65.0)
+        job.close_bucket(now=365.0)
+
+        self.assertEqual(
+            job.bucket_seconds,
+            {webui.ANALYSIS_BUCKET: 35.0, webui.SILENCE_BUCKET: 30.0, webui.RENDER_BUCKET: 300.0},
+        )
+
+    def test_the_first_finished_job_replaces_the_defaults(self):
+        model = self.model()
+        model.learn(
+            {webui.ANALYSIS_BUCKET: 50.0, webui.SILENCE_BUCKET: 100.0, webui.RENDER_BUCKET: 2000.0},
+            duration=5000.0,
+        )
+
+        self.assertAlmostEqual(model.analysis_seconds, 50.0)
+        self.assertAlmostEqual(model.silence_rate, 0.02)
+        self.assertAlmostEqual(model.render_rate, 0.4)
+
+    def test_later_jobs_are_averaged_in_but_never_ignored(self):
+        model = self.model(render_rate=0.4, samples=20)
+        model.learn({webui.RENDER_BUCKET: 1000.0}, duration=1000.0)  # this one took 1.0 s/s
+
+        # With many samples the weight bottoms out at a quarter, so a new kind of
+        # source still moves the estimate noticeably.
+        self.assertAlmostEqual(model.render_rate, 0.4 + 0.25 * (1.0 - 0.4))
+
+    def test_the_model_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "throughput.json"
+            model = webui.ThroughputModel.load(path)
+            model.learn({webui.RENDER_BUCKET: 900.0}, duration=3000.0)
+
+            reloaded = webui.ThroughputModel.load(path)
+
+            self.assertAlmostEqual(reloaded.render_rate, 0.3)
+            self.assertEqual(reloaded.samples, 1)
+
+    def test_a_damaged_model_file_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "throughput.json"
+            path.write_text("{not json")
+
+            self.assertEqual(webui.ThroughputModel.load(path).render_rate, webui.DEFAULT_RENDER_RATE)
+
+    def manager_with(self, jobs, **model):
+        manager = webui.JobManager.__new__(webui.JobManager)
+        manager.model = self.model(**model)
+        manager._lock = threading.Lock()
+        manager._jobs = {job.id: job for job in jobs}
+        manager._order = [job.id for job in jobs]
+        return manager
+
+    def test_a_queued_job_finishes_after_everything_ahead_of_it(self):
+        manager = self.manager_with(
+            [
+                self.job(id="done", input_duration=500.0, status=webui.STATUS_DONE),
+                self.job(id="first", input_duration=100.0),
+                self.job(id="second", input_duration=300.0),
+                self.job(id="third", input_duration=200.0),
+            ],
+            analysis_seconds=0, silence_rate=0, render_rate=0.5,
+        )
+
+        finishes = manager.finish_times(now=0.0)
+
+        self.assertNotIn("done", finishes)
+        self.assertEqual(finishes, {"first": 50.0, "second": 200.0, "third": 300.0})
+
+    def test_an_unknown_job_hides_the_finish_of_those_behind_it(self):
+        manager = self.manager_with(
+            [
+                self.job(id="first", input_duration=100.0),
+                self.job(id="mystery"),
+                self.job(id="last", input_duration=100.0),
+            ],
+            analysis_seconds=0, silence_rate=0, render_rate=0.5,
+        )
+
+        finishes = manager.finish_times(now=0.0)
+
+        self.assertEqual(finishes["first"], 50.0)
+        self.assertIsNone(finishes["mystery"])
+        self.assertIsNone(finishes["last"])
+
+    def test_listing_carries_both_figures(self):
+        manager = self.manager_with(
+            [self.job(id="first", input_duration=100.0), self.job(id="second", input_duration=100.0)],
+            analysis_seconds=0, silence_rate=0, render_rate=0.5,
+        )
+
+        rows = {row["id"]: row for row in manager.listing()}
+
+        self.assertEqual(rows["second"]["remaining_seconds"], 50.0)
+        self.assertEqual(rows["second"]["finishes_in_seconds"], 100.0)
+
+    def test_the_queue_total_adds_up_and_counts_unknowns(self):
+        manager = webui.JobManager.__new__(webui.JobManager)
+        manager.model = self.model(analysis_seconds=0, silence_rate=0, render_rate=0.5)
+        manager._lock = threading.Lock()
+        manager._jobs = {
+            "a": self.job(id="a", input_duration=100.0),
+            "b": self.job(id="b", input_duration=300.0),
+            "c": self.job(id="c"),  # length unknown
+            "d": self.job(id="d", input_duration=900.0, status=webui.STATUS_DONE),
+        }
+        manager._order = ["a", "b", "c", "d"]
+
+        queue = manager.queue_remaining()
+
+        self.assertEqual(queue["pending"], 3)
+        self.assertAlmostEqual(queue["remaining_seconds"], 200.0)
+        self.assertEqual(queue["unknown"], 1)
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")

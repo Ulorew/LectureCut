@@ -194,7 +194,26 @@ A render outruns playback by several times over, so there is no reason to wait
 for it. Press «Смотреть» on a running job and it plays from the beginning while
 the rest is still being produced, seekable up to wherever the render has got to.
 When the job finishes the player swaps to the finished file at the same
-position.
+position. The button is shown, greyed out, from the moment a job is queued: on a
+long lecture the audio analysis and the silence pass take several minutes before
+there is any video to watch.
+
+## How long the queue will take
+
+Every pending job shows when it will be done, counting everything ahead of it,
+and the queue shows the total and the clock time it will finish by.
+
+The estimate is learned rather than guessed. A job passes through three stages
+whose cost scales differently — analysis is a fixed number of short windows,
+the silence pass reads the audio once, the render decodes the whole input — and
+each finished job records how long each stage took on this machine, kept in
+`~/.config/lecturecut/throughput.json`. Inside the silence pass and the render
+the job's own pace is used instead, extrapolated from the fraction done.
+
+Measured on three jobs queued at once: until the first one finished, the built-in
+defaults were pessimistic, by up to two minutes on a two-minute lecture. From then
+on the last job in the queue was predicted within 1.4 s while it was still
+waiting, and every stage of the running jobs within 1.3 s.
 
 This works because the render is muxed as an HLS event playlist of fMP4 segments
 rather than straight to MP4, then remuxed into the usual faststart MP4 with a

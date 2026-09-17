@@ -98,6 +98,46 @@ function formatDuration(seconds) {
     : `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function formatEta(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 60) return "меньше минуты";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} мин`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} ч ${rest} мин` : `${hours} ч`;
+}
+
+function clockIn(seconds) {
+  const at = new Date(Date.now() + seconds * 1000);
+  const time = at.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const sameDay = at.toDateString() === new Date().toDateString();
+  return sameDay ? time : `${at.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })} ${time}`;
+}
+
+function renderQueueSummary(queue) {
+  const box = el("queue-summary");
+  if (!queue || !queue.pending) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const known = queue.pending - queue.unknown;
+  const parts = [`в работе и в очереди: ${queue.pending}`];
+  if (known > 0) {
+    // With unknown lengths among them, the sum is only a floor.
+    const lower = queue.unknown ? "не меньше " : "≈ ";
+    parts.push(`осталось ${lower}${formatEta(queue.remaining_seconds)}`);
+    if (!queue.unknown) parts.push(`закончится к ${clockIn(queue.remaining_seconds)}`);
+  }
+  if (queue.unknown) parts.push(`длительность неизвестна для ${queue.unknown}`);
+  let text = parts.join(" · ");
+  if (!queue.learned_from) {
+    text += " (оценка уточнится после первой готовой задачи)";
+  }
+  box.textContent = text;
+}
+
 function baseName(path) {
   return String(path).split("/").pop();
 }
@@ -749,7 +789,20 @@ function renderJobs() {
     const badge = document.createElement("span");
     badge.className = `badge ${job.status}`;
     badge.textContent = statusLabel(job.status);
-    head.append(name, badge);
+    const side = document.createElement("span");
+    side.className = "job-side";
+    if (ACTIVE_STATUSES.has(job.status) && job.finishes_in_seconds !== null) {
+      const eta = document.createElement("span");
+      eta.className = "muted small";
+      eta.textContent = `готово через ≈ ${formatEta(job.finishes_in_seconds)}`;
+      eta.title =
+        job.status === "queued"
+          ? "С учётом задач перед ней. Сама она займёт ≈ " + formatEta(job.remaining_seconds)
+          : "По текущему темпу этого этапа и скорости прошлых задач";
+      side.appendChild(eta);
+    }
+    side.appendChild(badge);
+    head.append(name, side);
     item.appendChild(head);
 
     const bar = document.createElement("div");
@@ -779,6 +832,17 @@ function renderJobs() {
           playJob(job);
         })
       );
+    } else if (ACTIVE_STATUSES.has(job.status) && job.settings && job.settings.live_dir) {
+      // Shown before it works, so the feature can be found: on a long lecture
+      // analysis and the silence pass take minutes before the render begins.
+      const pending = button("Смотреть", "secondary tiny", () => {});
+      pending.disabled = true;
+      pending.title = "Появится, когда начнётся рендер — после анализа звука и поиска тишины";
+      actions.appendChild(pending);
+      const hint = document.createElement("span");
+      hint.className = "muted small";
+      hint.textContent = "просмотр — с началом рендера";
+      actions.appendChild(hint);
     }
     if (job.status === "done" && job.result && job.result.output) {
       const output = job.result.output;
@@ -918,6 +982,7 @@ async function refreshJobs() {
     }
     state.jobs = data.jobs;
     renderJobs();
+    renderQueueSummary(data.queue);
     // Results land in folders the picker may not have listed yet.
     if (state.jobs.some((job) => job.status === "done")) {
       const known = new Set(state.files.map((file) => file.path));

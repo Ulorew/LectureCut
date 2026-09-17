@@ -67,6 +67,29 @@ LIVE_SERVE_RE = re.compile(r"^(index\.m3u8|init\.mp4|seg_\d{5}\.m4s)$")
 # Browsers will not play HEVC; a preview of one would be a black box.
 LIVE_ENCODER_BLOCKLIST = {"hevc_nvenc"}
 EVENT_HISTORY_LIMIT = 2000
+
+# Time estimates. A job passes through three buckets whose cost scales
+# differently: analysis is a fixed number of short windows, silence detection is
+# one audio pass over the input, and the render decodes all of it. The defaults
+# are what this project measured; each finished job replaces them with what this
+# machine actually took.
+ANALYSIS_BUCKET = "analysis"
+SILENCE_BUCKET = "silence"
+RENDER_BUCKET = "render"
+BUCKET_ORDER = (ANALYSIS_BUCKET, SILENCE_BUCKET, RENDER_BUCKET)
+PHASE_BUCKETS = {
+    core.PHASE_MEASURE: ANALYSIS_BUCKET,
+    core.PHASE_CALIBRATE: ANALYSIS_BUCKET,
+    core.PHASE_SILENCE: SILENCE_BUCKET,
+    core.PHASE_RENDER: RENDER_BUCKET,
+}
+DEFAULT_ANALYSIS_SECONDS = 40.0
+DEFAULT_SILENCE_RATE = 0.03  # wall seconds per input second
+DEFAULT_RENDER_RATE = 0.30
+# Before this much of a phase has passed, its own pace says too little.
+EXTRAPOLATE_MIN_FRACTION = 0.03
+EXTRAPOLATE_MIN_SECONDS = 3.0
+LEARNING_FLOOR = 0.25
 SSE_KEEPALIVE_SECONDS = 15.0
 
 STATUS_QUEUED = "queued"
@@ -97,6 +120,90 @@ def state_file_path() -> Path:
 
 
 @dataclass
+class ThroughputModel:
+    """How long each bucket takes on this machine, learned from finished jobs."""
+
+    analysis_seconds: float = DEFAULT_ANALYSIS_SECONDS
+    silence_rate: float = DEFAULT_SILENCE_RATE
+    render_rate: float = DEFAULT_RENDER_RATE
+    samples: int = 0
+    path: Path | None = field(default=None, repr=False)
+
+    @classmethod
+    def load(cls, path: Path | None) -> "ThroughputModel":
+        model = cls(path=path)
+        if path is None or not path.exists():
+            return model
+        try:
+            data = json.loads(path.read_text())
+            model.analysis_seconds = float(data["analysis_seconds"])
+            model.silence_rate = float(data["silence_rate"])
+            model.render_rate = float(data["render_rate"])
+            model.samples = int(data["samples"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return cls(path=path)
+        return model
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "analysis_seconds": self.analysis_seconds,
+            "silence_rate": self.silence_rate,
+            "render_rate": self.render_rate,
+            "samples": self.samples,
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.part")
+            temporary.write_text(json.dumps(payload, indent=2))
+            os.replace(temporary, self.path)
+        except OSError:
+            pass
+
+    def estimate(
+        self, duration: float | None, settings: dict[str, Any]
+    ) -> dict[str, float] | None:
+        """Seconds per bucket for a job of this length, or None if unknown."""
+
+        if duration is None:
+            return None
+        if settings.get("dry_run"):
+            render = 0.0
+        else:
+            render = self.render_rate * duration
+        return {
+            ANALYSIS_BUCKET: 0.0 if settings.get("no_analyze") else self.analysis_seconds,
+            SILENCE_BUCKET: 0.0 if settings.get("no_cut_silence") else self.silence_rate * duration,
+            RENDER_BUCKET: render,
+        }
+
+    def learn(self, bucket_seconds: dict[str, float], duration: float) -> None:
+        """Fold one finished job in.
+
+        The first job replaces the defaults outright, later ones are averaged in,
+        and the weight never drops below a quarter so a new kind of source - an
+        iPhone's HEVC after 720p H.264, say - shows up within a few jobs.
+        """
+
+        if duration <= 0:
+            return
+        weight = max(LEARNING_FLOOR, 1.0 / (self.samples + 1))
+
+        def blend(old: float, new: float) -> float:
+            return old + weight * (new - old)
+
+        if bucket_seconds.get(ANALYSIS_BUCKET):
+            self.analysis_seconds = blend(self.analysis_seconds, bucket_seconds[ANALYSIS_BUCKET])
+        if bucket_seconds.get(SILENCE_BUCKET):
+            self.silence_rate = blend(self.silence_rate, bucket_seconds[SILENCE_BUCKET] / duration)
+        if bucket_seconds.get(RENDER_BUCKET):
+            self.render_rate = blend(self.render_rate, bucket_seconds[RENDER_BUCKET] / duration)
+        self.samples += 1
+        self.save()
+
+
+@dataclass
 class Job:
     """One unit of work. `kind` exists so previews can join later as a sibling."""
 
@@ -105,6 +212,11 @@ class Job:
     source: str
     settings: dict[str, Any]
     live_dir: Path | None = None
+    input_duration: float | None = None
+    bucket: str | None = None
+    bucket_started: float | None = None
+    bucket_seconds: dict[str, float] = field(default_factory=dict)
+    phase_fraction: float = 0.0
     status: str = STATUS_QUEUED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -126,10 +238,74 @@ class Job:
         playlist = self.live_dir / core.LIVE_PLAYLIST
         return playlist if playlist.exists() else None
 
-    def summary(self) -> dict[str, Any]:
+    def enter_phase(self, phase: str, now: float) -> None:
+        bucket = PHASE_BUCKETS.get(phase)
+        self.phase_fraction = 0.0
+        if bucket == self.bucket:
+            return  # measure and calibrate share one bucket
+        self.close_bucket(now)
+        self.bucket = bucket
+        self.bucket_started = now
+
+    def close_bucket(self, now: float) -> None:
+        if self.bucket is not None and self.bucket_started is not None:
+            spent = now - self.bucket_started
+            self.bucket_seconds[self.bucket] = self.bucket_seconds.get(self.bucket, 0.0) + spent
+        self.bucket_started = None
+
+    def remaining_seconds(self, model: ThroughputModel, now: float) -> float | None:
+        """Time left for this job, or None when there is nothing to base it on.
+
+        Inside silence detection and the render the job's own pace is the best
+        guide, so it is extrapolated from the fraction done. Analysis reports no
+        useful fraction, so there the learned figure is used instead, less what
+        has already gone by.
+        """
+
+        if self.status in {STATUS_DONE, STATUS_ERROR, STATUS_CANCELLED}:
+            return 0.0
+        estimate = model.estimate(self.input_duration, self.settings)
+        if self.status == STATUS_QUEUED or self.bucket is None:
+            if estimate is None:
+                return None
+            elapsed = now - self.started_at if self.started_at is not None else 0.0
+            return max(sum(estimate.values()) - elapsed, 0.0)
+
+        index = BUCKET_ORDER.index(self.bucket)
+        elapsed = now - self.bucket_started if self.bucket_started is not None else 0.0
+        fraction = self.phase_fraction
+        if (
+            self.bucket != ANALYSIS_BUCKET
+            and fraction >= EXTRAPOLATE_MIN_FRACTION
+            and elapsed >= EXTRAPOLATE_MIN_SECONDS
+        ):
+            current = elapsed * (1.0 - fraction) / fraction
+        elif estimate is not None:
+            current = max(estimate[self.bucket] - elapsed, 0.0)
+        else:
+            return None
+        if index == len(BUCKET_ORDER) - 1:
+            return current
+        if estimate is None:
+            return None
+        return current + sum(estimate[b] for b in BUCKET_ORDER[index + 1 :])
+
+    def summary(
+        self,
+        model: ThroughputModel | None = None,
+        finishes_in: float | None = None,
+    ) -> dict[str, Any]:
+        remaining = (
+            self.remaining_seconds(model, time.time()) if model is not None else None
+        )
         return {
             "id": self.id,
             "live": self.live_playlist() is not None,
+            "input_duration": self.input_duration,
+            # This job's own work, and how long until it is done - which for a
+            # queued job includes everything ahead of it.
+            "remaining_seconds": remaining,
+            "finishes_in_seconds": finishes_in,
             "kind": self.kind,
             "source": self.source,
             "settings": self.settings,
@@ -152,7 +328,8 @@ class JobManager:
     running two would make both slower while making progress harder to read.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model: ThroughputModel | None = None) -> None:
+        self.model = model or ThroughputModel()
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._pending: queue.Queue[str] = queue.Queue()
@@ -169,6 +346,7 @@ class JobManager:
         source: str,
         settings: dict[str, Any],
         live_dir: Path | None = None,
+        input_duration: float | None = None,
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -176,6 +354,7 @@ class JobManager:
             source=source,
             settings=settings,
             live_dir=live_dir,
+            input_duration=input_duration,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -191,9 +370,62 @@ class JobManager:
             raise HTTPException(status_code=404, detail=f"No such job: {job_id}")
         return job
 
-    def listing(self) -> list[dict[str, Any]]:
+    def finish_times(self, now: float) -> dict[str, float | None]:
+        """Seconds until each pending job is done, in the order the worker runs them.
+
+        One worker drains the queue first in, first out, so a job finishes after
+        everything submitted before it. Once any job ahead has no estimate, none
+        of the later ones can have one either.
+        """
+
         with self._lock:
-            return [self._jobs[job_id].summary() for job_id in reversed(self._order)]
+            jobs = [self._jobs[job_id] for job_id in self._order]
+        finishes: dict[str, float | None] = {}
+        ahead: float | None = 0.0
+        for job in jobs:
+            if job.status not in {STATUS_QUEUED, STATUS_RUNNING}:
+                continue
+            own = job.remaining_seconds(self.model, now)
+            if ahead is None or own is None:
+                ahead = None
+                finishes[job.id] = None
+            else:
+                ahead += own
+                finishes[job.id] = ahead
+        return finishes
+
+    def listing(self) -> list[dict[str, Any]]:
+        finishes = self.finish_times(time.time())
+        with self._lock:
+            return [
+                self._jobs[job_id].summary(self.model, finishes.get(job_id))
+                for job_id in reversed(self._order)
+            ]
+
+    def queue_remaining(self) -> dict[str, Any]:
+        """Time until the whole queue is through, and whether that is complete."""
+
+        total = 0.0
+        unknown = 0
+        pending = 0
+        now = time.time()
+        with self._lock:
+            jobs = [self._jobs[job_id] for job_id in self._order]
+        for job in jobs:
+            if job.status not in {STATUS_QUEUED, STATUS_RUNNING}:
+                continue
+            pending += 1
+            remaining = job.remaining_seconds(self.model, now)
+            if remaining is None:
+                unknown += 1
+            else:
+                total += remaining
+        return {
+            "pending": pending,
+            "remaining_seconds": total,
+            "unknown": unknown,
+            "learned_from": self.model.samples,
+        }
 
     def cancel(self, job_id: str) -> Job:
         job = self.get(job_id)
@@ -248,6 +480,9 @@ class JobManager:
     def _finish(self, job: Job, status: str) -> None:
         job.status = status
         job.finished_at = time.time()
+        job.close_bucket(job.finished_at)
+        if status == STATUS_DONE and job.input_duration and not job.settings.get("dry_run"):
+            self.model.learn(job.bucket_seconds, job.input_duration)
         self._schedule_preview_cleanup(job)
         if status == STATUS_DONE:
             job.overall = 1.0
@@ -285,8 +520,10 @@ class JobManager:
             if kind == "phase":
                 job.phase = str(fields.get("phase"))
                 job.overall = float(fields.get("overall") or 0.0)
+                job.enter_phase(job.phase, time.time())
             elif kind == "progress":
                 job.overall = float(fields.get("overall") or 0.0)
+                job.phase_fraction = float(fields.get("fraction") or 0.0)
             elif kind == "result":
                 job.result = dict(fields)
             elif kind == "analysis":
@@ -349,6 +586,7 @@ class Config:
     source_dir: Path | None = None
     recent_source_dirs: list[Path] = field(default_factory=list)
     state_path: Path | None = None
+    throughput_path: Path | None = None
     allowed_hosts: set[str] | None = None
     require_csrf_header: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -685,6 +923,21 @@ def purge_stale_previews(grace: float = PREVIEW_GRACE_SECONDS) -> None:
             continue
 
 
+def effective_duration(source: Path, settings: dict[str, Any]) -> float | None:
+    """The stretch of the input a job will actually process, if it can be probed."""
+
+    try:
+        start = float(settings.get("start") or 0.0)
+        limit = settings.get("limit")
+        media = core.probe_media(
+            source, start=start, limit=float(limit) if limit not in (None, "") else None
+        )
+    except (core.PipelineError, subprocess.CalledProcessError, ValueError, OSError):
+        # An unreadable file still gets queued; the pipeline reports what is wrong.
+        return None
+    return media.duration if media.duration > 0 else None
+
+
 def live_preview_allowed(config: Config, settings: dict[str, Any]) -> bool:
     if not config.live_preview:
         return False
@@ -718,7 +971,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             response.headers["Cache-Control"] = "no-store, must-revalidate"
         return response
 
-    manager = jobs or JobManager()
+    manager = jobs or JobManager(ThroughputModel.load(config.throughput_path))
     processed = ProcessedIndex()
     app.state.config = config
     app.state.jobs = manager
@@ -900,7 +1153,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
 
     @app.get("/api/jobs")
     def job_list() -> dict[str, Any]:
-        return {"jobs": manager.listing()}
+        return {"jobs": manager.listing(), "queue": manager.queue_remaining()}
 
     @app.post("/api/jobs")
     def create_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -945,9 +1198,13 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             settings["keep_live_dir"] = True
 
         job = manager.submit(
-            kind="convert", source=str(source), settings=settings, live_dir=live_dir
+            kind="convert",
+            source=str(source),
+            settings=settings,
+            live_dir=live_dir,
+            input_duration=effective_duration(source, settings),
         )
-        return job.summary()
+        return job.summary(manager.model, manager.finish_times(time.time()).get(job.id))
 
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict[str, Any]:
@@ -1092,6 +1349,7 @@ def build_config(args: argparse.Namespace) -> Config:
         allow_browse=not args.no_browse,
         live_preview=not args.no_live_preview,
         state_path=state_file_path(),
+        throughput_path=state_file_path().with_name("throughput.json"),
         allowed_hosts=allowed_hosts_for(args.host, args.port),
         require_csrf_header=True,
         source_dir=default_source,

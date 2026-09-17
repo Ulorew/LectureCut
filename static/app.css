@@ -345,3 +345,20 @@ dialog#folder-dialog::backdrop { background: rgba(0, 0, 0, .55); }
 .player-bar .muted { flex: 1 1 auto; }
 
 .dropzone.warn { border-color: var(--warn); color: var(--warn); }
+
+/* --- time estimates ------------------------------------------------------- */
+
+.queue-summary {
+  margin: -4px 0 10px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-radius: 6px;
+}
+.job-side { display: flex; align-items: baseline; gap: 8px; flex: 0 0 auto; }
+
+/* On a short window the panel cap and the list's own minimum height cannot both
+   hold, and the list spilled out below the panel. Let the panel grow there. */
+@media (max-height: 820px) {
+  #source-panel { max-height: none; }
+  #source-panel .file-list { max-height: 45vh; }
+}
