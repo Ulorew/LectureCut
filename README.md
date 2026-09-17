@@ -177,10 +177,27 @@ from ~7 LU to 20-25 LU. `afftdn` remains the default denoiser.
 ## When a denoiser goes wrong
 
 Any denoiser can mistake speech for noise. Before the run, the pipeline measures
-the speech level with and without the denoiser on the sampled windows; if the
-denoiser costs more than `--denoise-loss-limit` dB (6 by default), it is removing
-speech rather than noise and the run falls back to `afftdn` — or to no denoise if
-`afftdn` was the culprit. `--denoise-loss-limit 0` turns the check off.
+the sampled windows with and without the denoiser - on exactly the signal the
+render will feed it, downmixed first if `--mono` is set - and checks two things:
+
+- **loudness**: costing more than `--denoise-loss-limit` dB (6 by default) means
+  it is removing speech rather than noise;
+- **spectral tilt**: the presence band (2-8 kHz) against the body band
+  (100-1000 Hz) moving by more than 6 dB means it is reshaping the voice -
+  muffled, as if under water, when negative, thin when positive.
+
+Loudness alone missed the worst case: an afftdn that stripped the upper
+frequencies off a seminar changed its loudness by 0.3 dB while tilting it by
+-9.3 dB. A denoiser that fails steps down to `afftdn`, then to no denoise, and
+each step is measured again. `--denoise-loss-limit 0` turns the check off. The
+queue shows which denoiser each job actually ran, and says so when it differs
+from the one requested.
+
+afftdn subtracts whatever it believes is at or below its noise profile, so that
+profile is kept below the quietest speech. On a clean recording it sits a few
+dB above the noise floor, where that leaves less hiss; as the speech gets closer
+to the noise the margin shrinks to nothing, because there the same margin puts
+the profile over the speech itself.
 
 The noise gate is subject to the same reasoning. Sitting a fixed distance above
 the noise floor is only safe when the speech is well clear of it: on a recording

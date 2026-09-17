@@ -805,6 +805,26 @@ function renderJobs() {
     head.append(name, side);
     item.appendChild(head);
 
+    // What the job denoises with. A dropdown moved by an arrow key or a scroll
+    // wheel looks exactly like a run with the usual settings until you listen.
+    const meta = document.createElement("div");
+    meta.className = "job-meta small";
+    const requested = (job.settings && job.settings.denoise) || "auto";
+    const result = job.result || {};
+    if (result.denoise_used) {
+      meta.textContent = `шумодав: ${result.denoise_used}`;
+      if (result.denoise_filter) meta.title = result.denoise_filter;
+      if (result.denoise_requested && result.denoise_requested !== result.denoise_used) {
+        const fallback = document.createElement("span");
+        fallback.className = "warn";
+        fallback.textContent = ` — вместо ${result.denoise_requested}: тот портил речь`;
+        meta.appendChild(fallback);
+      }
+    } else {
+      meta.textContent = `шумодав: ${requested}`;
+    }
+    item.appendChild(meta);
+
     const bar = document.createElement("div");
     bar.className = "progress mini";
     const fill = document.createElement("div");

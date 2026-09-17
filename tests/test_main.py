@@ -335,6 +335,92 @@ class LectureCutTests(unittest.TestCase):
         self.assertNotIn("agate", [item.split("=")[0] for item in noisy_chain])
         self.assertIn("agate", [item.split("=")[0] for item in quiet_chain])
 
+    def checks(self, *results):
+        """A fake measurement returning each check in turn, then None when off."""
+
+        queue = list(results)
+
+        def measure(input_path, *, args, analysis):
+            if main.resolved_denoise_mode(args) == "none" or not queue:
+                return None
+            check = queue.pop(0)
+            return main.DenoiseCheck(
+                main.resolved_denoise_mode(args),
+                check.speech_before,
+                check.speech_after,
+                check.tilt_before,
+                check.tilt_after,
+            )
+
+        return measure
+
+    def run_sanity(self, args, *results):
+        with unittest.mock.patch.object(main, "measure_denoise_effect", self.checks(*results)):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                main.enforce_denoise_sanity(main.Path("in.mp4"), args=args, analysis=self.analysis())
+
+    def test_a_muffling_denoiser_is_replaced_even_at_equal_loudness(self):
+        # The seminar case: 0.3 dB of loudness, but the upper frequencies gone.
+        args = self.audio_args(denoise="afftdn")
+        self.run_sanity(args, main.DenoiseCheck("afftdn", -40.0, -40.3, 0.0, -9.3))
+
+        self.assertEqual(args.denoise, "none")
+
+    def test_a_thinning_denoiser_is_replaced_too(self):
+        args = self.audio_args(denoise="arnndn", arnndn_model="/m.rnnn")
+        self.run_sanity(
+            args,
+            main.DenoiseCheck("arnndn", -40.0, -40.5, 0.0, +7.1),
+            main.DenoiseCheck("afftdn", -40.0, -40.2, 0.0, -2.0),
+        )
+
+        self.assertEqual(args.denoise, "afftdn")
+
+    def test_the_fallback_is_measured_as_well(self):
+        # arnndn fails, and so does the afftdn it falls back to: end with none.
+        args = self.audio_args(denoise="arnndn", arnndn_model="/m.rnnn")
+        self.run_sanity(
+            args,
+            main.DenoiseCheck("arnndn", -40.0, -46.1),
+            main.DenoiseCheck("afftdn", -40.0, -40.3, 0.0, -10.4),
+        )
+
+        self.assertEqual(args.denoise, "none")
+
+    def test_a_modest_tilt_is_accepted(self):
+        args = self.audio_args(denoise="afftdn")
+        self.run_sanity(args, main.DenoiseCheck("afftdn", -40.0, -40.2, 0.0, -5.5))
+
+        self.assertEqual(args.denoise, "afftdn")
+
+    def test_spectral_probe_graph_orders_body_before_presence(self):
+        graph = main.spectral_probe_graph(["highpass=f=85"])
+
+        self.assertIn("ebur128", graph)
+        self.assertLess(
+            graph.index("lowpass=f=1000,volumedetect"), graph.index("lowpass=f=8000,volumedetect")
+        )
+
+    def test_spectral_probe_log_is_read_by_instance_order(self):
+        # ffmpeg may print the later instance first; the index decides.
+        log = "\n".join(
+            [
+                "[Parsed_volumedetect_9 @ 0x2] mean_volume: -52.0 dB",
+                "[Parsed_volumedetect_6 @ 0x1] mean_volume: -40.0 dB",
+                "    I:         -38.5 LUFS",
+            ]
+        )
+
+        loudness, tilt = main.parse_spectral_probe(log)
+
+        self.assertEqual(loudness, -38.5)
+        self.assertEqual(tilt, -12.0)  # presence (-52) minus body (-40)
+
+    def test_a_probe_without_band_levels_gives_no_tilt(self):
+        self.assertEqual(
+            main.parse_spectral_probe("    I:         -38.5 LUFS"), (-38.5, None)
+        )
+
     def test_denoise_loss_is_the_difference_in_speech_level(self):
         check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-48.6)
 
@@ -345,7 +431,7 @@ class LectureCutTests(unittest.TestCase):
         check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-48.6)
 
         with unittest.mock.patch.object(
-            main, "measure_denoise_effect", lambda *a, **k: check
+            main, "measure_denoise_effect", self.checks(check)
         ):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
@@ -359,7 +445,7 @@ class LectureCutTests(unittest.TestCase):
         check = main.DenoiseCheck("arnndn", speech_before=-22.0, speech_after=-23.1)
 
         with unittest.mock.patch.object(
-            main, "measure_denoise_effect", lambda *a, **k: check
+            main, "measure_denoise_effect", self.checks(check)
         ):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
@@ -373,7 +459,7 @@ class LectureCutTests(unittest.TestCase):
         check = main.DenoiseCheck("afftdn", speech_before=-22.0, speech_after=-40.0)
 
         with unittest.mock.patch.object(
-            main, "measure_denoise_effect", lambda *a, **k: check
+            main, "measure_denoise_effect", self.checks(check)
         ):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(
@@ -499,7 +585,40 @@ class LectureCutTests(unittest.TestCase):
         noisy_room = main.denoise_filters(args, noise_floor_db=-45.0, snr_db=12.0)
 
         self.assertEqual(quiet_room, ["afftdn=nr=10:nf=-64:tn=1"])
-        self.assertEqual(noisy_room, ["afftdn=nr=28:nf=-39:tn=1"])
+        # 12 dB of SNR leaves 1 dB of headroom above the floor, not the 6 dB a
+        # clean recording gets.
+        self.assertEqual(noisy_room, ["afftdn=nr=28:nf=-44:tn=1"])
+
+    def test_afftdn_profile_never_sits_above_the_quiet_speech(self):
+        # The seminar that came out sounding under water: floor -43.2 dB, speech
+        # in its quiet passages at -42.6 LUFS, 3.3 dB of SNR. The old rule put the
+        # profile at -37, over the speech; it has to stay under it.
+        profile = main.afftdn_noise_profile(
+            noise_floor_db=-43.2, snr_db=3.3, quiet_speech_lufs=-42.6
+        )
+
+        self.assertEqual(profile, -46)
+        self.assertLess(profile, -42.6)
+
+    def test_a_clean_recording_keeps_its_headroom(self):
+        # 31.7 dB of SNR: the speech guard is far away and the full margin applies.
+        self.assertEqual(
+            main.afftdn_noise_profile(
+                noise_floor_db=-49.1, snr_db=31.7, quiet_speech_lufs=-23.0
+            ),
+            -43,
+        )
+
+    def test_headroom_shrinks_with_the_snr(self):
+        profile = lambda snr: main.afftdn_noise_profile(
+            noise_floor_db=-50.0, snr_db=snr, quiet_speech_lufs=None
+        )
+
+        self.assertEqual(profile(3.0), -50)
+        self.assertEqual(profile(10.0), -50)
+        self.assertEqual(profile(16.0), -47)
+        self.assertEqual(profile(22.0), -44)
+        self.assertEqual(profile(40.0), -44)
 
     def test_denoise_modes_and_model_validation(self):
         self.assertEqual(

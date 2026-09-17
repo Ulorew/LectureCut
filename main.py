@@ -262,6 +262,19 @@ ARNNDN_MODEL_MAX_BYTES = 2 * 1024 * 1024
 ARNNDN_DEFAULT_MODEL = "lq"
 # A denoiser that quietens speech this much is destroying it, not cleaning it.
 DENOISE_LOSS_LIMIT_DB = 6.0
+# afftdn subtracts everything it believes is at or below its noise profile. Put
+# that profile above the quietest speech and it subtracts the speech: on a seminar
+# with 3 dB of SNR a profile of -37 dB sat over passages spoken at -43 LUFS, and
+# they came out sounding as if under water.
+NF_SPEECH_MARGIN_DB = 3.0
+# How far a denoiser may tilt the spectrum - presence band against body band -
+# before it counts as reshaping the voice rather than cleaning it. The seminar's
+# under-water render measured -9.3 dB against a transparent one; the corrected
+# afftdn -4.3.
+DENOISE_TILT_LIMIT_DB = 6.0
+BODY_BAND_HZ = (100, 1000)
+PRESENCE_BAND_HZ = (2000, 8000)
+VOLUMEDETECT_RE = re.compile(r"\[Parsed_volumedetect_(\d+) @ [^\]]+\] mean_volume: (-?[\d.]+) dB")
 # The gate must sit below the quietest speech worth keeping, not just above the
 # noise; with a poor SNR there is no such gap and gating is simply wrong.
 GATE_SPEECH_MARGIN_DB = 12.0
@@ -1636,11 +1649,32 @@ def apply_silence_bias(threshold_db: float, bias_db: float) -> float:
     return clamp(threshold_db + bias_db, *SILENCE_THRESHOLD_LIMITS)
 
 
+def afftdn_noise_profile(
+    *, noise_floor_db: float, snr_db: float, quiet_speech_lufs: float | None
+) -> float:
+    """Where afftdn should believe the noise sits.
+
+    A little above the measured floor helps when the speech is well clear of it:
+    tuned on a lecture with 20 dB of SNR, floor + 6 left 3 dB less hiss. With the
+    speech close to the noise the same margin eats the speech, so it shrinks to
+    nothing by 10 dB of SNR, and the profile is kept below the quietest speech
+    whatever the floor says - the per-window floor runs high whenever a window
+    holds no real pause.
+    """
+
+    headroom = clamp((snr_db - 10.0) / 2.0, 0.0, 6.0)
+    profile = noise_floor_db + headroom
+    if quiet_speech_lufs is not None:
+        profile = min(profile, quiet_speech_lufs - NF_SPEECH_MARGIN_DB)
+    return clamp(round(profile), -80.0, -20.0)
+
+
 def denoise_filters(
     args: argparse.Namespace,
     *,
     noise_floor_db: float,
     snr_db: float,
+    quiet_speech_lufs: float | None = None,
 ) -> list[str]:
     mode = args.denoise
     if mode == "auto":
@@ -1653,12 +1687,15 @@ def denoise_filters(
         return [f"arnndn=m={filter_escape(str(model))}"]
     if mode == "anlmdn":
         return [f"anlmdn=s={args.anlmdn_strength:g}:p=0.002:r=0.006"]
-    # afftdn: aim the noise profile slightly above the measured floor, and reduce
-    # harder when the recording has little headroom between speech and noise.
-    # Measured on a phone-recorded lecture (SNR 20 dB): nr=25:nf=-51 left 3 dB
-    # less residual noise than nr=20:nf=-54, while staying clear of nr=30 where
-    # afftdn starts adding watery artifacts of its own.
-    noise_profile = clamp(round(noise_floor_db + 6.0), -80.0, -20.0)
+    # Reduce harder when speech and noise are close. The strength barely touches
+    # the speech once the profile is right - measured on the same seminar
+    # passage, nr 8, 12 and 20 took the same from it - so the profile is the
+    # setting that matters.
+    noise_profile = afftdn_noise_profile(
+        noise_floor_db=noise_floor_db,
+        snr_db=snr_db,
+        quiet_speech_lufs=quiet_speech_lufs,
+    )
     reduction = clamp(round(45.0 - snr_db), 10.0, 28.0)
     return [f"afftdn=nr={reduction:g}:nf={noise_profile:g}:tn=1"]
 
@@ -1920,6 +1957,7 @@ def audio_chain_for(
             args,
             noise_floor_db=noise_floor_db,
             snr_db=speech_lufs - noise_floor_db,
+            quiet_speech_lufs=analysis.speech_lufs if analysis else FALLBACK_SPEECH_LUFS,
         )
     )
     if not args.no_gate:
@@ -1977,15 +2015,76 @@ def measure_processed_loudness(
 
 @dataclass(frozen=True)
 class DenoiseCheck:
-    """What the denoiser did to the speech, measured rather than assumed."""
+    """What the denoiser did to the speech, measured rather than assumed.
+
+    Loudness alone missed the worst case. An afftdn that stripped the upper
+    frequencies off a seminar - the sound of speech under water - changed the
+    integrated loudness by 0.3 dB, because the low body of the voice carries
+    most of it. The tilt between presence and body bands is what moved.
+    """
 
     mode: str
     speech_before: float
     speech_after: float
+    tilt_before: float = 0.0
+    tilt_after: float = 0.0
 
     @property
     def loss_db(self) -> float:
         return self.speech_before - self.speech_after
+
+    @property
+    def tilt_change_db(self) -> float:
+        return self.tilt_after - self.tilt_before
+
+
+def spectral_probe_graph(chain: list[str]) -> str:
+    """One pass giving loudness plus the body and presence band levels."""
+
+    body_low, body_high = BODY_BAND_HZ
+    presence_low, presence_high = PRESENCE_BAND_HZ
+    prefix = ",".join(chain) if chain else "anull"
+    # The two volumedetect instances are told apart by their order in the graph.
+    return (
+        f"[0:a:0]{prefix},asplit=3[l][b][p];"
+        "[l]ebur128[lo];"
+        f"[b]highpass=f={body_low},lowpass=f={body_high},volumedetect[bo];"
+        f"[p]highpass=f={presence_low},lowpass=f={presence_high},volumedetect[po];"
+        "[lo][bo][po]amix=inputs=3[out]"
+    )
+
+
+def parse_spectral_probe(log: str) -> tuple[float | None, float | None]:
+    """Return (integrated loudness, presence minus body) from a probe's log."""
+
+    loudness = first_match(EBUR128_I_RE, log)
+    levels = sorted((int(index), float(value)) for index, value in VOLUMEDETECT_RE.findall(log))
+    if len(levels) < 2:
+        return loudness, None
+    body, presence = levels[0][1], levels[1][1]
+    return loudness, presence - body
+
+
+def run_spectral_probe(
+    path: Path, *, start: float, duration: float, chain: list[str]
+) -> tuple[float | None, float | None]:
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        *ffmpeg_input_options(start, duration),
+        "-i",
+        str(path),
+        "-filter_complex",
+        spectral_probe_graph(chain),
+        "-map",
+        "[out]",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = run_command(command, capture=True)
+    return parse_spectral_probe("\n".join(p for p in (result.stdout, result.stderr) if p))
 
 
 def measure_denoise_effect(
@@ -2009,27 +2108,39 @@ def measure_denoise_effect(
         args,
         noise_floor_db=analysis.noise_floor_db,
         snr_db=analysis.snr_db,
+        quiet_speech_lufs=analysis.speech_lufs,
     )
     if not denoise:
         return None
 
+    if args.mono:
+        prefix = ["aformat=channel_layouts=mono", *prefix]
     window = min(args.analysis_window, GAIN_CALIBRATION_WINDOW)
     plain: list[float] = []
     treated: list[float] = []
+    plain_tilt: list[float] = []
+    treated_tilt: list[float] = []
     for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]:
-        for chain, sink in ((prefix, plain), (prefix + denoise, treated)):
-            log = run_audio_probe(
-                input_path,
-                start=args.start + start,
-                duration=window,
-                audio_filter=",".join([*chain, "ebur128"]),
+        for chain, loud_sink, tilt_sink in (
+            (prefix, plain, plain_tilt),
+            (prefix + denoise, treated, treated_tilt),
+        ):
+            loudness, tilt = run_spectral_probe(
+                input_path, start=args.start + start, duration=window, chain=chain
             )
-            value = first_match(EBUR128_I_RE, log)
-            if value is not None:
-                sink.append(value)
+            if loudness is not None:
+                loud_sink.append(loudness)
+            if tilt is not None:
+                tilt_sink.append(tilt)
     if not plain or not treated:
         return None
-    return DenoiseCheck(mode, combine_loudness(plain), combine_loudness(treated))
+    return DenoiseCheck(
+        mode,
+        combine_loudness(plain),
+        combine_loudness(treated),
+        tilt_before=median(plain_tilt) if plain_tilt else 0.0,
+        tilt_after=median(treated_tilt) if treated_tilt else 0.0,
+    )
 
 
 def enforce_denoise_sanity(
@@ -2038,23 +2149,43 @@ def enforce_denoise_sanity(
     args: argparse.Namespace,
     analysis: AudioAnalysis | None,
 ) -> None:
-    """Fall back to a predictable denoiser when the chosen one destroys speech."""
+    """Step down to a gentler denoiser for as long as the current one harms speech.
+
+    The order is the requested denoiser, then afftdn, then none. Each fallback is
+    measured too: the afftdn an arnndn failure fell back to used to go unchecked,
+    and on a noisy enough recording it was the thing that muffled the voice.
+    """
 
     if analysis is None or args.denoise_loss_limit <= 0:
         return
-    check = measure_denoise_effect(input_path, args=args, analysis=analysis)
-    if check is None:
-        return
-    report(f"Denoiser {check.mode} costs {check.loss_db:.1f} dB of speech")
-    if check.loss_db <= args.denoise_loss_limit:
-        return
-    fallback = "afftdn" if check.mode != "afftdn" else "none"
-    report(
-        f"  that is more than {args.denoise_loss_limit:g} dB, so it is removing "
-        f"speech rather than noise; using {fallback} instead",
-        error=True,
-    )
-    args.denoise = fallback
+    while True:
+        check = measure_denoise_effect(input_path, args=args, analysis=analysis)
+        if check is None:
+            return  # nothing left to check: denoising is off
+        report(
+            f"Denoiser {check.mode} costs {check.loss_db:.1f} dB of speech and tilts "
+            f"its spectrum by {check.tilt_change_db:+.1f} dB"
+        )
+        reason = denoise_failure(check, args)
+        if reason is None:
+            return
+        fallback = "afftdn" if check.mode != "afftdn" else "none"
+        report(f"  {reason}; using {fallback} instead", error=True)
+        args.denoise = fallback
+
+
+def denoise_failure(check: DenoiseCheck, args: argparse.Namespace) -> str | None:
+    if check.loss_db > args.denoise_loss_limit:
+        return (
+            f"that is more than {args.denoise_loss_limit:g} dB, so it is removing "
+            "speech rather than noise"
+        )
+    if abs(check.tilt_change_db) > DENOISE_TILT_LIMIT_DB:
+        return (
+            f"a tilt past {DENOISE_TILT_LIMIT_DB:g} dB reshapes the voice - muffled "
+            "when negative, thin when positive"
+        )
+    return None
 
 
 def calibrate_gain(
@@ -2708,6 +2839,9 @@ def run_preview_sweep(
 def run_pipeline(args: argparse.Namespace) -> int:
     if args.download_models is not None:
         return install_models(args.download_models)
+    # Kept before any fallback can change it, so a result can say whether the
+    # denoiser that ran is the one that was asked for.
+    args.denoise_requested = resolved_denoise_mode(args)
     require_command("ffmpeg")
     # Before any temporary directory exists: a refusal here has nothing to clean.
     validate_denoise_settings(args)
@@ -2803,6 +2937,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
             realtime=realtime,
             silence_threshold=str(args.silence_threshold),
             audio_chain=list(args.audio_chain),
+            denoise_requested=args.denoise_requested,
+            denoise_used=resolved_denoise_mode(args),
+            denoise_filter=next(
+                (
+                    stage
+                    for stage in args.audio_chain
+                    if stage.split("=", 1)[0] in {"afftdn", "anlmdn", "arnndn"}
+                ),
+                None,
+            ),
         )
         return 0
     finally:

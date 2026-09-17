@@ -362,3 +362,6 @@ dialog#folder-dialog::backdrop { background: rgba(0, 0, 0, .55); }
   #source-panel { max-height: none; }
   #source-panel .file-list { max-height: 45vh; }
 }
+
+.job-meta { color: var(--muted); margin-top: 3px; }
+.job-meta .warn { color: var(--warn); }
