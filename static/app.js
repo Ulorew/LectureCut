@@ -10,6 +10,9 @@ const BASIC_DESTS = new Set([
   "silence_bias",
   "arnndn_model",
   "arnndn_mix",
+  "cq",
+  "crf",
+  "encoder",
   "if_exists",
   "start",
   "limit",
@@ -21,6 +24,18 @@ const BASIC_DESTS = new Set([
 const SKIPPED_GROUPS = new Set(["preview sweep", "live preview"]);
 // The upstream table maps what a model expects to hear against what it expects
 // to filter out; the core passes those two keys and the wording lives here.
+// Measured on a whiteboard lecture, 1080p30, through the pipeline: at cq 23 it
+// wrote 2.8 GB/h and at cq 28 1.4 GB/h, and the handwriting on the board is
+// indistinguishable between them. Sizes are for the GPU encoder; libx264 writes
+// roughly half as much for the same look.
+const QUALITY_LEVELS = [
+  { label: "максимальное качество", cq: 23, crf: 20, gpu: 2.8, cpu: 1.3, hevc: 1.4 },
+  { label: "высокое", cq: 26, crf: 22, gpu: 1.9, cpu: 0.95, hevc: 1.0 },
+  { label: "обычное", cq: 28, crf: 23, gpu: 1.4, cpu: 0.8, hevc: 0.8 },
+  { label: "компактное", cq: 32, crf: 26, gpu: 0.77, cpu: 0.72, hevc: 0.5 },
+  { label: "минимальный размер", cq: 36, crf: 29, gpu: 0.45, cpu: 0.5, hevc: 0.35 },
+];
+
 const SIGNAL_WORDS = { speech: "речь", voice: "речь и смех", general: "любой звук" };
 const NOISE_WORDS = { recording: "шум записи", general: "любой шум" };
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -222,6 +237,9 @@ function applyDefaults() {
   }
   denoise.value = d.denoise;
   el("set-arnndn-mix").value = d.arnndn_mix ?? 1;
+  renderQualityLevels();
+  el("set-encoder").value = ["libx264", "hevc_nvenc"].includes(d.encoder) ? d.encoder : "auto";
+  syncQualityHint();
   syncArnndnMix();
   renderModels();
   syncDenoiseHelp();
@@ -240,6 +258,40 @@ function modelLabel(model) {
   if (signal && noise) parts.push(`${signal} + ${noise}`);
   if (model.recommended) parts.push("рекомендуется для лекций");
   return parts.join(" — ");
+}
+
+function currentQuality() {
+  const index = Number(el("set-quality").value);
+  return QUALITY_LEVELS[index] || QUALITY_LEVELS[2];
+}
+
+function renderQualityLevels() {
+  const select = el("set-quality");
+  if (select.options.length) return;
+  QUALITY_LEVELS.forEach((level, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = level.label;
+    select.appendChild(option);
+  });
+  // Whatever the defaults say, so the page starts where the CLI would.
+  const fromDefaults = QUALITY_LEVELS.findIndex((level) => level.cq === state.defaults.cq);
+  select.value = String(fromDefaults >= 0 ? fromDefaults : 2);
+}
+
+function syncQualityHint() {
+  const level = currentQuality();
+  const encoder = el("set-encoder").value;
+  const perHour =
+    encoder === "libx264" ? level.cpu : encoder === "hevc_nvenc" ? level.hevc : level.gpu;
+  const speed = Number(el("set-speed").value) || 1;
+  const duration = state.selected && state.selected.duration;
+  // The output is shorter than the input by the speed-up, and shorter again by
+  // whatever silence is cut - so this is an upper bound.
+  const bytes = duration ? (perHour * 1073741824 * duration) / speed / 3600 : 0;
+  const forThisFile = bytes ? ` · этот файл не больше ${formatSize(bytes)}` : "";
+  el("quality-hint").textContent =
+    `≈ ${perHour.toFixed(1)} ГБ на час записи${forThisFile} — прикидка по лекции с доской, зависит от съёмки`;
 }
 
 function syncArnndnMix() {
@@ -365,6 +417,10 @@ function collectSettings() {
   put("speed", Number(el("set-speed").value));
   put("target_lufs", Number(el("set-target-lufs").value));
   put("denoise", el("set-denoise").value);
+  const quality = currentQuality();
+  put("cq", quality.cq);
+  put("crf", quality.crf);
+  put("encoder", el("set-encoder").value);
   const model = el("set-arnndn-model").value;
   if (model && !el("model-label").classList.contains("hidden")) {
     settings.arnndn_model = model;
@@ -445,6 +501,7 @@ function restoreFormState() {
   // "next to the source" entry - the same thing a fresh install would show.
   syncSilenceControls();
   syncArnndnMix();
+  syncQualityHint();
 }
 
 function resetFormState() {
@@ -588,7 +645,9 @@ async function describeFile(file) {
     file.defaultOutput = info.default_output;
     if (state.selected !== file) return;
     const parts = [formatSize(file.size)];
+    file.duration = info.duration;
     if (info.duration) parts.push(formatDuration(info.duration));
+    syncQualityHint();
     if (!info.has_audio) parts.push("без аудио!");
     if (!info.has_video) parts.push("без видео!");
     el("selected-meta").textContent = `${parts.join(" · ")} · ${file.path}`;
@@ -1077,8 +1136,9 @@ function renderResult(fields) {
   const box = el("result");
   box.classList.remove("hidden");
   box.className = "result ok";
+  const size = fields.output_size ? ` · ${formatSize(fields.output_size)}` : "";
   box.textContent = [
-    `Готово: ${fields.output}`,
+    `Готово: ${fields.output}${size}`,
     `Кодировщик: ${fields.encoder}`,
     `Длительность: ${formatDuration(fields.output_duration)} из ${formatDuration(fields.input_duration)}`,
     `Рендер: ${Number(fields.render_seconds).toFixed(0)} с (${Number(fields.realtime).toFixed(2)}× realtime)`,
@@ -1196,6 +1256,8 @@ const REQUIRED_ELEMENTS = [
   "source-dir-tools",
   "drop-note",
   "set-arnndn-mix",
+  "set-quality",
+  "set-encoder",
   "file-list",
   "folder-dialog",
   "video",
@@ -1269,6 +1331,9 @@ async function init() {
   el("convert").addEventListener("click", convert);
   el("set-denoise").addEventListener("change", syncDenoiseHelp);
   el("set-arnndn-mix").addEventListener("input", syncArnndnMix);
+  el("set-quality").addEventListener("change", syncQualityHint);
+  el("set-speed").addEventListener("input", syncQualityHint);
+  el("set-encoder").addEventListener("change", syncQualityHint);
   el("fetch-model").addEventListener("click", () =>
     fetchModels([state.schema.default_model])
   );

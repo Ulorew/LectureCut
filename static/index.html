@@ -98,6 +98,19 @@
         <input type="checkbox" id="set-mono">
         <span>Свести в моно</span>
       </label>
+      <label>Сжатие видео
+        <select id="set-quality"></select>
+      </label>
+      <label>Кодировщик
+        <select id="set-encoder">
+          <option value="auto">видеокарта (быстро)</option>
+          <option value="libx264">процессор (файл вдвое меньше, рендер вдвое дольше)</option>
+          <option value="hevc_nvenc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
+        </select>
+      </label>
+      <label class="wide" id="quality-hint-label">
+        <span id="quality-hint" class="muted small"></span>
+      </label>
       <label class="wide">Папка результата
         <span class="inline">
           <select id="set-output-dir"></select>

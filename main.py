@@ -724,8 +724,8 @@ def build_parser() -> argparse.ArgumentParser:
     video_group.add_argument(
         "--cq",
         type=int,
-        default=23,
-        help="NVENC constant quality value",
+        default=28,
+        help="NVENC constant quality value; higher means a smaller file",
     )
     video_group.add_argument(
         "--crf",
@@ -844,9 +844,9 @@ def field_kind(action: argparse.Action) -> str:
         return "flag"
     if action.choices:
         return "choice"
-    if action.type in (positive_int,):
+    if action.type in (positive_int, int):
         return "integer"
-    if action.type in (positive_float, non_negative_float, float):
+    if action.type in (positive_float, non_negative_float, unit_interval, float):
         return "number"
     if action.type is Path:
         return "path"
@@ -2966,6 +2966,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             encoder=encoder,
             input_duration=media.duration,
             output_duration=output_media.duration,
+            output_size=output_path.stat().st_size,
             render_seconds=elapsed,
             realtime=realtime,
             silence_threshold=str(args.silence_threshold),

@@ -306,6 +306,28 @@ Measurement knobs:
 `--encoder auto` prefers `h264_nvenc` when FFmpeg exposes it and falls back to
 `libx264` if the NVENC render fails.
 
+## Size of the result
+
+A lecture is a static frame of handwriting, and the old default spent four times
+the bitrate it needed on one. Measured through the pipeline on a whiteboard
+seminar at 1080p30, and compared by cropping the same frame at 1:1 - the
+handwriting looks the same in all of them:
+
+| setting | per hour | render, 180 s of input |
+| --- | --- | --- |
+| `--cq 23` (the old default) | 2.8 GB | 23 s |
+| `--cq 28` (now the default) | 1.4 GB | 23 s |
+| `--encoder libx264 --crf 26 --x264-preset medium` | 0.72 GB | 43 s |
+| `--encoder hevc_nvenc --cq 30` | ~0.7 GB | 23 s |
+
+So the default halves the file for nothing, and the CPU encoder halves it again
+for twice the render time. HEVC does the same on the GPU, but browsers will not
+play it, so a job encoding with it gets no live preview.
+
+The page has «Сжатие видео» with five steps and an encoder choice, and shows the
+size to expect per hour and for the selected file. That estimate comes from this
+lecture; a busier frame will need more.
+
 The default `--filtergraph-mode select` is intended for speed on long lectures.
 It preserves sync by mapping every kept segment back onto a shared output
 timeline for audio and video. `--filtergraph-mode concat` keeps the older
