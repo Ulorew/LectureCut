@@ -118,9 +118,17 @@ The same recording also shows why `--silence-threshold` is measured: at the old
 -35dB default, 35% of a speech-dense window reads as silence, so cutting would
 chew through syllables. `auto` derived -49.1dB for it.
 
-Calibration aims for a typical share of removed pauses, which is a starting
-point rather than an answer - so `--silence-bias` shifts it by ear. Positive
-cuts more pauses, negative keeps more; a few dB either way is the usual range.
+Calibration searches for the threshold at which silencedetect would cut 18% of
+the sampled audio: it widens its steps until it has a threshold on each side of
+that, then halves the interval, using every analysis window. That is a starting
+point rather than an answer, so `--silence-bias` shifts it by ear. Positive cuts
+more pauses, negative keeps more; a few dB either way is the usual range.
+
+Silence is detected on the input, not on the denoised audio. It seems the better
+order, but measured on a noisy seminar it is not: after afftdn or anlmdn the
+share cut at each threshold barely moves, and after arnndn most of the quiet
+speech already sits below any usable threshold, so a detector placed there
+would remove exactly the speech arnndn had pushed down.
 
 If the gap to `--target-lufs` is larger than a couple of decibels, a slow
 compressor takes up the slack, because peak normalization cannot raise loudness
@@ -168,6 +176,13 @@ across two recordings, `sh` took 3-27 dB of speech with it, while `lq` took
 1-8 dB and still gave the best or near-best improvement in signal-to-noise.
 A denoiser is a classifier, and this one is confidently wrong often enough that
 the table is not a safe guide.
+
+`--arnndn-mix` (the «Сила arnndn» slider) sets how much of arnndn's output is
+used, the rest being the untouched input. arnndn tends to push quiet speech
+down along with the noise: on a seminar with 3 dB of SNR, 72% of three minutes
+ended up below -50 dB at full strength, 30% at 0.8 and 4% at 0.6. The filter
+delays its input by exactly its own 10 ms frame before blending - measured
+sample-exact - so a lower strength adds no comb filtering.
 
 **`arnndn` is not automatically better than `afftdn`.** It cleans harder, but it
 decides what is speech, and when it decides wrong it removes the voice. On a

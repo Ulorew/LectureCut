@@ -9,6 +9,7 @@ const BASIC_DESTS = new Set([
   "silence_threshold",
   "silence_bias",
   "arnndn_model",
+  "arnndn_mix",
   "if_exists",
   "start",
   "limit",
@@ -220,6 +221,8 @@ function applyDefaults() {
     denoise.appendChild(option);
   }
   denoise.value = d.denoise;
+  el("set-arnndn-mix").value = d.arnndn_mix ?? 1;
+  syncArnndnMix();
   renderModels();
   syncDenoiseHelp();
   const auto = String(d.silence_threshold).toLowerCase() === "auto";
@@ -239,6 +242,11 @@ function modelLabel(model) {
   return parts.join(" — ");
 }
 
+function syncArnndnMix() {
+  const share = Math.round(Number(el("set-arnndn-mix").value) * 100);
+  el("arnndn-mix-value").textContent = `${share}%`;
+}
+
 function syncDenoiseHelp() {
   const mode = el("set-denoise").value;
   const help = (state.schema.denoise_help || {})[mode] || "";
@@ -247,6 +255,7 @@ function syncDenoiseHelp() {
   // model picker appears exactly when it is about to be used.
   const needsModel = mode === "arnndn" || (mode === "auto" && models.length > 0);
   el("model-label").classList.toggle("hidden", !needsModel);
+  el("arnndn-mix-label").classList.toggle("hidden", !needsModel);
   const missing = mode === "arnndn" && !models.length;
   el("denoise-help").textContent = missing
     ? `${help}. Модели ещё нет — нажмите «Скачать»`
@@ -359,6 +368,7 @@ function collectSettings() {
   const model = el("set-arnndn-model").value;
   if (model && !el("model-label").classList.contains("hidden")) {
     settings.arnndn_model = model;
+    put("arnndn_mix", Number(el("set-arnndn-mix").value));
   }
   if (el("set-mono").checked) settings.mono = true;
 
@@ -434,6 +444,7 @@ function restoreFormState() {
   // A folder that has since disappeared leaves the select empty, which is the
   // "next to the source" entry - the same thing a fresh install would show.
   syncSilenceControls();
+  syncArnndnMix();
 }
 
 function resetFormState() {
@@ -1184,6 +1195,7 @@ const REQUIRED_ELEMENTS = [
   "source-dir-path",
   "source-dir-tools",
   "drop-note",
+  "set-arnndn-mix",
   "file-list",
   "folder-dialog",
   "video",
@@ -1256,6 +1268,7 @@ async function init() {
   updateConvertButton();
   el("convert").addEventListener("click", convert);
   el("set-denoise").addEventListener("change", syncDenoiseHelp);
+  el("set-arnndn-mix").addEventListener("input", syncArnndnMix);
   el("fetch-model").addEventListener("click", () =>
     fetchModels([state.schema.default_model])
   );

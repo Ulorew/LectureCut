@@ -313,6 +313,89 @@ class LectureCutTests(unittest.TestCase):
         self.assertFalse(main.name_suggests_output(main.Path("Lecture_01.MOV")))
         self.assertFalse(main.name_suggests_output(main.Path("notes.mp4")))
 
+    def calibrate_on_curve(self, curve, *, floor=-43.2, speech=-42.2, windows=8):
+        """Run the threshold search against a made-up share-cut curve."""
+
+        tried, seen_starts = [], []
+
+        def fake_fraction(input_path, *, starts, window, threshold_db, min_silence, offset):
+            tried.append(threshold_db)
+            seen_starts.append(list(starts))
+            return curve(threshold_db)
+
+        analysis = self.analysis(
+            noise_floor_db=floor,
+            speech_lufs=speech,
+            starts=tuple(float(i * 20) for i in range(windows)),
+        )
+        with unittest.mock.patch.object(main, "measure_silence_fraction", fake_fraction):
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = main.calibrate_silence_threshold(
+                    main.Path("in.mp4"), analysis=analysis, args=self.audio_args()
+                )
+        return result, tried, seen_starts
+
+    @staticmethod
+    def seminar_curve(threshold):
+        """Roughly the seminar's: nothing below -42 dB, half gone by -33 dB."""
+
+        return max(0.0, min(1.0, (threshold + 42.0) / 18.0)) ** 1.5
+
+    def test_the_search_does_not_stop_after_two_short_steps(self):
+        # The bug: two thresholds that both cut nothing sent the next step back to
+        # one already tried, and the search returned the first, useless, one.
+        result, tried, _ = self.calibrate_on_curve(self.seminar_curve)
+
+        self.assertGreater(len(tried), 2)
+        self.assertGreater(result, -40.0)
+
+    def test_the_search_lands_near_the_target_not_just_inside_a_band(self):
+        result, _, _ = self.calibrate_on_curve(self.seminar_curve)
+
+        self.assertAlmostEqual(
+            self.seminar_curve(result),
+            main.SILENCE_FRACTION_TARGET,
+            delta=main.SILENCE_FRACTION_TOLERANCE,
+        )
+
+    def test_the_search_starts_above_the_noise_floor(self):
+        _, tried, _ = self.calibrate_on_curve(self.seminar_curve)
+
+        # Derived from speech it would start at -48 dB, where nothing can be found.
+        self.assertGreaterEqual(tried[0], -43.2)
+
+    def test_the_search_samples_every_analysis_window(self):
+        _, _, seen = self.calibrate_on_curve(self.seminar_curve, windows=8)
+
+        self.assertEqual(len(seen[0]), 8)
+
+    def test_a_steep_curve_still_converges(self):
+        steep = lambda t: 0.0 if t < -32.5 else (0.16 if t < -32.1 else 0.45)
+        result, tried, _ = self.calibrate_on_curve(steep, floor=-38.3, speech=-36.0)
+
+        self.assertLessEqual(len(tried), main.SILENCE_CALIBRATION_ROUNDS)
+        self.assertAlmostEqual(steep(result), 0.16)
+
+    def test_arnndn_strength_blends_in_the_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            model = Path(temp) / "lq.rnnn"
+            model.write_bytes(b"model")
+            full = main.parse_args(["in.mp4", "--denoise", "arnndn", "--arnndn-model", str(model)])
+            gentle = main.parse_args(
+                ["in.mp4", "--denoise", "arnndn", "--arnndn-model", str(model), "--arnndn-mix", "0.6"]
+            )
+
+            full_stage = main.denoise_filters(full, noise_floor_db=-43.0, snr_db=3.0)[0]
+            gentle_stage = main.denoise_filters(gentle, noise_floor_db=-43.0, snr_db=3.0)[0]
+
+        self.assertNotIn("mix=", full_stage)
+        self.assertTrue(gentle_stage.endswith(":mix=0.6"))
+
+    def test_arnndn_strength_must_be_a_fraction(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main.parse_args(["in.mp4", "--arnndn-mix", "1.5"])
+
     def test_gate_stays_clear_of_the_speech(self):
         # Good SNR: the old floor+8 rule already sat well below the speech.
         self.assertAlmostEqual(

@@ -364,10 +364,15 @@ FALLBACK_SPEECH_LUFS = -35.0
 
 SILENCE_THRESHOLD_LIMITS = (-70.0, -20.0)
 SILENCE_FRACTION_TARGET = 0.18
-SILENCE_FRACTION_MIN = 0.05
-SILENCE_FRACTION_MAX = 0.40
+# Close enough: the share cut moves steeply with the threshold, and the bias
+# slider is there for taste.
+SILENCE_FRACTION_TOLERANCE = 0.04
+SILENCE_CALIBRATION_RESOLUTION_DB = 0.5
 SILENCE_CALIBRATION_STEP_DB = 3.0
-SILENCE_CALIBRATION_ROUNDS = 4
+# Steps double while the search keeps heading the same way, so a starting point
+# 10 dB off is reached in a few rounds rather than never.
+SILENCE_CALIBRATION_MAX_STEP_DB = 12.0
+SILENCE_CALIBRATION_ROUNDS = 8
 
 # A static boost after peak normalization would only drive the limiter, so the
 # fine trim stays small and any real lift comes from crest reduction instead.
@@ -588,6 +593,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Model for the arnndn denoiser: a path to an .rnnn file, or one of "
             f"{', '.join(ARNNDN_MODELS)} to fetch it on demand "
             f"(default {ARNNDN_DEFAULT_MODEL})"
+        ),
+    )
+    audio_group.add_argument(
+        "--arnndn-mix",
+        type=unit_interval,
+        default=1.0,
+        help=(
+            "How much of arnndn's output to use, 0 to 1; the rest is the input. "
+            "Lower it when arnndn swallows quiet speech"
         ),
     )
     audio_group.add_argument(
@@ -912,6 +926,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
     return parsed
 
 
@@ -1578,25 +1599,32 @@ def calibrate_silence_threshold(
     analysis: AudioAnalysis | None,
     args: argparse.Namespace,
 ) -> float:
-    """Nudge the derived threshold until the measured silence share is sane.
+    """Find the threshold that cuts the target share of the sampled audio.
 
     The noise floor alone can mislead: a room with HVAC hum and a speaker who
     pauses often need different thresholds even at the same floor. So the derived
-    value is checked against how much of the sampled audio it would actually cut.
+    value is only a starting point, and the share it would actually cut decides.
+
+    This is a root search on a curve that only rises with the threshold. It
+    widens its steps until it has a threshold on each side of the target, then
+    halves the interval. Accepting the first threshold inside a wide band instead
+    once took -33 dB on a seminar spoken at -40 LUFS, a jump that cut 36% of it.
     """
 
     threshold = derive_silence_threshold(analysis)
     if analysis is None:
         return threshold
 
-    window = args.analysis_window
-    starts = list(analysis.starts[:3]) or [0.0]
+    # Below the noise floor silencedetect finds nothing at all, and the search
+    # would spend its rounds proving it.
+    threshold = max(threshold, analysis.noise_floor_db + 1.0)
+    # Every analysis window, not the first few: a lecture that opens with
+    # unbroken speech made its first minute look pause-free.
+    starts = list(analysis.starts) or [0.0]
     measured: dict[float, float] = {}
-    # Brackets of the usable range: too_low cuts nothing, too_high eats speech.
-    too_low: float | None = None
-    too_high: float | None = None
-    best = threshold
-    best_distance: float | None = None
+    below: float | None = None  # highest threshold that cut less than the target
+    above: float | None = None  # lowest threshold that cut more
+    step = SILENCE_CALIBRATION_STEP_DB
 
     for _ in range(SILENCE_CALIBRATION_ROUNDS):
         threshold = round(clamp(threshold, *SILENCE_THRESHOLD_LIMITS), 1)
@@ -1605,7 +1633,7 @@ def calibrate_silence_threshold(
         fraction = measure_silence_fraction(
             input_path,
             starts=starts,
-            window=window,
+            window=args.analysis_window,
             threshold_db=threshold,
             min_silence=args.min_silence,
             offset=args.start,
@@ -1614,28 +1642,26 @@ def calibrate_silence_threshold(
         report(
             f"  threshold {threshold:.1f}dB cuts {fraction * 100:.1f}% of sampled audio",
         )
-        distance = abs(fraction - SILENCE_FRACTION_TARGET)
-        if best_distance is None or distance < best_distance:
-            best, best_distance = threshold, distance
-        if SILENCE_FRACTION_MIN <= fraction <= SILENCE_FRACTION_MAX:
+        if abs(fraction - SILENCE_FRACTION_TARGET) <= SILENCE_FRACTION_TOLERANCE:
             return threshold
 
-        if fraction > SILENCE_FRACTION_MAX:
-            too_high = threshold if too_high is None else max(too_high, threshold)
+        if fraction < SILENCE_FRACTION_TARGET:
+            below = threshold if below is None else max(below, threshold)
         else:
-            too_low = threshold if too_low is None else min(too_low, threshold)
+            above = threshold if above is None else min(above, threshold)
 
-        if too_low is not None and too_high is not None:
-            # Both ends known: halve the remaining interval instead of stepping
-            # past the answer, which a fixed step does when the band is narrow.
-            if abs(too_high - too_low) <= 0.2:
+        if below is not None and above is not None:
+            if above - below <= SILENCE_CALIBRATION_RESOLUTION_DB:
                 break
-            threshold = (too_low + too_high) / 2.0
-        elif too_high is not None:
-            threshold = too_high - SILENCE_CALIBRATION_STEP_DB
+            threshold = (below + above) / 2.0
+        elif above is not None:
+            threshold = above - step
+            step = min(step * 2, SILENCE_CALIBRATION_MAX_STEP_DB)
         else:
-            threshold = too_low + SILENCE_CALIBRATION_STEP_DB
-    return best
+            threshold = below + step
+            step = min(step * 2, SILENCE_CALIBRATION_MAX_STEP_DB)
+
+    return min(measured, key=lambda t: abs(measured[t] - SILENCE_FRACTION_TARGET))
 
 
 def apply_silence_bias(threshold_db: float, bias_db: float) -> float:
@@ -1684,7 +1710,14 @@ def denoise_filters(
     if mode == "arnndn":
         model = validate_denoise_settings(args)
         assert model is not None
-        return [f"arnndn=m={filter_escape(str(model))}"]
+        stage = f"arnndn=m={filter_escape(str(model))}"
+        # mix blends in the input, which the filter delays by exactly its own
+        # 10 ms frame - measured sample-exact - so the two stay in phase and the
+        # blend adds no comb filtering. On a 3 dB SNR seminar, the share of audio
+        # pushed below -50 dB went 72% -> 30% -> 4% for mix 1.0, 0.8, 0.6.
+        if args.arnndn_mix < 1.0:
+            stage += f":mix={args.arnndn_mix:g}"
+        return [stage]
     if mode == "anlmdn":
         return [f"anlmdn=s={args.anlmdn_strength:g}:p=0.002:r=0.006"]
     # Reduce harder when speech and noise are close. The strength barely touches
