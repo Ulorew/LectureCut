@@ -2582,6 +2582,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if args.download_models is not None:
         return install_models(args.download_models)
     require_command("ffmpeg")
+    # Before any temporary directory exists: a refusal here has nothing to clean.
+    validate_denoise_settings(args)
     workdir_manager: tempfile.TemporaryDirectory[str] | None = None
     if args.workdir is None:
         if args.keep_workdir:
@@ -2594,7 +2596,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
         workdir = args.workdir
         workdir.mkdir(parents=True, exist_ok=True)
 
-    validate_denoise_settings(args)
     try:
         input_path = prepare_input(args.source, workdir, args.download_format)
         if args.preview_dir is not None:
