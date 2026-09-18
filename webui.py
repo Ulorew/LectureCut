@@ -1377,7 +1377,12 @@ def serve(argv: list[str] | None = None) -> int:
     for root in config.roots:
         print(f"  root: {root}", flush=True)
     if config.allowed_hosts is None:
-        print("  Warning: bound to all interfaces; the Host check is off", flush=True)
+        print(
+            "  Warning: bound to all interfaces. There is no authentication: "
+            "anyone who can reach this port may browse folders, read media "
+            "from them and start jobs on this machine.",
+            flush=True,
+        )
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

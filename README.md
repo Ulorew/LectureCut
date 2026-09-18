@@ -34,7 +34,7 @@ ffmpeg -hide_banner -encoders | grep nvenc    # is hardware encoding available
 The command line tool needs no Python packages. The web UI does:
 
 ```bash
-pip install -e .[web]
+pip install -e '.[web]'
 ```
 
 ## Command line
@@ -85,7 +85,10 @@ asks for.
 
 The server answers only to the loopback address it is bound to and requires its
 own header on anything that changes state, which keeps other sites on the
-machine from driving it.
+machine from driving it. There is no login: it runs as you and can read the
+folders you point it at, so `--host 0.0.0.0` hands that to everyone on the
+network. `--no-browse --no-open --no-upload` narrows it to the `--root` folders
+if you ever need to.
 
 ## Tests
 

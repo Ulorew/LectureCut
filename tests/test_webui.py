@@ -899,6 +899,7 @@ class LivePreviewTests(unittest.TestCase):
         self.assertTrue(fresh.exists())
 
 
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
 class TimeEstimateTests(unittest.TestCase):
     """How long a job, and the whole queue, still has to go."""
 
