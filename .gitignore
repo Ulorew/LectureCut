@@ -27,5 +27,7 @@ previews/
 *.log
 filtergraph*.ffmpeg
 
-# Editable install metadata
+# Build and editable-install artefacts
 *.egg-info/
+build/
+dist/
