@@ -796,11 +796,15 @@ class LectureCutTests(unittest.TestCase):
         self.assertIn("limit=0.7943", limiter)
 
     def test_hints_surface_what_the_measurements_imply(self):
-        hints = " ".join(
-            main.audio_analysis_hints(
-                self.analysis(channel_imbalance_db=3.3, true_peak_db=-0.7, speech_lufs_median=-48.0)
-            )
+        found = main.audio_analysis_hints(
+            self.analysis(channel_imbalance_db=3.3, true_peak_db=-0.7, speech_lufs_median=-48.0)
         )
+        hints = " ".join(hint["text"] for hint in found)
+
+        # The key and the numbers travel with the sentence, so a UI can say it
+        # in its own language.
+        self.assertEqual([hint["key"] for hint in found], ["mono", "declick", "arnndn"])
+        self.assertEqual(found[0]["imbalance"], 3.3)
 
         self.assertIn("--mono", hints)
         self.assertIn("--declick", hints)

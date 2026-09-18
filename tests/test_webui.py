@@ -150,8 +150,8 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(set(body["denoise_help"]), set(main.AUDIO_DENOISE_MODES))
         self.assertEqual([m["name"] for m in body["models"]], ["sh.rnnn"])
-        # The hint names the cache the models actually land in, per request.
-        self.assertIn(str(Path(self.temp.name) / "cache"), body["model_hint"])
+        # The page words the hint; the server only says where models land.
+        self.assertIn(str(Path(self.temp.name) / "cache"), body["model_dir"])
 
     def test_schema_carries_the_downloadable_catalogue(self):
         body = self.client.get("/api/schema").json()

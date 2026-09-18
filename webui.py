@@ -101,15 +101,6 @@ STATUS_CANCELLED = "cancelled"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-def model_hint() -> str:
-    """Built per request: the cache location follows the environment."""
-
-    return (
-        f"Модели по ~300 КБ, скачиваются по кнопке в кэш {core.model_cache_dir()}. "
-        "Хеши зашиты, так что загрузка проверяется"
-    )
-
-
 def live_root() -> Path:
     return core.model_cache_dir().parent / "live"
 
@@ -993,7 +984,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "models": list_arnndn_models(config),
             "catalogue": model_catalogue(),
             "default_model": core.ARNNDN_DEFAULT_MODEL,
-            "model_hint": model_hint(),
+            "model_dir": str(core.model_cache_dir()),
         }
 
     @app.get("/api/files")

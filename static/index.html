@@ -10,34 +10,38 @@
 <body>
 <header>
   <h1>LectureCut</h1>
+  <div class="lang" id="lang-switch">
+    <button type="button" class="secondary tiny" data-lang="ru">RU</button>
+    <button type="button" class="secondary tiny" data-lang="en">EN</button>
+  </div>
 </header>
 
 <main>
   <section class="panel" id="source-panel">
-    <h2>Источник</h2>
+    <h2 data-i18n="panel.source">Источник</h2>
     <div class="source-dir">
       <div class="source-dir-path">
-        <span class="muted small">Папка с лекциями</span>
+        <span class="muted small" data-i18n="src.folder">Папка с лекциями</span>
         <strong id="source-dir-path"></strong>
       </div>
       <div class="inline" id="source-dir-tools">
-        <button type="button" id="change-source-dir" class="secondary tiny">Сменить…</button>
-        <select id="recent-source-dirs" title="Недавние папки"></select>
+        <button type="button" id="change-source-dir" class="secondary tiny" data-i18n="src.change">Сменить…</button>
+        <select id="recent-source-dirs" data-i18n-title="src.recentTitle"></select>
       </div>
     </div>
     <div id="dropzone" class="dropzone">
-      <span id="drop-note">Перетащите файл сюда или выберите из списка</span>
-      <span class="muted small">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди известных папок</span>
+      <span id="drop-note" data-i18n="drop.idle">Перетащите файл сюда или выберите из списка</span>
+      <span class="muted small" data-i18n="src.dropHint">браузер не передаёт путь, поэтому файл ищется по имени и размеру среди известных папок</span>
     </div>
-    <input type="search" id="file-filter" placeholder="Фильтр по имени">
+    <input type="search" id="file-filter" data-i18n-placeholder="src.filter" placeholder="Фильтр по имени">
     <div class="list-tools">
-      <button type="button" id="check-all" class="secondary tiny">Выбрать все</button>
-      <button type="button" id="check-none" class="secondary tiny">Снять выбор</button>
+      <button type="button" id="check-all" class="secondary tiny" data-i18n="src.checkAll">Выбрать все</button>
+      <button type="button" id="check-none" class="secondary tiny" data-i18n="src.checkNone">Снять выбор</button>
       <span id="checked-count" class="muted small"></span>
     </div>
     <label class="inline-label small">
       <input type="checkbox" id="hide-processed" checked>
-      <span>Скрывать уже обработанные</span>
+      <span data-i18n="src.hideProcessed">Скрывать уже обработанные</span>
     </label>
     <ul id="file-list" class="file-list"></ul>
     <div id="selected" class="selected hidden">
@@ -47,95 +51,95 @@
   </section>
 
   <section class="panel" id="settings-panel">
-    <h2>Настройки</h2>
+    <h2 data-i18n="panel.settings">Настройки</h2>
     <div class="grid" id="basic-settings">
-      <label>Скорость
+      <label><span data-i18n="set.speed">Скорость</span>
         <input type="number" id="set-speed" step="0.05" min="0.5">
       </label>
-      <label>Целевая громкость, LUFS
+      <label><span data-i18n="set.targetLufs">Целевая громкость, LUFS</span>
         <input type="number" id="set-target-lufs" step="0.5">
       </label>
-      <label class="wide">Денойз
+      <label class="wide"><span data-i18n="set.denoise">Шумодав</span>
         <select id="set-denoise"></select>
         <span id="denoise-help" class="muted small"></span>
       </label>
-      <label class="wide hidden" id="model-label">Модель arnndn
+      <label class="wide hidden" id="model-label"><span data-i18n="set.model">Модель arnndn</span>
         <span class="inline">
           <select id="set-arnndn-model"></select>
-          <button type="button" id="fetch-model" class="secondary tiny">Скачать</button>
-          <button type="button" id="fetch-all-models" class="secondary tiny">Все</button>
+          <button type="button" id="fetch-model" class="secondary tiny" data-i18n="set.download">Скачать</button>
+          <button type="button" id="fetch-all-models" class="secondary tiny" data-i18n="set.all">Все</button>
         </span>
         <span id="model-hint" class="muted small"></span>
       </label>
-      <label class="wide hidden" id="arnndn-mix-label">Сила arnndn
+      <label class="wide hidden" id="arnndn-mix-label"><span data-i18n="set.strength">Сила arnndn</span>
         <span class="inline">
           <input type="range" id="set-arnndn-mix" min="0" max="1" step="0.05" value="1">
           <output id="arnndn-mix-value" class="small">100%</output>
         </span>
-        <span class="muted small">меньше — тихая речь уцелеет, но и шума останется больше</span>
+        <span class="muted small" data-i18n="set.strengthHint">меньше — тихая речь уцелеет, но и шума останется больше</span>
       </label>
-      <label>Порог тишины
+      <label><span data-i18n="set.silence">Порог тишины</span>
         <span class="inline">
           <input type="checkbox" id="set-silence-auto" checked>
-          <span class="small">авто</span>
+          <span class="small" data-i18n="set.auto">авто</span>
           <input type="text" id="set-silence-threshold" placeholder="-45dB" disabled>
         </span>
       </label>
-      <label id="silence-bias-label">Поправка к авто, дБ
+      <label id="silence-bias-label"><span data-i18n="set.bias">Поправка к авто, дБ</span>
         <span class="inline">
           <input type="range" id="set-silence-bias" min="-10" max="10" step="0.5" value="0">
           <output id="silence-bias-value" class="small">0.0</output>
         </span>
-        <span class="muted small">больше — режет больше пауз</span>
+        <span class="muted small" data-i18n="set.biasHint">больше — режет больше пауз</span>
       </label>
-      <label>С секунды (необязательно)
+      <label><span data-i18n="set.start">С секунды (необязательно)</span>
         <input type="number" id="set-start" step="1" min="0" placeholder="0">
       </label>
-      <label>Длительность, с (необязательно)
-        <input type="number" id="set-limit" step="1" min="1" placeholder="весь файл">
+      <label><span data-i18n="set.limit">Длительность, с (необязательно)</span>
+        <input type="number" id="set-limit" step="1" min="1" data-i18n-placeholder="set.limitPlaceholder" placeholder="весь файл">
       </label>
       <label class="inline-label">
         <input type="checkbox" id="set-mono">
-        <span>Свести в моно</span>
+        <span data-i18n="set.mono">Свести в моно</span>
       </label>
-      <label>Сжатие видео
+      <label><span data-i18n="set.quality">Сжатие видео</span>
         <select id="set-quality"></select>
       </label>
-      <label>Кодировщик
+      <label><span data-i18n="set.encoder">Кодировщик</span>
         <select id="set-encoder">
-          <option value="auto">видеокарта (быстро)</option>
-          <option value="libx264">процессор (файл вдвое меньше, рендер вдвое дольше)</option>
-          <option value="hevc_nvenc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
+          <option value="auto" data-i18n="enc.gpu">видеокарта (быстро)</option>
+          <option value="libx264" data-i18n="enc.cpu">процессор (файл вдвое меньше, рендер вдвое дольше)</option>
+          <option value="hevc_nvenc" data-i18n="enc.hevc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
         </select>
       </label>
       <label class="wide" id="quality-hint-label">
         <span id="quality-hint" class="muted small"></span>
       </label>
-      <label class="wide">Папка результата
+      <label class="wide"><span data-i18n="set.outputDir">Папка результата</span>
         <span class="inline">
           <select id="set-output-dir"></select>
-          <button type="button" id="open-output-dir" class="secondary tiny" title="Открыть папку">Открыть</button>
+          <button type="button" id="open-output-dir" class="secondary tiny" data-i18n-title="set.openTitle" data-i18n="set.open">Открыть</button>
         </span>
       </label>
-      <label class="wide">Имя файла
-        <input type="text" id="set-output-name" placeholder="как у источника">
+      <label class="wide"><span data-i18n="set.outputName">Имя файла</span>
+        <input type="text" id="set-output-name" data-i18n-placeholder="set.outputNamePlaceholder" placeholder="как у источника">
       </label>
     </div>
 
     <details id="advanced">
-      <summary>Дополнительно</summary>
+      <summary data-i18n="set.advanced">Дополнительно</summary>
       <div id="advanced-settings"></div>
     </details>
 
     <div class="actions">
-      <button id="convert" disabled>Конвертировать</button>
-      <button type="button" id="reset-settings" class="secondary tiny">Сбросить</button>
-      <span class="muted small" id="queue-hint">выбирайте несколько файлов — они выполнятся по очереди</span>
+      <button id="convert" disabled data-i18n="set.convert">Конвертировать</button>
+      <button type="button" id="reset-settings" class="secondary tiny" data-i18n="set.reset">Сбросить</button>
+      <span class="muted small" id="queue-hint" data-i18n="set.queueHint">выбирайте несколько файлов — они выполнятся по очереди</span>
     </div>
   </section>
 
   <section class="panel" id="run-panel">
-    <h2>Очередь</h2>
+    <h2 data-i18n="panel.queue">Очередь</h2>
     <div id="queue-summary" class="queue-summary muted small hidden"></div>
     <ul id="job-list" class="job-list"></ul>
 
@@ -143,12 +147,12 @@
       <video id="video" controls playsinline></video>
       <div class="player-bar">
         <span id="player-note" class="muted small"></span>
-        <button type="button" id="player-close" class="secondary tiny">Закрыть</button>
+        <button type="button" id="player-close" class="secondary tiny" data-i18n="player.close">Закрыть</button>
       </div>
     </div>
 
     <div id="watch" class="hidden">
-      <h2 class="spaced">Ход выполнения</h2>
+      <h2 class="spaced" data-i18n="panel.progress">Ход выполнения</h2>
       <div class="progress-wrap">
         <div class="progress"><div id="bar"></div></div>
         <div class="progress-meta">
@@ -165,23 +169,24 @@
 
 <dialog id="folder-dialog">
   <div class="folder-browser">
-    <h2>Папка с лекциями</h2>
+    <h2 data-i18n="folder.title">Папка с лекциями</h2>
     <div class="inline">
-      <button type="button" id="folder-up" class="secondary tiny" title="На уровень выше">↑</button>
-      <button type="button" id="folder-home" class="secondary tiny">Домой</button>
+      <button type="button" id="folder-up" class="secondary tiny" data-i18n-title="folder.up" title="На уровень выше">↑</button>
+      <button type="button" id="folder-home" class="secondary tiny" data-i18n="folder.home">Домой</button>
       <input type="text" id="folder-path" spellcheck="false" autocomplete="off">
-      <button type="button" id="folder-go" class="secondary tiny">Перейти</button>
+      <button type="button" id="folder-go" class="secondary tiny" data-i18n="folder.go">Перейти</button>
     </div>
     <p id="folder-note" class="muted small"></p>
     <ul id="folder-list" class="folder-list"></ul>
     <div class="actions">
-      <button type="button" id="folder-choose">Выбрать эту папку</button>
-      <button type="button" id="folder-cancel" class="secondary">Отмена</button>
+      <button type="button" id="folder-choose" data-i18n="folder.choose">Выбрать эту папку</button>
+      <button type="button" id="folder-cancel" class="secondary" data-i18n="folder.cancel">Отмена</button>
     </div>
   </div>
 </dialog>
 
 <script src="vendor/hls.light.min.js"></script>
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

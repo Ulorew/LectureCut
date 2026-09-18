@@ -19,39 +19,27 @@ const BASIC_DESTS = new Set([
   "mono",
   "output",
 ]);
-// The preview sweep is a separate flow, not part of this screen.
 // The preview sweep is a separate flow; live preview is wired by the server.
 const SKIPPED_GROUPS = new Set(["preview sweep", "live preview"]);
-// The upstream table maps what a model expects to hear against what it expects
-// to filter out; the core passes those two keys and the wording lives here.
+
 // Measured on a whiteboard lecture, 1080p30, through the pipeline: at cq 23 it
 // wrote 2.8 GB/h and at cq 28 1.4 GB/h, and the handwriting on the board is
 // indistinguishable between them. Sizes are for the GPU encoder; libx264 writes
 // roughly half as much for the same look.
 const QUALITY_LEVELS = [
-  { label: "максимальное качество", cq: 23, crf: 20, gpu: 2.8, cpu: 1.3, hevc: 1.4 },
-  { label: "высокое", cq: 26, crf: 22, gpu: 1.9, cpu: 0.95, hevc: 1.0 },
-  { label: "обычное", cq: 28, crf: 23, gpu: 1.4, cpu: 0.8, hevc: 0.8 },
-  { label: "компактное", cq: 32, crf: 26, gpu: 0.77, cpu: 0.72, hevc: 0.5 },
-  { label: "минимальный размер", cq: 36, crf: 29, gpu: 0.45, cpu: 0.5, hevc: 0.35 },
+  { key: "q.max", cq: 23, crf: 20, gpu: 2.8, cpu: 1.3, hevc: 1.4 },
+  { key: "q.high", cq: 26, crf: 22, gpu: 1.9, cpu: 0.95, hevc: 1.0 },
+  { key: "q.normal", cq: 28, crf: 23, gpu: 1.4, cpu: 0.8, hevc: 0.8 },
+  { key: "q.compact", cq: 32, crf: 26, gpu: 0.77, cpu: 0.72, hevc: 0.5 },
+  { key: "q.min", cq: 36, crf: 29, gpu: 0.45, cpu: 0.5, hevc: 0.35 },
 ];
 
-const SIGNAL_WORDS = { speech: "речь", voice: "речь и смех", general: "любой звук" };
-const NOISE_WORDS = { recording: "шум записи", general: "любой шум" };
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
 const SETTINGS_KEY = "lecturecut.settings.v1";
 // Deliberately not remembered: they belong to one particular file, and silently
 // reusing them would quietly process 60 seconds of the next lecture.
 const NEVER_REMEMBERED = new Set(["set-output-name", "set-start", "set-limit"]);
 const JOB_POLL_MS = 1500;
-
-const STATUS_LABELS = {
-  queued: "в очереди",
-  running: "выполняется",
-  done: "готово",
-  error: "ошибка",
-  cancelled: "отменено",
-};
 
 const state = {
   schema: null,
@@ -116,19 +104,22 @@ function formatDuration(seconds) {
 
 function formatEta(seconds) {
   if (seconds === null || seconds === undefined) return "";
-  if (seconds < 60) return "меньше минуты";
+  if (seconds < 60) return t("eta.lessMinute");
   const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes} мин`;
+  if (minutes < 60) return t("eta.minutes", { n: minutes });
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
-  return rest ? `${hours} ч ${rest} мин` : `${hours} ч`;
+  return rest ? t("eta.hoursMinutes", { h: hours, m: rest }) : t("eta.hours", { h: hours });
 }
 
 function clockIn(seconds) {
   const at = new Date(Date.now() + seconds * 1000);
-  const time = at.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const locale = currentLang() === "ru" ? "ru-RU" : "en-GB";
+  const time = at.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
   const sameDay = at.toDateString() === new Date().toDateString();
-  return sameDay ? time : `${at.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })} ${time}`;
+  return sameDay
+    ? time
+    : `${at.toLocaleDateString(locale, { day: "numeric", month: "short" })} ${time}`;
 }
 
 function renderQueueSummary(queue) {
@@ -139,17 +130,19 @@ function renderQueueSummary(queue) {
   }
   box.classList.remove("hidden");
   const known = queue.pending - queue.unknown;
-  const parts = [`в работе и в очереди: ${queue.pending}`];
+  const parts = [t("queue.pending", { n: queue.pending })];
   if (known > 0) {
     // With unknown lengths among them, the sum is only a floor.
-    const lower = queue.unknown ? "не меньше " : "≈ ";
-    parts.push(`осталось ${lower}${formatEta(queue.remaining_seconds)}`);
-    if (!queue.unknown) parts.push(`закончится к ${clockIn(queue.remaining_seconds)}`);
+    const approx = queue.unknown ? t("queue.atLeast") : "≈ ";
+    parts.push(t("queue.remaining", { approx, eta: formatEta(queue.remaining_seconds) }));
+    if (!queue.unknown) {
+      parts.push(t("queue.finishBy", { time: clockIn(queue.remaining_seconds) }));
+    }
   }
-  if (queue.unknown) parts.push(`длительность неизвестна для ${queue.unknown}`);
+  if (queue.unknown) parts.push(t("queue.unknown", { n: queue.unknown }));
   let text = parts.join(" · ");
   if (!queue.learned_from) {
-    text += " (оценка уточнится после первой готовой задачи)";
+    text += t("queue.learning");
   }
   box.textContent = text;
 }
@@ -252,11 +245,13 @@ function applyDefaults() {
 }
 
 function modelLabel(model) {
-  const signal = SIGNAL_WORDS[model.signal];
-  const noise = NOISE_WORDS[model.noise];
+  // The upstream table maps what a model expects to hear against what it expects
+  // to filter out; the core sends those two keys and the wording lives here.
   const parts = [model.name || model.file];
-  if (signal && noise) parts.push(`${signal} + ${noise}`);
-  if (model.recommended) parts.push("рекомендуется для лекций");
+  if (model.signal && model.noise) {
+    parts.push(`${t(`signal.${model.signal}`)} + ${t(`noise.${model.noise}`)}`);
+  }
+  if (model.recommended) parts.push(t("den.recommended"));
   return parts.join(" — ");
 }
 
@@ -265,15 +260,21 @@ function currentQuality() {
   return QUALITY_LEVELS[index] || QUALITY_LEVELS[2];
 }
 
-function renderQualityLevels() {
+function renderQualityLevels(rebuild) {
   const select = el("set-quality");
-  if (select.options.length) return;
+  if (select.options.length && !rebuild) return;
+  const chosen = select.value;
+  select.textContent = "";
   QUALITY_LEVELS.forEach((level, index) => {
     const option = document.createElement("option");
     option.value = String(index);
-    option.textContent = level.label;
+    option.textContent = t(level.key);
     select.appendChild(option);
   });
+  if (chosen) {
+    select.value = chosen;
+    return;
+  }
   // Whatever the defaults say, so the page starts where the CLI would.
   const fromDefaults = QUALITY_LEVELS.findIndex((level) => level.cq === state.defaults.cq);
   select.value = String(fromDefaults >= 0 ? fromDefaults : 2);
@@ -289,9 +290,11 @@ function syncQualityHint() {
   // The output is shorter than the input by the speed-up, and shorter again by
   // whatever silence is cut - so this is an upper bound.
   const bytes = duration ? (perHour * 1073741824 * duration) / speed / 3600 : 0;
-  const forThisFile = bytes ? ` · этот файл не больше ${formatSize(bytes)}` : "";
-  el("quality-hint").textContent =
-    `≈ ${perHour.toFixed(1)} ГБ на час записи${forThisFile} — прикидка по лекции с доской, зависит от съёмки`;
+  const forThisFile = bytes ? t("q.hintFile", { size: formatSize(bytes) }) : "";
+  el("quality-hint").textContent = t("q.hint", {
+    perHour: perHour.toFixed(1),
+    file: forThisFile,
+  });
 }
 
 function syncArnndnMix() {
@@ -301,7 +304,7 @@ function syncArnndnMix() {
 
 function syncDenoiseHelp() {
   const mode = el("set-denoise").value;
-  const help = (state.schema.denoise_help || {})[mode] || "";
+  const help = t(`den.${mode}`);
   const models = state.schema.models || [];
   // arnndn is the best of the three and the only one that needs a file, so the
   // model picker appears exactly when it is about to be used.
@@ -309,9 +312,7 @@ function syncDenoiseHelp() {
   el("model-label").classList.toggle("hidden", !needsModel);
   el("arnndn-mix-label").classList.toggle("hidden", !needsModel);
   const missing = mode === "arnndn" && !models.length;
-  el("denoise-help").textContent = missing
-    ? `${help}. Модели ещё нет — нажмите «Скачать»`
-    : help;
+  el("denoise-help").textContent = missing ? t("den.noModel", { help }) : help;
   el("denoise-help").classList.toggle("warn", missing);
 }
 
@@ -323,7 +324,7 @@ function renderModels() {
   if (!models.length) {
     const empty = document.createElement("option");
     empty.value = "";
-    empty.textContent = "моделей нет";
+    empty.textContent = t("den.modelsNone");
     select.appendChild(empty);
     select.disabled = true;
   } else {
@@ -342,15 +343,15 @@ function renderModels() {
   el("fetch-model").classList.toggle("hidden", models.length > 0);
   el("fetch-all-models").classList.toggle("hidden", pending.length === 0);
   el("fetch-all-models").textContent = pending.length
-    ? `Ещё ${pending.length} (${Math.round(total / 1024)} КБ)`
-    : "Все";
-  el("model-hint").textContent = state.schema.model_hint;
+    ? t("den.fetchMore", { n: pending.length, kb: Math.round(total / 1024) })
+    : t("set.all");
+  el("model-hint").textContent = t("den.modelHint", { dir: state.schema.model_dir });
 }
 
 async function fetchModels(keys) {
   const buttons = [el("fetch-model"), el("fetch-all-models")];
   for (const button of buttons) button.disabled = true;
-  el("model-hint").textContent = "Скачиваю...";
+  el("model-hint").textContent = t("den.downloading");
   try {
     const data = await api("/api/models", {
       method: "POST",
@@ -362,7 +363,7 @@ async function fetchModels(keys) {
     renderModels();
     syncDenoiseHelp();
   } catch (error) {
-    el("model-hint").textContent = `Не удалось скачать: ${error.message}`;
+    el("model-hint").textContent = t("den.downloadFailed", { error: error.message });
     el("model-hint").classList.add("warn");
   } finally {
     for (const button of buttons) button.disabled = false;
@@ -383,7 +384,7 @@ function renderDirs() {
   select.textContent = "";
   const auto = document.createElement("option");
   auto.value = "";
-  auto.textContent = "рядом с источником";
+  auto.textContent = t("dir.nextToSource");
   select.appendChild(auto);
   for (const dir of state.dirs) {
     const option = document.createElement("option");
@@ -529,11 +530,9 @@ function renderFiles() {
     const empty = document.createElement("li");
     empty.className = "muted";
     const hidden = state.files.length - visibleFiles({ ignoreProcessed: true }).length;
-    empty.textContent = state.files.length
-      ? "Ничего не найдено"
-      : "В этой папке нет медиафайлов";
+    empty.textContent = state.files.length ? t("files.noMatch") : t("files.none");
     if (state.files.length && hidden > 0) {
-      empty.textContent = "Все подходящие файлы уже обработаны";
+      empty.textContent = t("files.allProcessed");
     }
     list.appendChild(empty);
     return;
@@ -551,8 +550,8 @@ function renderFiles() {
     if (file.processed) {
       const done = document.createElement("span");
       done.className = "badge done";
-      done.textContent = "обработано";
-      done.title = "У файла есть метка LectureCut либо имя результата";
+      done.textContent = t("files.processed");
+      done.title = t("files.processedTitle");
       item.appendChild(done);
     }
     const size = document.createElement("span");
@@ -598,7 +597,7 @@ async function refreshPrimary() {
   box.classList.remove("hidden");
   const chosen = batchTargets();
   el("selected-name").textContent =
-    chosen.length > 1 ? `${chosen.length} файла(ов) выбрано` : file.name;
+    chosen.length > 1 ? t("files.selectedN", { n: chosen.length }) : file.name;
   el("selected-meta").textContent = `${formatSize(file.size)} · ${file.path}`;
   await describeFile(file);
 }
@@ -624,19 +623,19 @@ function updateConvertButton() {
   const button = el("convert");
   button.disabled = targets.length === 0;
   button.textContent =
-    targets.length > 1 ? `Конвертировать (${targets.length})` : "Конвертировать";
+    targets.length > 1 ? t("set.convertN", { n: targets.length }) : t("set.convert");
   el("checked-count").textContent = state.checked.size
-    ? `выбрано: ${state.checked.size}`
+    ? t("files.checked", { n: state.checked.size })
     : "";
   // One explicit name cannot serve a batch; the core names each output instead.
   const name = el("set-output-name");
   name.disabled = targets.length > 1;
   name.placeholder =
     targets.length > 1
-      ? "имена задаются по каждому источнику"
+      ? t("files.batchNames")
       : state.selected && state.selected.defaultOutput
         ? baseName(state.selected.defaultOutput)
-        : "как у источника";
+        : t("set.outputNamePlaceholder");
 }
 
 async function describeFile(file) {
@@ -648,8 +647,8 @@ async function describeFile(file) {
     file.duration = info.duration;
     if (info.duration) parts.push(formatDuration(info.duration));
     syncQualityHint();
-    if (!info.has_audio) parts.push("без аудио!");
-    if (!info.has_video) parts.push("без видео!");
+    if (!info.has_audio) parts.push(t("files.noAudio"));
+    if (!info.has_video) parts.push(t("files.noVideo"));
     el("selected-meta").textContent = `${parts.join(" · ")} · ${file.path}`;
     updateConvertButton();
   } catch (error) {
@@ -680,7 +679,7 @@ function renderSourceDir() {
   select.textContent = "";
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = recent.length ? "Недавние…" : "недавних нет";
+  placeholder.textContent = recent.length ? t("folder.recent") : t("folder.recentNone");
   select.appendChild(placeholder);
   for (const dir of recent) {
     const option = document.createElement("option");
@@ -702,15 +701,15 @@ async function navigateFolder(path) {
     el("folder-up").disabled = !data.parent;
     note.classList.remove("warn");
     note.textContent = data.media_here
-      ? `Здесь медиафайлов: ${data.media_here}`
-      : "Здесь медиафайлов нет — возможно, они во вложенных папках";
+      ? t("folder.mediaHere", { n: data.media_here })
+      : t("folder.mediaNone");
 
     const list = el("folder-list");
     list.textContent = "";
     if (!data.dirs.length) {
       const empty = document.createElement("li");
       empty.className = "muted";
-      empty.textContent = "Вложенных папок нет";
+      empty.textContent = t("folder.noSub");
       list.appendChild(empty);
     }
     for (const dir of data.dirs) {
@@ -752,7 +751,7 @@ async function chooseFolder(path) {
     await loadDirs();
     if (el("folder-dialog").open) el("folder-dialog").close();
   } catch (error) {
-    const message = `Не удалось выбрать папку: ${error.message}`;
+    const message = t("folder.failed", { error: error.message });
     if (el("folder-dialog").open) {
       el("folder-note").classList.add("warn");
       el("folder-note").textContent = message;
@@ -786,39 +785,35 @@ async function handleDrop(fileHandle) {
   );
   if (here) {
     if (!state.checked.has(here.path)) toggleFile(here);
-    dropNote(`Выбран ${fileHandle.name}`);
+    dropNote(t("drop.selected", { name: fileHandle.name }));
     return;
   }
 
   // The browser withheld the path, but the file is on this machine: look for it
   // where the server can already read, rather than copying it over localhost.
-  dropNote(`Ищу ${fileHandle.name} в известных папках…`);
+  dropNote(t("drop.searching", { name: fileHandle.name }));
   const found = await api(
     `/api/locate?name=${encodeURIComponent(fileHandle.name)}&size=${fileHandle.size}`
   );
   if (found.found) {
     await chooseFolder(found.dir);
     await selectByPath(found.path);
-    dropNote(`Выбран ${fileHandle.name} из ${found.dir}`);
+    dropNote(t("drop.selectedFrom", { name: fileHandle.name, dir: found.dir }));
     return;
   }
 
   if (!state.schema.allow_upload) {
-    dropNote(`${fileHandle.name} нет в известных папках, а загрузка отключена`, true);
+    dropNote(t("drop.uploadDisabled", { name: fileHandle.name }), true);
     return;
   }
   const size = formatSize(fileHandle.size);
-  const proceed = window.confirm(
-    `${fileHandle.name} нет в известных папках.\n\n` +
-      `Скопировать его сюда через браузер (${size})?\n` +
-      "Быстрее выбрать его папку кнопкой «Сменить…»."
-  );
+  const proceed = window.confirm(t("drop.confirm", { name: fileHandle.name, size }));
   if (!proceed) {
-    dropNote("Выберите папку с этим файлом кнопкой «Сменить…»", true);
+    dropNote(t("drop.pickFolder"), true);
     return;
   }
 
-  dropNote(`Загружаю ${fileHandle.name} (${size})…`);
+  dropNote(t("drop.uploading", { name: fileHandle.name, size }));
   const uploaded = await api(`/api/upload?name=${encodeURIComponent(fileHandle.name)}`, {
     method: "POST",
     body: fileHandle,
@@ -826,13 +821,13 @@ async function handleDrop(fileHandle) {
   // The upload lands in its own folder, so switch to it or the file stays unseen.
   await chooseFolder(uploaded.dir);
   await selectByPath(uploaded.path);
-  dropNote(`Загружен ${fileHandle.name}`);
+  dropNote(t("drop.uploaded", { name: fileHandle.name }));
 }
 
 // ----------------------------------------------------------------- job queue
 
 function statusLabel(status) {
-  return STATUS_LABELS[status] || status;
+  return t(`status.${status}`);
 }
 
 function renderJobs() {
@@ -841,7 +836,7 @@ function renderJobs() {
   if (!state.jobs.length) {
     const empty = document.createElement("li");
     empty.className = "muted";
-    empty.textContent = "Очередь пуста";
+    empty.textContent = t("queue.empty");
     list.appendChild(empty);
     return;
   }
@@ -864,11 +859,11 @@ function renderJobs() {
     if (ACTIVE_STATUSES.has(job.status) && job.finishes_in_seconds !== null) {
       const eta = document.createElement("span");
       eta.className = "muted small";
-      eta.textContent = `готово через ≈ ${formatEta(job.finishes_in_seconds)}`;
+      eta.textContent = t("job.readyIn", { eta: formatEta(job.finishes_in_seconds) });
       eta.title =
         job.status === "queued"
-          ? "С учётом задач перед ней. Сама она займёт ≈ " + formatEta(job.remaining_seconds)
-          : "По текущему темпу этого этапа и скорости прошлых задач";
+          ? t("job.queuedTitle", { eta: formatEta(job.remaining_seconds) })
+          : t("job.runningTitle");
       side.appendChild(eta);
     }
     side.appendChild(badge);
@@ -882,16 +877,16 @@ function renderJobs() {
     const requested = (job.settings && job.settings.denoise) || "auto";
     const result = job.result || {};
     if (result.denoise_used) {
-      meta.textContent = `шумодав: ${result.denoise_used}`;
+      meta.textContent = t("job.denoise", { mode: result.denoise_used });
       if (result.denoise_filter) meta.title = result.denoise_filter;
       if (result.denoise_requested && result.denoise_requested !== result.denoise_used) {
         const fallback = document.createElement("span");
         fallback.className = "warn";
-        fallback.textContent = ` — вместо ${result.denoise_requested}: тот портил речь`;
+        fallback.textContent = t("job.denoiseFallback", { requested: result.denoise_requested });
         meta.appendChild(fallback);
       }
     } else {
-      meta.textContent = `шумодав: ${requested}`;
+      meta.textContent = t("job.denoise", { mode: requested });
     }
     item.appendChild(meta);
 
@@ -908,7 +903,7 @@ function renderJobs() {
     actions.className = "job-actions";
     if (ACTIVE_STATUSES.has(job.status)) {
       actions.appendChild(
-        button("Отмена", "secondary tiny", async (event) => {
+        button(t("job.cancel"), "secondary tiny", async (event) => {
           event.stopPropagation();
           await api(`/api/jobs/${job.id}/cancel`, { method: "POST" });
           await refreshJobs();
@@ -917,7 +912,7 @@ function renderJobs() {
     }
     if (job.live && ACTIVE_STATUSES.has(job.status)) {
       actions.appendChild(
-        button("Смотреть", "tiny", (event) => {
+        button(t("job.watch"), "tiny", (event) => {
           event.stopPropagation();
           playJob(job);
         })
@@ -925,32 +920,32 @@ function renderJobs() {
     } else if (ACTIVE_STATUSES.has(job.status) && job.settings && job.settings.live_dir) {
       // Shown before it works, so the feature can be found: on a long lecture
       // analysis and the silence pass take minutes before the render begins.
-      const pending = button("Смотреть", "secondary tiny", () => {});
+      const pending = button(t("job.watch"), "secondary tiny", () => {});
       pending.disabled = true;
-      pending.title = "Появится, когда начнётся рендер — после анализа звука и поиска тишины";
+      pending.title = t("job.watchPending");
       actions.appendChild(pending);
       const hint = document.createElement("span");
       hint.className = "muted small";
-      hint.textContent = "просмотр — с началом рендера";
+      hint.textContent = t("job.watchHint");
       actions.appendChild(hint);
     }
     if (job.status === "done" && job.result && job.result.output) {
       const output = job.result.output;
       actions.appendChild(
-        button("Смотреть", "tiny", (event) => {
+        button(t("job.watch"), "tiny", (event) => {
           event.stopPropagation();
           playJob(job);
         })
       );
       if (state.schema.allow_open) {
         actions.appendChild(
-          button("Открыть", "tiny", (event) => {
+          button(t("job.open"), "tiny", (event) => {
             event.stopPropagation();
             openPath(output, false);
           })
         );
         actions.appendChild(
-          button("Папка", "secondary tiny", (event) => {
+          button(t("job.folder"), "secondary tiny", (event) => {
             event.stopPropagation();
             openPath(output, true);
           })
@@ -959,7 +954,7 @@ function renderJobs() {
       const link = document.createElement("a");
       link.className = "tiny-link";
       link.href = `/api/file?path=${encodeURIComponent(output)}`;
-      link.textContent = "Скачать";
+      link.textContent = t("job.download");
       link.addEventListener("click", (event) => event.stopPropagation());
       actions.appendChild(link);
     }
@@ -993,7 +988,7 @@ async function openPath(path, reveal) {
       body: JSON.stringify({ path, reveal }),
     });
   } catch (error) {
-    appendLog(`Не удалось открыть: ${error.message}`, true);
+    appendLog(t("err.open", { error: error.message }), true);
   }
 }
 
@@ -1022,14 +1017,13 @@ function playJob(job) {
   if (job.status === "done" && job.result && job.result.output) {
     state.player = { jobId: job.id, mode: "file", hls: null };
     video.src = `/api/file?path=${encodeURIComponent(job.result.output)}`;
-    el("player-note").textContent = `Готово: ${baseName(job.result.output)}`;
+    el("player-note").textContent = t("player.done", { name: baseName(job.result.output) });
     video.play().catch(() => {});
     return;
   }
 
   const playlist = `/api/jobs/${job.id}/live/index.m3u8`;
-  el("player-note").textContent =
-    "Идёт конвертация — смотреть можно с начала, перемотка до отрендеренного места";
+  el("player-note").textContent = t("player.live");
   if (window.Hls && window.Hls.isSupported()) {
     // startPosition 0: an event playlist would otherwise open at its live edge,
     // which for a render running at 10x is nowhere near the beginning.
@@ -1043,7 +1037,7 @@ function playJob(job) {
     video.play().catch(() => {});
     state.player = { jobId: job.id, mode: "live", hls: null };
   } else {
-    el("player-note").textContent = "Браузер не умеет проигрывать HLS";
+    el("player-note").textContent = t("player.noHls");
   }
 }
 
@@ -1109,14 +1103,32 @@ function renderAnalysis(fields) {
   box.textContent = "";
   const rows = [
     [
-      "Речь",
-      `${fields.speech_lufs_median.toFixed(1)} LUFS (тихие места ${fields.speech_lufs.toFixed(1)})`,
+      t("an.speech"),
+      t("an.speechValue", {
+        median: fields.speech_lufs_median.toFixed(1),
+        quiet: fields.speech_lufs.toFixed(1),
+      }),
     ],
-    ["Шумовой пол", `${fields.noise_floor_db.toFixed(1)} дБ, SNR ${fields.snr_db.toFixed(1)} дБ`],
-    ["Пик", `${fields.true_peak_db.toFixed(1)} dBFS, запас ${fields.headroom_db.toFixed(1)} дБ`],
     [
-      "Динамика",
-      `LRA до ${fields.lra.toFixed(1)} LU, каналы ${fields.channel_imbalance_db.toFixed(1)} дБ`,
+      t("an.floor"),
+      t("an.floorValue", {
+        floor: fields.noise_floor_db.toFixed(1),
+        snr: fields.snr_db.toFixed(1),
+      }),
+    ],
+    [
+      t("an.peak"),
+      t("an.peakValue", {
+        peak: fields.true_peak_db.toFixed(1),
+        headroom: fields.headroom_db.toFixed(1),
+      }),
+    ],
+    [
+      t("an.dynamics"),
+      t("an.dynamicsValue", {
+        lra: fields.lra.toFixed(1),
+        imbalance: fields.channel_imbalance_db.toFixed(1),
+      }),
     ],
   ];
   for (const [label, value] of rows) {
@@ -1127,7 +1139,9 @@ function renderAnalysis(fields) {
   for (const hint of fields.hints || []) {
     const row = document.createElement("div");
     row.className = "hint";
-    row.textContent = `→ ${hint}`;
+    // The core sends a key and the numbers behind it, and its own English
+    // sentence as a fallback for a hint this page has no wording for.
+    row.textContent = `→ ${I18N[currentLang()][`hint.${hint.key}`] ? t(`hint.${hint.key}`, hint) : hint.text}`;
     box.appendChild(row);
   }
 }
@@ -1138,11 +1152,17 @@ function renderResult(fields) {
   box.className = "result ok";
   const size = fields.output_size ? ` · ${formatSize(fields.output_size)}` : "";
   box.textContent = [
-    `Готово: ${fields.output}${size}`,
-    `Кодировщик: ${fields.encoder}`,
-    `Длительность: ${formatDuration(fields.output_duration)} из ${formatDuration(fields.input_duration)}`,
-    `Рендер: ${Number(fields.render_seconds).toFixed(0)} с (${Number(fields.realtime).toFixed(2)}× realtime)`,
-    `Порог тишины: ${fields.silence_threshold}`,
+    t("res.done", { output: fields.output, size }),
+    t("res.encoder", { encoder: fields.encoder }),
+    t("res.duration", {
+      out: formatDuration(fields.output_duration),
+      in: formatDuration(fields.input_duration),
+    }),
+    t("res.render", {
+      seconds: Number(fields.render_seconds).toFixed(0),
+      realtime: Number(fields.realtime).toFixed(2),
+    }),
+    t("res.threshold", { threshold: fields.silence_threshold }),
   ].join("\n");
 }
 
@@ -1170,7 +1190,7 @@ function watchJob(jobId) {
         appendLog(event.text, event.error);
         break;
       case "phase":
-        el("phase").textContent = event.label || event.phase;
+        el("phase").textContent = t(`phase.${event.phase}`);
         setProgress(event.overall);
         break;
       case "progress":
@@ -1184,14 +1204,14 @@ function watchJob(jobId) {
         break;
       case "status":
         if (event.status === "done") {
-          el("phase").textContent = "Готово";
+          el("phase").textContent = t("phase.done");
           el("bar").className = "done";
           setProgress(1);
         } else if (event.status === "cancelled") {
-          el("phase").textContent = "Отменено";
+          el("phase").textContent = t("phase.cancelled");
           el("bar").className = "error";
         } else if (event.status === "error") {
-          el("phase").textContent = "Ошибка";
+          el("phase").textContent = t("phase.error");
           el("bar").className = "error";
         }
         refreshJobs();
@@ -1246,6 +1266,25 @@ async function convert() {
   refreshPrimary();
 }
 
+// ---------------------------------------------------------------- language
+
+function applyLanguage() {
+  applyStaticText();
+  for (const button of document.querySelectorAll("#lang-switch button")) {
+    button.classList.toggle("chosen", button.dataset.lang === currentLang());
+  }
+  // Everything the page drew itself has to be drawn again in the new language.
+  renderQualityLevels(true);
+  renderModels();
+  syncDenoiseHelp();
+  syncQualityHint();
+  renderDirs();
+  renderFiles();
+  refreshPrimary();
+  renderJobs();
+  refreshJobs();
+}
+
 // ------------------------------------------------------------------------ init
 
 // Every element the script expects to find. A page served from cache can be
@@ -1269,15 +1308,14 @@ const REQUIRED_ELEMENTS = [
 function checkPageMatchesScript() {
   const missing = REQUIRED_ELEMENTS.filter((id) => !el(id));
   if (missing.length) {
-    throw new Error(
-      "страница из кэша браузера старее скрипта — обновите её с Ctrl+Shift+R " +
-        `(не хватает: ${missing.join(", ")})`
-    );
+    throw new Error(t("err.stalePage", { missing: missing.join(", ") }));
   }
 }
 
 async function init() {
   checkPageMatchesScript();
+  setLanguage(currentLang());
+  applyStaticText();
   state.schema = await api("/api/schema");
   for (const group of state.schema.groups) {
     for (const field of group.fields) {
@@ -1292,6 +1330,12 @@ async function init() {
   await refreshJobs();
 
   el("file-filter").addEventListener("input", renderFiles);
+  for (const button of document.querySelectorAll("#lang-switch button")) {
+    button.addEventListener("click", () => {
+      setLanguage(button.dataset.lang);
+      applyLanguage();
+    });
+  }
   el("change-source-dir").addEventListener("click", openFolderBrowser);
   el("recent-source-dirs").addEventListener("change", (event) => {
     const path = event.target.value;
@@ -1382,18 +1426,19 @@ async function init() {
     try {
       await handleDrop(file);
     } catch (error) {
-      dropNote(`Не получилось: ${error.message}`, true);
+      dropNote(t("drop.failed", { error: error.message }), true);
     }
   });
   window.addEventListener("dragover", (event) => event.preventDefault());
   window.addEventListener("drop", (event) => event.preventDefault());
 
+  applyLanguage();
   state.poller = setInterval(refreshJobs, JOB_POLL_MS);
 }
 
 init().catch((error) => {
   document.body.insertAdjacentHTML(
     "afterbegin",
-    `<p style="color:#e8735e;padding:16px">Не удалось запустить интерфейс: ${error.message}</p>`
+    `<p style="color:#e8735e;padding:16px">${t("err.startup", { error: error.message })}</p>`
   );
 });

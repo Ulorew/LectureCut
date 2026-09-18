@@ -1537,22 +1537,46 @@ def format_audio_analysis(analysis: AudioAnalysis) -> str:
 CHANNEL_IMBALANCE_HINT_DB = 2.0
 
 
-def audio_analysis_hints(analysis: AudioAnalysis) -> list[str]:
-    hints: list[str] = []
+def audio_analysis_hints(analysis: AudioAnalysis) -> list[dict[str, object]]:
+    """What the measurements suggest, as a key plus the numbers behind it.
+
+    The text is what the terminal prints; a UI can translate from the key and
+    the values instead of parsing the sentence.
+    """
+
+    hints: list[dict[str, object]] = []
     if analysis.channel_imbalance_db >= CHANNEL_IMBALANCE_HINT_DB:
         hints.append(
-            f"Channels differ by {analysis.channel_imbalance_db:.1f} dB; --mono "
-            "trades stereo for a cleaner single voice"
+            {
+                "key": "mono",
+                "imbalance": round(analysis.channel_imbalance_db, 1),
+                "text": (
+                    f"Channels differ by {analysis.channel_imbalance_db:.1f} dB; "
+                    "--mono trades stereo for a cleaner single voice"
+                ),
+            }
         )
     if analysis.headroom_db < 3.0:
         hints.append(
-            f"Only {analysis.headroom_db:.1f} dB of headroom: a transient already "
-            "sits near full scale, so --declick may help before gain"
+            {
+                "key": "declick",
+                "headroom": round(analysis.headroom_db, 1),
+                "text": (
+                    f"Only {analysis.headroom_db:.1f} dB of headroom: a transient "
+                    "already sits near full scale, so --declick may help before gain"
+                ),
+            }
         )
     if analysis.snr_db < 12.0:
         hints.append(
-            f"SNR is {analysis.snr_db:.1f} dB; consider --denoise arnndn with a "
-            "model for speech-aware denoising"
+            {
+                "key": "arnndn",
+                "snr": round(analysis.snr_db, 1),
+                "text": (
+                    f"SNR is {analysis.snr_db:.1f} dB; consider --denoise arnndn "
+                    "with a model for speech-aware denoising"
+                ),
+            }
         )
     return hints
 
@@ -2922,7 +2946,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 report(format_audio_analysis(analysis))
                 hints = audio_analysis_hints(analysis)
                 for hint in hints:
-                    report(f"  hint: {hint}")
+                    report(f"  hint: {hint['text']}")
                 report_event(
                     "analysis",
                     speech_lufs=analysis.speech_lufs,
