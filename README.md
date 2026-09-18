@@ -98,4 +98,4 @@ the summary does not end in `skipped=`.
 
 - `data/` and `previews/` are gitignored: recordings and sample renders stay local.
 - `static/vendor/` holds hls.js (Apache-2.0), vendored so the UI works offline.
-- No license is declared yet.
+- MIT, see [LICENSE](LICENSE). The vendored hls.js keeps its own Apache-2.0.
