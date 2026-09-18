@@ -1,5 +1,7 @@
 # LectureCut
 
+Fully vibecoded ultimate ADHD video utility.
+
 Turns a raw lecture recording into something watchable: cuts the silence, cleans
 and levels the audio, speeds it up a little, re-encodes it. Python measures the
 recording and plans the edit, FFmpeg does the media work.
