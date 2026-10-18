@@ -25,6 +25,32 @@ class LectureCutTests(unittest.TestCase):
 
         self.assertEqual(silences, [main.Silence(1.25, 2.0), main.Silence(9.5, 10.0)])
 
+    def test_the_silence_pass_never_decodes_video(self):
+        """Decoding a 60 fps HEVC track here once cost more than the render."""
+
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with unittest.mock.patch.object(main, "run_command", fake_run), \
+                unittest.mock.patch.object(main, "require_command", lambda name: None):
+            main.detect_silences(
+                Path("lecture.mp4"),
+                threshold="-45dB",
+                min_silence=0.6,
+                duration=60.0,
+                start=0.0,
+                limit=None,
+            )
+
+        command = seen[0]
+        self.assertIn("-vn", command)
+        mapped = command[command.index("-map") + 1]
+        self.assertEqual(mapped, "0:a:0")  # the stream the render graph reads as [0:a]
+        self.assertLess(command.index("-i"), command.index("-vn"))  # an output option
+
     def test_silences_to_segments_keeps_padding_around_speech(self):
         segments = main.silences_to_segments(
             [main.Silence(3.0, 5.0), main.Silence(7.0, 7.3)],

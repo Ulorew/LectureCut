@@ -1247,6 +1247,16 @@ def detect_silences(
         *ffmpeg_input_options(start, limit),
         "-i",
         str(path),
+        # Without these the null muxer also takes the video stream, and every
+        # frame is decoded only to be thrown away: on a 60 fps HEVC screen
+        # recording that made this pass slower than the whole render. The map
+        # also pins the stream the render graph uses ([0:a] is a:0), where the
+        # default would pick whichever audio stream ffmpeg rates best.
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map",
+        "0:a:0",
         "-af",
         f"silencedetect=noise={threshold}:d={format_seconds(min_silence)}",
         "-f",
