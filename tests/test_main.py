@@ -1,6 +1,8 @@
 import argparse
 import contextlib
 import io
+import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,19 @@ import unittest.mock
 from pathlib import Path
 
 import main
+
+
+class CutExpressionCache:
+    """Translate an ffmpeg cut expression to Python once, not once per probe."""
+
+    _cache: dict[str, object] = {}
+
+    @classmethod
+    def compiled(cls, expression: str):
+        if expression not in cls._cache:
+            python = re.sub(r"\b(if|lt|between)\(", r"_\1(", expression.replace("\\,", ","))
+            cls._cache[expression] = compile(python, "<cut expression>", "eval")
+        return cls._cache[expression]
 
 
 class LectureCutTests(unittest.TestCase):
@@ -50,6 +65,64 @@ class LectureCutTests(unittest.TestCase):
         mapped = command[command.index("-map") + 1]
         self.assertEqual(mapped, "0:a:0")  # the stream the render graph reads as [0:a]
         self.assertLess(command.index("-i"), command.index("-vn"))  # an output option
+
+    @staticmethod
+    def evaluate_cut_expression(expression: str, variable: str, value: float) -> float:
+        """Evaluate the subset of ffmpeg's expression language the cuts use."""
+
+        code = CutExpressionCache.compiled(expression)
+        functions = {
+            "_if": lambda condition, then, otherwise: then if condition else otherwise,
+            "_lt": lambda a, b: 1.0 if a < b else 0.0,
+            "_between": lambda x, lo, hi: 1.0 if lo <= x <= hi else 0.0,
+        }
+        return eval(code, {"__builtins__": {}}, {**functions, variable: value})
+
+    def test_the_cut_expressions_find_the_right_segment(self):
+        rng = random.Random(7)
+        segments, cursor = [], 0.0
+        for _ in range(1612):  # the lecture that exposed the per-frame cost
+            cursor += rng.uniform(0.05, 3.0)
+            length = rng.uniform(0.1, 30.0)
+            segments.append(main.Segment(round(cursor, 3), round(cursor + length, 3)))
+            cursor += length
+        select = main.segment_select_expression(segments)
+        pts = main.segment_pts_expression(segments)
+
+        offsets, total = [], 0.0
+        for segment in segments:
+            offsets.append(total)
+            total += segment.duration
+        probes = [rng.uniform(-1.0, cursor + 1.0) for _ in range(3000)]
+        for segment in segments[::40]:
+            probes += [segment.start, segment.end, segment.start - 1e-4, segment.end + 1e-4]
+
+        for t in probes:
+            inside = [i for i, seg in enumerate(segments) if seg.start <= t <= seg.end]
+            expected_pts = t - segments[inside[0]].start + offsets[inside[0]] if inside else 0.0
+            self.assertEqual(bool(self.evaluate_cut_expression(select, "t", t)), bool(inside), t)
+            self.assertAlmostEqual(
+                self.evaluate_cut_expression(pts, "T", t), expected_pts, places=6, msg=t
+            )
+
+    def test_the_cut_expressions_stay_shallow(self):
+        """Each frame should walk one path of the tree, not every segment."""
+
+        segments = [main.Segment(i * 2.0, i * 2.0 + 1.0) for i in range(1612)]
+        for expression in (
+            main.segment_select_expression(segments),
+            main.segment_pts_expression(segments),
+        ):
+            depth = deepest = 0
+            for char in expression:
+                depth += {"(": 1, ")": -1}.get(char, 0)
+                deepest = max(deepest, depth)
+            self.assertLessEqual(deepest, 2 * 12 + 3)  # 11-12 levels of if(lt(...))
+            self.assertEqual(expression.count("between("), 1612)  # each segment once
+
+    def test_no_segments_selects_nothing(self):
+        self.assertEqual(main.segment_select_expression([]), "0")
+        self.assertEqual(main.segment_pts_expression([]), "0")
 
     def test_silences_to_segments_keeps_padding_around_speech(self):
         segments = main.silences_to_segments(
@@ -110,16 +183,12 @@ class LectureCutTests(unittest.TestCase):
             video_fps=25.0,
         )
 
-        self.assertIn("select='between(t\\,0\\,1)+between(t\\,2\\,3.5)'", filtergraph)
-        self.assertIn(
-            "setpts='(between(T\\,0\\,1)*(T-0+0)+between(T\\,2\\,3.5)*(T-2+1))/2.00000000/TB'[vout]",
-            filtergraph,
-        )
-        self.assertIn("aselect='between(t\\,0\\,1)+between(t\\,2\\,3.5)'", filtergraph)
-        self.assertIn(
-            "asetpts='(between(T\\,0\\,1)*(T-0+0)+between(T\\,2\\,3.5)*(T-2+1))/TB'",
-            filtergraph,
-        )
+        select = "if(lt(t\\,2)\\,between(t\\,0\\,1)\\,between(t\\,2\\,3.5))"
+        pts = "if(lt(T\\,2)\\,between(T\\,0\\,1)*(T-0+0)\\,between(T\\,2\\,3.5)*(T-2+1))"
+        self.assertIn(f"select='{select}'", filtergraph)
+        self.assertIn(f"setpts='({pts})/2.00000000/TB'[vout]", filtergraph)
+        self.assertIn(f"aselect='{select}'", filtergraph)
+        self.assertIn(f"asetpts='({pts})/TB'", filtergraph)
         self.assertIn(
             "atempo=2.000000,alimiter=limit=0.7943:level=disabled,aresample=48000[aout]",
             filtergraph,
@@ -132,7 +201,7 @@ class LectureCutTests(unittest.TestCase):
 
         self.assertEqual(
             expression,
-            "between(T\\,1\\,2.5)*(T-1+0)+between(T\\,4\\,5)*(T-4+1.5)",
+            "if(lt(T\\,4)\\,between(T\\,1\\,2.5)*(T-1+0)\\,between(T\\,4\\,5)*(T-4+1.5))",
         )
 
     def test_parse_fraction(self):

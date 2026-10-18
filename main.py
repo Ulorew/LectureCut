@@ -21,7 +21,7 @@ from statistics import median
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -2386,10 +2386,7 @@ def build_select_filtergraph(
     *,
     video_fps: float,
 ) -> str:
-    select_expression = "+".join(
-        f"between(t\\,{format_seconds(segment.start)}\\,{format_seconds(segment.end)})"
-        for segment in segments
-    )
+    select_expression = segment_select_expression(segments)
     pts_expression = segment_pts_expression(segments)
     video_filters = [
         f"select='{select_expression}'",
@@ -2406,16 +2403,60 @@ def build_select_filtergraph(
     )
 
 
+def segment_search_tree(
+    segments: list[Segment], variable: str, leaf: Callable[[int], str]
+) -> str:
+    """An expression that finds the segment holding `variable` by bisection.
+
+    ffmpeg evaluates the cut expressions for every frame, video and audio
+    alike. Written as a sum of one between() per segment that costs a test per
+    segment per frame: a lecture with 1600 kept stretches at 60 fps spent its
+    render in the single filter thread with the decoders idle. Segments are
+    sorted and disjoint, and if() evaluates only the branch it takes, so a
+    balanced tree of comparisons reaches the one segment that can match in
+    log2(n) steps. The leaf still checks that segment's bounds, so a time in a
+    gap - or before the first segment - selects nothing.
+    """
+
+    if not segments:
+        return "0"
+
+    def node(lo: int, hi: int) -> str:
+        if hi - lo == 1:
+            return leaf(lo)
+        mid = (lo + hi) // 2
+        boundary = format_seconds(segments[mid].start)
+        return f"if(lt({variable}\\,{boundary})\\,{node(lo, mid)}\\,{node(mid, hi)})"
+
+    return node(0, len(segments))
+
+
+def segment_select_expression(segments: list[Segment]) -> str:
+    def leaf(index: int) -> str:
+        segment = segments[index]
+        return (
+            f"between(t\\,{format_seconds(segment.start)}"
+            f"\\,{format_seconds(segment.end)})"
+        )
+
+    return segment_search_tree(segments, "t", leaf)
+
+
 def segment_pts_expression(segments: list[Segment]) -> str:
-    terms: list[str] = []
+    offsets: list[float] = []
     output_offset = 0.0
     for segment in segments:
+        offsets.append(output_offset)
+        output_offset += segment.duration
+
+    def leaf(index: int) -> str:
+        segment = segments[index]
         start = format_seconds(segment.start)
         end = format_seconds(segment.end)
-        offset = format_seconds(output_offset)
-        terms.append(f"between(T\\,{start}\\,{end})*(T-{start}+{offset})")
-        output_offset += segment.duration
-    return "+".join(terms) or "0"
+        offset = format_seconds(offsets[index])
+        return f"between(T\\,{start}\\,{end})*(T-{start}+{offset})"
+
+    return segment_search_tree(segments, "T", leaf)
 
 
 def build_concat_filtergraph(segments: list[Segment], args: argparse.Namespace) -> str:
