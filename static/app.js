@@ -615,7 +615,15 @@ function visibleFiles(options) {
 }
 
 function batchTargets() {
-  return state.files.filter((file) => state.checked.has(file.path));
+  // A Set keeps insertion order, so the queue follows the order the files were
+  // clicked in. Filtering state.files instead would order the batch by the
+  // listing, which is alphabetical and has nothing to do with what was picked
+  // first. Re-picking a file moves it to the end, which is what a second click
+  // on it means.
+  const byPath = new Map(state.files.map((file) => [file.path, file]));
+  return [...state.checked]
+    .map((path) => byPath.get(path))
+    .filter((file) => file !== undefined);
 }
 
 function updateConvertButton() {
