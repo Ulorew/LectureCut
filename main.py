@@ -403,6 +403,8 @@ class MediaInfo:
     has_audio: bool
     has_video: bool
     video_fps: float
+    # Filters that apply the display matrix; None leaves it to ffmpeg's autorotate.
+    upright: tuple[str, ...] | None = ()
 
 
 @dataclass(frozen=True)
@@ -732,6 +734,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=23,
         help="libx264 CRF value",
+    )
+    video_group.add_argument(
+        "--max-fps",
+        type=float,
+        default=0.0,
+        help=(
+            "Cap the output frame rate, e.g. 30; 0 keeps the source rate. A slower "
+            "source is never padded with repeated frames"
+        ),
     )
 
     live_group = parser.add_argument_group("live preview")
@@ -1183,7 +1194,8 @@ def probe_media(
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate",
+        "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate"
+        ":stream_side_data=side_data_type,rotation,displaymatrix",
         "-of",
         "json",
         str(path),
@@ -1207,7 +1219,51 @@ def probe_media(
         has_audio=any(stream.get("codec_type") == "audio" for stream in streams),
         has_video=any(stream.get("codec_type") == "video" for stream in streams),
         video_fps=stream_fps(video_stream),
+        upright=upright_filters(video_stream),
     )
+
+
+DISPLAY_MATRIX_ROW_RE = re.compile(
+    r"^\s*0000000[0-2]:\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)", re.MULTILINE
+)
+
+
+def upright_filters(stream: dict[str, object]) -> tuple[str, ...] | None:
+    """The filters that turn the picture the way its display matrix asks.
+
+    ffmpeg applies the matrix itself, but to every decoded frame before the cut
+    filters run - on a 60 fps recording turned upside down that was a quarter of
+    the decoding cost, spent on frames the cuts then dropped. Applied at the end
+    of our own chain it touches only the frames that are kept, and gives the
+    same pixels. Only quarter turns are taken over: for a mirrored matrix the
+    reported rotation is misleading (a plain horizontal flip reads as -180), so
+    that and any odd angle return None and stay with ffmpeg's autorotate.
+    """
+
+    for side in stream.get("side_data_list") or []:  # type: ignore[union-attr]
+        if not isinstance(side, dict) or side.get("side_data_type") != "Display Matrix":
+            continue
+        rows = DISPLAY_MATRIX_ROW_RE.findall(str(side.get("displaymatrix") or ""))
+        if len(rows) < 2:
+            return None
+        (a, b, _), (c, d, _) = (tuple(int(value) for value in row) for row in rows[:2])
+        if a * d - b * c <= 0:
+            return None
+        try:
+            theta = (-float(side.get("rotation") or 0.0)) % 360.0
+        except (TypeError, ValueError):
+            return None
+        for angle, filters in (
+            (0.0, ()),
+            (90.0, ("transpose=clock",)),
+            (180.0, ("hflip", "vflip")),
+            (270.0, ("transpose=cclock",)),
+            (360.0, ()),
+        ):
+            if abs(theta - angle) < 1.0:
+                return filters
+        return None
+    return ()
 
 
 def stream_fps(stream: dict[str, object]) -> float:
@@ -2374,23 +2430,49 @@ def build_filtergraph(
     args: argparse.Namespace,
     *,
     video_fps: float = 30.0,
+    upright: tuple[str, ...] | None = (),
 ) -> str:
+    tail = video_tail_filters(args, video_fps=video_fps, upright=upright)
     if args.filtergraph_mode == "concat":
-        return build_concat_filtergraph(segments, args)
-    return build_select_filtergraph(segments, args, video_fps=video_fps)
+        return build_concat_filtergraph(segments, args, tail=tail)
+    return build_select_filtergraph(segments, args, tail=tail)
+
+
+def video_tail_filters(
+    args: argparse.Namespace,
+    *,
+    video_fps: float,
+    upright: tuple[str, ...] | None,
+) -> list[str]:
+    """What runs on the kept frames after the cuts: the rate cap, then rotation.
+
+    Both go last on purpose. Everything after the cuts costs per kept frame, and
+    the cap halves those on a 60 fps source - in a measured render that took a
+    lecture from 24 s to 13 s per two minutes and the file from 4.9 to 2.4 MB.
+    The cap only applies when the sped-up source would exceed it; below that
+    fps would repeat frames instead.
+    """
+
+    filters: list[str] = []
+    max_fps = getattr(args, "max_fps", 0.0) or 0.0
+    if max_fps > 0 and video_fps * args.speed > max_fps + 0.01:
+        filters.append(f"fps={format_seconds(max_fps)}")
+    filters.extend(upright or ())
+    return filters
 
 
 def build_select_filtergraph(
     segments: list[Segment],
     args: argparse.Namespace,
     *,
-    video_fps: float,
+    tail: list[str] = [],  # noqa: B006 - never mutated
 ) -> str:
     select_expression = segment_select_expression(segments)
     pts_expression = segment_pts_expression(segments)
     video_filters = [
         f"select='{select_expression}'",
         f"setpts='({pts_expression})/{args.speed:.8f}/TB'",
+        *tail,
     ]
     audio_filters = [
         f"aselect='{select_expression}'",
@@ -2459,7 +2541,12 @@ def segment_pts_expression(segments: list[Segment]) -> str:
     return segment_search_tree(segments, "T", leaf)
 
 
-def build_concat_filtergraph(segments: list[Segment], args: argparse.Namespace) -> str:
+def build_concat_filtergraph(
+    segments: list[Segment],
+    args: argparse.Namespace,
+    *,
+    tail: list[str] = [],  # noqa: B006 - never mutated
+) -> str:
     lines: list[str] = []
     concat_inputs: list[str] = []
     for index, segment in enumerate(segments):
@@ -2475,7 +2562,7 @@ def build_concat_filtergraph(segments: list[Segment], args: argparse.Namespace) 
 
     joined_inputs = "".join(concat_inputs)
     lines.append(f"{joined_inputs}concat=n={len(segments)}:v=1:a=1[vcat][acat]")
-    lines.append(f"[vcat]setpts=PTS/{args.speed:.8f}[vout]")
+    lines.append(f"[vcat]{','.join([f'setpts=PTS/{args.speed:.8f}', *tail])}[vout]")
     lines.append(f"[acat]{','.join(build_audio_filters(args))}[aout]")
     return ";\n".join(lines) + "\n"
 
@@ -2588,6 +2675,7 @@ def render_command(
     encoder: str,
     args: argparse.Namespace,
     live_dir: Path | None = None,
+    manual_rotation: bool = False,
 ) -> list[str]:
     command = [
         "ffmpeg",
@@ -2595,6 +2683,8 @@ def render_command(
         "-y",
         "-nostdin",
         *ffmpeg_input_options(args.start, args.limit),
+        # The filtergraph turns the kept frames itself; see upright_filters.
+        *(["-noautorotate"] if manual_rotation else []),
         "-i",
         str(input_path),
         "-filter_complex_script",
@@ -2663,6 +2753,7 @@ def render_with_fallback(
     filtergraph_path: Path,
     args: argparse.Namespace,
     expected_duration: float | None = None,
+    manual_rotation: bool = False,
 ) -> tuple[str, float]:
     candidates = encoder_candidates(args)
     last_error: subprocess.CalledProcessError | None = None
@@ -2679,6 +2770,7 @@ def render_with_fallback(
             encoder=encoder,
             args=args,
             live_dir=live_dir,
+            manual_rotation=manual_rotation,
         )
         if args.dry_run:
             report("\nRender command:")
@@ -2836,7 +2928,9 @@ def render_segments(
     args: argparse.Namespace,
     filtergraph_name: str = "filtergraph.ffmpeg",
 ) -> tuple[str, float]:
-    filtergraph = build_filtergraph(segments, args, video_fps=media.video_fps)
+    filtergraph = build_filtergraph(
+        segments, args, video_fps=media.video_fps, upright=media.upright
+    )
     filtergraph_path = workdir / filtergraph_name
     filtergraph_path.write_text(filtergraph, encoding="utf-8")
 
@@ -2851,6 +2945,10 @@ def render_segments(
         filtergraph_path=filtergraph_path,
         args=args,
         expected_duration=kept / args.speed if args.speed > 0 else None,
+        # Only when the graph really turns the frames: if the probe saw no
+        # matrix, ffmpeg's autorotate stays on and a missed one still lands
+        # upright, merely without the saving.
+        manual_rotation=bool(media.upright),
     )
 
 

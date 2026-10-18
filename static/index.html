@@ -112,6 +112,14 @@
           <option value="hevc_nvenc" data-i18n="enc.hevc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
         </select>
       </label>
+      <label><span data-i18n="set.maxFps">Кадров в секунду</span>
+        <select id="set-max-fps">
+          <option value="0" data-i18n="fps.source">как в источнике</option>
+          <option value="30" data-i18n="fps.30">не больше 30</option>
+          <option value="25" data-i18n="fps.25">не больше 25</option>
+          <option value="15" data-i18n="fps.15">не больше 15 — слайды, доска</option>
+        </select>
+      </label>
       <label class="wide" id="quality-hint-label">
         <span id="quality-hint" class="muted small"></span>
       </label>

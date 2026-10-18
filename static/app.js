@@ -13,6 +13,7 @@ const BASIC_DESTS = new Set([
   "cq",
   "crf",
   "encoder",
+  "max_fps",
   "if_exists",
   "start",
   "limit",
@@ -232,6 +233,7 @@ function applyDefaults() {
   el("set-arnndn-mix").value = d.arnndn_mix ?? 1;
   renderQualityLevels();
   el("set-encoder").value = ["libx264", "hevc_nvenc"].includes(d.encoder) ? d.encoder : "auto";
+  el("set-max-fps").value = String(Number(d.max_fps) || 0);
   syncQualityHint();
   syncArnndnMix();
   renderModels();
@@ -422,6 +424,7 @@ function collectSettings() {
   put("cq", quality.cq);
   put("crf", quality.crf);
   put("encoder", el("set-encoder").value);
+  put("max_fps", Number(el("set-max-fps").value));
   const model = el("set-arnndn-model").value;
   if (model && !el("model-label").classList.contains("hidden")) {
     settings.arnndn_model = model;
@@ -1311,6 +1314,7 @@ const REQUIRED_ELEMENTS = [
   "set-arnndn-mix",
   "set-quality",
   "set-encoder",
+  "set-max-fps",
   "file-list",
   "folder-dialog",
   "video",

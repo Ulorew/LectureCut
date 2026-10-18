@@ -3,6 +3,7 @@ import contextlib
 import io
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1362,6 +1363,142 @@ class ReporterAndCancelTests(unittest.TestCase):
                 main.run_command(["false"], capture=True)
         finally:
             main.ACTIVE_CANCEL.reset(token)
+
+
+def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:
+    """A video stream as ffprobe reports one carrying a display matrix."""
+
+    text = (
+        f"\n00000000: {a:12d} {b:11d} {0:11d}\n"
+        f"00000001: {c:12d} {d:11d} {0:11d}\n"
+        f"00000002: {0:12d} {0:11d}  1073741824\n"
+    )
+    return {
+        "codec_type": "video",
+        "side_data_list": [
+            {"side_data_type": "Display Matrix", "displaymatrix": text, "rotation": rotation}
+        ],
+    }
+
+
+class UprightTests(unittest.TestCase):
+    """Taking rotation over from ffmpeg, and only where that is safe."""
+
+    ONE = 65536
+
+    def test_quarter_turns_map_to_the_filters_ffmpeg_would_insert(self):
+        one = self.ONE
+        cases = {
+            "upside down, as the iPad recording": (display_matrix(-one, 0, 0, -one, -180), ("hflip", "vflip")),
+            "rotation 90": (display_matrix(0, -one, one, 0, 90), ("transpose=cclock",)),
+            "rotation -90": (display_matrix(0, one, -one, 0, -90), ("transpose=clock",)),
+            "identity": (display_matrix(one, 0, 0, one, 0), ()),
+        }
+        for name, (stream, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(main.upright_filters(stream), expected)
+
+    def test_a_mirror_is_left_to_ffmpeg(self):
+        """A plain horizontal flip is reported as rotation -180."""
+
+        one = self.ONE
+        self.assertIsNone(main.upright_filters(display_matrix(-one, 0, 0, one, -180)))
+        self.assertIsNone(main.upright_filters(display_matrix(0, -one, -one, 0, 90)))
+
+    def test_odd_angles_and_unreadable_matrices_are_left_to_ffmpeg(self):
+        one = self.ONE
+        self.assertIsNone(main.upright_filters(display_matrix(46341, -46341, 46341, 46341, 45)))
+        broken = {"side_data_list": [{"side_data_type": "Display Matrix", "rotation": 90}]}
+        self.assertIsNone(main.upright_filters(broken))
+
+    def test_no_matrix_needs_nothing(self):
+        self.assertEqual(main.upright_filters({"codec_type": "video"}), ())
+
+    def test_autorotate_is_switched_off_only_for_the_graph_that_rotates(self):
+        args = main.parse_args(["in.mp4"])
+        for manual in (False, True):
+            command = main.render_command(
+                input_path=Path("in.mp4"),
+                output_path=Path("out.mp4"),
+                filtergraph_path=Path("graph.txt"),
+                encoder="libx264",
+                args=args,
+                manual_rotation=manual,
+            )
+            with self.subTest(manual=manual):
+                self.assertEqual("-noautorotate" in command, manual)
+                if manual:
+                    self.assertLess(command.index("-noautorotate"), command.index("-i"))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_the_frames_match_ffmpegs_own_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            plain = folder / "plain.mp4"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                 "-i", "testsrc=size=160x120:rate=5:duration=1",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(plain)],
+                check=True,
+            )
+            for rotation in ("90", "180", "-90"):
+                rotated = folder / f"rot{rotation}.mp4"
+                subprocess.run(
+                    ["ffmpeg", "-v", "error", "-y", "-display_rotation", rotation,
+                     "-i", str(plain), "-c", "copy", str(rotated)],
+                    check=True,
+                )
+                media = main.probe_media(rotated)
+                self.assertTrue(media.upright, rotation)
+
+                def frames(*command: str) -> list[str]:
+                    out = subprocess.run(
+                        ["ffmpeg", "-v", "error", *command, "-pix_fmt", "yuv420p",
+                         "-c:v", "rawvideo", "-f", "framemd5", "-"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout
+                    return [line for line in out.splitlines() if line.startswith("0,")]
+
+                with self.subTest(rotation=rotation):
+                    self.assertEqual(
+                        frames("-noautorotate", "-i", str(rotated), "-vf", ",".join(media.upright)),
+                        frames("-i", str(rotated)),
+                    )
+
+
+class FrameRateCapTests(unittest.TestCase):
+    def tail(self, *, fps: float, speed: float, cap: float, upright=()) -> list[str]:
+        args = main.parse_args(["in.mp4", f"--speed={speed}", f"--max-fps={cap}"])
+        return main.video_tail_filters(args, video_fps=fps, upright=upright)
+
+    def test_a_60_fps_lecture_is_capped(self):
+        self.assertEqual(self.tail(fps=59.97, speed=1.15, cap=30), ["fps=30"])
+
+    def test_the_speed_up_counts(self):
+        """25 fps played at 1.25x is 31.25 fps on the way out."""
+
+        self.assertEqual(self.tail(fps=25, speed=1.25, cap=30), ["fps=30"])
+        self.assertEqual(self.tail(fps=25, speed=1.15, cap=30), [])
+
+    def test_a_slower_source_is_not_padded_with_repeats(self):
+        self.assertEqual(self.tail(fps=24, speed=1.0, cap=30), [])
+
+    def test_zero_keeps_the_source_rate(self):
+        self.assertEqual(self.tail(fps=59.97, speed=1.15, cap=0), [])
+
+    def test_rotation_follows_the_cap_so_dropped_frames_are_never_turned(self):
+        self.assertEqual(
+            self.tail(fps=60, speed=1.0, cap=30, upright=("hflip", "vflip")),
+            ["fps=30", "hflip", "vflip"],
+        )
+
+    def test_both_graph_modes_end_the_video_chain_with_the_tail(self):
+        segments = [main.Segment(0.0, 1.0), main.Segment(2.0, 3.0)]
+        for mode in ("select", "concat"):
+            args = main.parse_args(["in.mp4", "--max-fps=30", f"--filtergraph-mode={mode}"])
+            graph = main.build_filtergraph(segments, args, video_fps=60.0, upright=("hflip", "vflip"))
+            with self.subTest(mode=mode):
+                self.assertRegex(graph, r",fps=30,hflip,vflip\[vout\]")
 
 
 if __name__ == "__main__":
