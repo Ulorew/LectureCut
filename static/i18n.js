@@ -115,6 +115,7 @@ const I18N = {
     "folder.noSub": "Вложенных папок нет",
     "folder.recent": "Недавние…",
     "folder.recentNone": "недавних нет",
+    "folder.unavailable": "— недоступна",
     "folder.failed": "Не удалось выбрать папку: {error}",
     "dir.nextToSource": "рядом с источником",
 
@@ -300,6 +301,7 @@ const I18N = {
     "folder.noSub": "No subfolders",
     "folder.recent": "Recent…",
     "folder.recentNone": "none recent",
+    "folder.unavailable": "— unavailable",
     "folder.failed": "Could not use that folder: {error}",
     "dir.nextToSource": "next to the source",
 

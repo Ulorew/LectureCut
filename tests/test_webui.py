@@ -367,19 +367,69 @@ class SourceFolderTests(unittest.TestCase):
 
         self.assertEqual(recent, [str(self.downloads.resolve()), str(self.project.resolve())])
 
-    def test_a_vanished_folder_is_forgotten_on_restart(self):
-        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
-        shutil.rmtree(self.downloads)
-
+    def restart(self) -> "webui.Config":
         reborn = webui.Config(
             roots=[self.project.resolve()],
             upload_dir=self.config.upload_dir,
             state_path=self.state,
         )
         reborn.load_state()
+        return reborn
 
+    def test_an_unmounted_folder_is_remembered_but_not_readable(self):
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        unplugged = self.downloads.with_name("unplugged")
+        self.downloads.rename(unplugged)  # the drive is not mounted on restart
+
+        reborn = self.restart()
+
+        self.assertEqual(reborn.recent_source_dirs, [self.downloads.resolve()])
+        self.assertNotIn(self.downloads.resolve(), reborn.roots)
         self.assertEqual(reborn.current_source_dir(), self.project.resolve())
-        self.assertEqual(reborn.recent_source_dirs, [])
+        self.assertEqual(
+            reborn.recent_payload()["unavailable_source_dirs"],
+            [str(self.downloads.resolve())],
+        )
+
+    def test_using_the_server_without_the_drive_does_not_erase_it(self):
+        """The reported bug: one session without the drive wiped the history."""
+
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        unplugged = self.downloads.with_name("unplugged")
+        self.downloads.rename(unplugged)
+
+        without_drive = self.restart()
+        without_drive.choose_source_dir(self.project.resolve())  # saves the state
+        unplugged.rename(self.downloads)  # the drive is back
+        with_drive = self.restart()
+
+        self.assertEqual(
+            with_drive.recent_source_dirs,
+            [self.project.resolve(), self.downloads.resolve()],
+        )
+        self.assertIn(self.downloads.resolve(), with_drive.roots)
+        self.assertEqual(with_drive.recent_payload()["unavailable_source_dirs"], [])
+
+    def test_the_last_folder_comes_back_with_its_drive(self):
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        unplugged = self.downloads.with_name("unplugged")
+        self.downloads.rename(unplugged)
+        self.restart().save_state()  # a session without the drive
+        unplugged.rename(self.downloads)
+
+        self.assertEqual(self.restart().current_source_dir(), self.downloads.resolve())
+
+    def test_picking_an_unavailable_folder_says_why(self):
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+        self.client.post("/api/source-dir", json={"path": str(self.project)})
+        self.downloads.rename(self.downloads.with_name("unplugged"))
+
+        response = self.client.post("/api/source-dir", json={"path": str(self.downloads.resolve())})
+        schema = self.client.get("/api/schema").json()
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("mounted", response.json()["detail"])
+        self.assertEqual(schema["unavailable_source_dirs"], [str(self.downloads.resolve())])
 
     def test_browsing_can_be_disabled(self):
         self.config.allow_browse = False

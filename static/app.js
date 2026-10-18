@@ -689,10 +689,15 @@ function renderSourceDir() {
   placeholder.value = "";
   placeholder.textContent = recent.length ? t("folder.recent") : t("folder.recentNone");
   select.appendChild(placeholder);
+  // Missing folders stay listed and pickable: the drive may have been mounted
+  // since the page loaded, and the server says why if it still is not.
+  const unavailable = new Set(state.schema.unavailable_source_dirs || []);
   for (const dir of recent) {
     const option = document.createElement("option");
     option.value = dir;
-    option.textContent = dir;
+    option.textContent = unavailable.has(dir)
+      ? `${dir} ${t("folder.unavailable")}`
+      : dir;
     select.appendChild(option);
   }
   select.disabled = recent.length === 0;
@@ -748,6 +753,7 @@ async function chooseFolder(path) {
     });
     state.schema.source_dir = data.source_dir;
     state.schema.recent_source_dirs = data.recent_source_dirs;
+    state.schema.unavailable_source_dirs = data.unavailable_source_dirs;
     state.files = data.files;
     // Selections belong to the folder they were made in.
     state.checked.clear();

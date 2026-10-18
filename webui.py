@@ -617,7 +617,15 @@ class Config:
             pass  # losing the remembered folder is not worth failing a request
 
     def load_state(self) -> None:
-        """Restore the chosen folders; a folder that has since vanished is dropped."""
+        """Restore the chosen folders, including ones that are missing right now.
+
+        A folder on an external drive is absent until the drive is mounted.
+        Dropping it here used to erase it for good, because the next save wrote
+        the shortened list back, so one start with the drive unplugged wiped the
+        history. A missing folder is kept and shown as unavailable; it only
+        becomes readable once it exists, and current_source_dir() falls back
+        while it does not.
+        """
 
         if self.state_path is None or not self.state_path.exists():
             return
@@ -628,15 +636,25 @@ class Config:
         if not self.allow_browse:
             return
         recent = [Path(p) for p in payload.get("recent_source_dirs") or []]
-        self.recent_source_dirs = [d for d in recent if d.is_dir()][:RECENT_SOURCE_DIRS]
+        self.recent_source_dirs = recent[:RECENT_SOURCE_DIRS]
         for folder in self.recent_source_dirs:
-            if folder not in self.roots:
+            if folder.is_dir() and folder not in self.roots:
                 self.roots.append(folder)
         chosen = payload.get("source_dir")
-        if chosen and Path(chosen).is_dir():
+        if chosen:
             self.source_dir = Path(chosen)
-            if self.source_dir not in self.roots:
+            if self.source_dir.is_dir() and self.source_dir not in self.roots:
                 self.roots.append(self.source_dir)
+
+    def recent_payload(self) -> dict[str, list[str]]:
+        """The remembered folders, and which of them cannot be opened now."""
+
+        return {
+            "recent_source_dirs": [str(d) for d in self.recent_source_dirs],
+            "unavailable_source_dirs": [
+                str(d) for d in self.recent_source_dirs if not d.is_dir()
+            ],
+        }
 
 
 def walk_limited(
@@ -974,7 +992,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             "groups": core.parser_schema(),
             "roots": [str(root) for root in config.roots],
             "source_dir": str(config.current_source_dir()),
-            "recent_source_dirs": [str(d) for d in config.recent_source_dirs],
+            **config.recent_payload(),
             "allow_browse": config.allow_browse,
             "live_preview": config.live_preview,
             "csrf_header": CSRF_HEADER,
@@ -1029,13 +1047,21 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         try:
             folder = Path(raw).expanduser().resolve(strict=True)
         except (FileNotFoundError, RuntimeError):
-            raise HTTPException(status_code=404, detail=f"No such folder: {raw}") from None
+            remembered = Path(raw) in config.recent_source_dirs
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Not available: {raw}. Is its drive mounted?"
+                    if remembered
+                    else f"No such folder: {raw}"
+                ),
+            ) from None
         if not folder.is_dir():
             raise HTTPException(status_code=400, detail=f"Not a folder: {folder}")
         config.choose_source_dir(folder)
         return {
             "source_dir": str(folder),
-            "recent_source_dirs": [str(d) for d in config.recent_source_dirs],
+            **config.recent_payload(),
             "files": list_media(config, processed),
         }
 
