@@ -2541,12 +2541,13 @@ def resolve_audio_settings(
     input_path: Path,
     args: argparse.Namespace,
     analysis: AudioAnalysis | None,
+    calibrate_threshold: bool = True,
 ) -> None:
     """Freeze the derived silence threshold and audio chain onto args."""
 
     start_phase(PHASE_CALIBRATE)
     enforce_denoise_sanity(input_path, args=args, analysis=analysis)
-    if str(args.silence_threshold).strip().lower() == "auto":
+    if calibrate_threshold and str(args.silence_threshold).strip().lower() == "auto":
         calibrated = calibrate_silence_threshold(
             input_path, analysis=analysis, args=args
         )
@@ -3155,6 +3156,27 @@ def run_preview_sweep(
     if not media.has_audio:
         raise PipelineError("Input has no audio stream")
 
+    # The clips exist to choose settings for the real render, so they get its
+    # measured chain: the same analysis over the render's range, and per denoise
+    # mode the same denoise check and gain calibration. Rendering them with no
+    # chain made build_audio_filters fall back to FALLBACK_* levels, and the
+    # previews did not sound like the render they were previewing.
+    analysis = None
+    if not args.no_analyze:
+        render_media = probe_media(input_path, start=args.start, limit=args.limit)
+        analysis = analyze_audio(input_path=input_path, media=render_media, args=args)
+    resolved: dict[str, argparse.Namespace] = {}
+    for denoise in denoise_modes:
+        chain_args = copy.copy(args)
+        chain_args.denoise = denoise
+        resolve_audio_settings(
+            input_path=input_path,
+            args=chain_args,
+            analysis=analysis,
+            calibrate_threshold=False,  # each clip names its own threshold
+        )
+        resolved[denoise] = chain_args
+
     manifest: list[dict[str, object]] = []
     total = len(thresholds) * len(denoise_modes)
     current = 0
@@ -3169,8 +3191,10 @@ def run_preview_sweep(
         for denoise in denoise_modes:
             current += 1
             combo_args = copy.copy(threshold_args)
-            combo_args.denoise = denoise
-            combo_args.audio_chain = None
+            # The denoise check may have stepped down to a gentler mode, as the
+            # render would; the file name keeps the mode that was asked for.
+            combo_args.denoise = resolved[denoise].denoise
+            combo_args.audio_chain = list(resolved[denoise].audio_chain)
             output_name = (
                 f"sample_{current:02d}_thr-{safe_label(threshold)}_"
                 f"denoise-{safe_label(denoise)}.mp4"

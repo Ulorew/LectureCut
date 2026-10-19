@@ -846,6 +846,40 @@ class LectureCutTests(unittest.TestCase):
         self.assertLess(names.index("afftdn"), names.index("dynaudnorm"))
         self.assertLess(names.index("atempo"), names.index("alimiter"))
 
+    def test_previews_use_the_measured_audio_chain(self):
+        analysis = self.analysis()
+        plan = main.GainPlan(bias_db=-3.0)
+        chains = []
+
+        def fake_render(**kwargs):
+            chains.append(kwargs["args"].audio_chain)
+            return "libx264", 1.0
+
+        media = main.MediaInfo(duration=60.0, has_audio=True, has_video=True, video_fps=30.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            args = main.parse_args(
+                ["in.mp4", "--preview-dir", tmp, "--preview-thresholds=-40dB,-30dB",
+                 "--preview-denoise", "none"]
+            )
+            with contextlib.ExitStack() as stack:
+                patch = lambda name, **kw: stack.enter_context(
+                    unittest.mock.patch.object(main, name, **kw)
+                )
+                patch("probe_media", return_value=media)
+                patch("analyze_audio", return_value=analysis)
+                patch("measure_denoise_effect", return_value=None)
+                patch("calibrate_gain", return_value=plan)
+                patch("plan_segments", return_value=([], [main.Segment(0.0, 8.0)]))
+                patch("render_segments", side_effect=fake_render)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                main.run_preview_sweep(input_path=Path("in.mp4"), workdir=Path(tmp), args=args)
+
+        expected_args = main.parse_args(["in.mp4", "--denoise", "none"])
+        expected = main.audio_chain_for(expected_args, analysis=analysis, gain_plan=plan)
+        self.assertEqual(chains, [expected, expected])
+        self.assertNotEqual(expected, main.audio_chain_for(expected_args, analysis=None))
+
     def test_audio_chain_omits_a_negligible_gain_bias(self):
         chain = main.audio_chain_for(
             self.audio_args(),
