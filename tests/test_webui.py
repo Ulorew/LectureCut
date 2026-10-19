@@ -285,6 +285,70 @@ class WebUITests(unittest.TestCase):
         self.assertIn("sh", response.json()["detail"])
         self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
 
+    def post_job(self, settings):
+        return self.client.post(
+            "/api/jobs",
+            json={"source": str(self.root / "lecture.mp4"), "settings": settings},
+        )
+
+    def test_settings_that_pick_where_the_pipeline_writes_are_refused(self):
+        for settings in (
+            {"workdir": str(self.outside / "wd"), "dry_run": True},
+            {"keep_workdir": True},
+            {"preview_dir": str(self.outside / "pv")},
+            {"download_models": "all"},
+        ):
+            with self.subTest(settings=settings):
+                response = self.post_job(settings)
+
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("web UI", response.json()["detail"])
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+        self.assertEqual(sorted(p.name for p in self.outside.iterdir()), ["secret.mp4"])
+
+    def test_the_form_does_not_offer_refused_settings(self):
+        groups = self.client.get("/api/schema").json()["groups"]
+        dests = {field["dest"] for group in groups for field in group["fields"]}
+
+        self.assertFalse(dests & webui.WEB_REFUSED_SETTINGS)
+        self.assertIn("dry_run", dests)
+
+    def test_a_model_outside_the_cache_and_roots_is_refused_unseen(self):
+        (self.outside / "real.rnnn").write_bytes(b"model")
+        settings = {"denoise": "arnndn"}
+        there = self.post_job({**settings, "arnndn_model": str(self.outside / "real.rnnn")})
+        missing = self.post_job({**settings, "arnndn_model": str(self.outside / "no.rnnn")})
+        not_a_model = self.post_job({**settings, "arnndn_model": "/etc/passwd"})
+
+        # Same answer whether the file exists, so it cannot be used as a probe.
+        self.assertEqual(there.status_code, 400)
+        self.assertEqual(there.json(), missing.json())
+        self.assertEqual(not_a_model.status_code, 400)
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+
+    def test_models_the_page_offers_are_accepted(self):
+        cache = webui.core.model_cache_dir()
+        cache.mkdir(parents=True)
+        (cache / "cached.rnnn").write_bytes(b"model")
+        (self.root / "local.rnnn").write_bytes(b"model")
+        offered = [m["path"] for m in self.client.get("/api/schema").json()["models"]]
+
+        # Accepting is what is tested; the worker never picks these up.
+        idle = unittest.mock.patch.object(self.app.state.jobs._pending, "put")
+        with idle, unittest.mock.patch.object(webui, "effective_duration", lambda *a: None):
+            for spec in [*offered, main.ARNNDN_DEFAULT_MODEL]:
+                with self.subTest(spec=spec):
+                    response = self.post_job(
+                        {"denoise": "arnndn", "arnndn_model": spec, "dry_run": True}
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(offered), 2)
+
+    def test_an_output_name_cannot_climb_out_of_its_folder(self):
+        response = self.post_job({"output": str(self.root / "..")})
+
+        self.assertEqual(response.status_code, 400)
+
     def test_accepting_a_job_never_downloads_a_model(self):
         def explode(*args, **kwargs):
             raise AssertionError("a request handler must not fetch a model")

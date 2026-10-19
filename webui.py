@@ -70,6 +70,12 @@ LIVE_SERVE_RE = re.compile(r"^(index\.m3u8|init\.mp4|seg_\d{5}\.m4s)$")
 # Browsers will not play HEVC; a preview of one would be a black box.
 LIVE_ENCODER_BLOCKLIST = {"hevc_nvenc"}
 EVENT_HISTORY_LIMIT = 2000
+# Settings a request may not pass at all. Each names a place the pipeline
+# writes to, and the page has no use for any of them: web sources are always
+# local files, so there is nothing to download into a workdir (and nothing a
+# kept one would be read back through), the preview sweep is a command line
+# flow, and models are fetched through /api/models.
+WEB_REFUSED_SETTINGS = {"workdir", "keep_workdir", "preview_dir", "download_models"}
 
 # Time estimates. A job passes through three buckets whose cost scales
 # differently: analysis is a fixed number of short windows, silence detection is
@@ -842,6 +848,48 @@ def list_arnndn_models(config: Config) -> list[dict[str, Any]]:
     return found
 
 
+def confine_arnndn_model(spec: str, config: Config) -> str:
+    """Accept a catalogue name, or a model file the page could have offered.
+
+    The page picks from list_arnndn_models: the download cache and the roots.
+    Anything else is refused before its existence is looked at, so the answer
+    does not tell a caller which files exist elsewhere on the machine.
+    """
+
+    if spec in core.ARNNDN_MODELS:
+        return spec
+    resolved = Path(spec).expanduser().resolve()
+    if resolved.suffix.lower() == core.ARNNDN_MODEL_SUFFIX:
+        for directory in [core.model_cache_dir().resolve(), *config.roots]:
+            try:
+                resolved.relative_to(directory)
+            except ValueError:
+                continue
+            return str(resolved)
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"arnndn model must be one of {', '.join(core.ARNNDN_MODELS)}, or a "
+            f"{core.ARNNDN_MODEL_SUFFIX} file in {core.model_cache_dir()} or the roots"
+        ),
+    )
+
+
+def web_schema() -> list[dict[str, Any]]:
+    """The parser's groups, less the settings a request may not pass."""
+
+    groups = []
+    for group in core.parser_schema():
+        fields = [
+            field
+            for field in group["fields"]
+            if field["dest"] not in WEB_REFUSED_SETTINGS
+        ]
+        if fields:
+            groups.append({**group, "fields": fields})
+    return groups
+
+
 def model_catalogue() -> list[dict[str, Any]]:
     """What can be fetched, and whether it already is."""
 
@@ -1011,7 +1059,8 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     @app.get("/api/schema")
     def schema() -> dict[str, Any]:
         return {
-            "groups": core.parser_schema(),
+            # The form is built from this, so it never offers a refused setting.
+            "groups": web_schema(),
             "roots": [str(root) for root in config.roots],
             "source_dir": str(config.current_source_dir()),
             **config.recent_payload(),
@@ -1211,9 +1260,22 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         # Where segments are written is the server's business, not the page's.
         settings.pop("live_dir", None)
         settings.pop("keep_live_dir", None)
+        refused = sorted(WEB_REFUSED_SETTINGS & set(settings))
+        if refused:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not available from the web UI: {', '.join(refused)}",
+            )
+        if settings.get("arnndn_model"):
+            settings["arnndn_model"] = confine_arnndn_model(
+                str(settings["arnndn_model"]), config
+            )
         output = settings.get("output")
         if output:
             destination = Path(str(output)).expanduser()
+            # "x/.." would name the folder above the one just checked.
+            if destination.name in {"", ".", ".."}:
+                raise HTTPException(status_code=400, detail=f"Not a file name: {output}")
             parent = resolve_within_roots(str(destination.parent), config)
             settings["output"] = str(parent / destination.name)
         elif payload.get("output_dir"):
