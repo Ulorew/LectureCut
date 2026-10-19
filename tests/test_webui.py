@@ -515,6 +515,45 @@ class SourceFolderTests(unittest.TestCase):
 
         self.assertEqual(len(found), 4)
 
+    def test_other_files_do_not_use_up_the_listing_limit(self):
+        # A course folder whose slides sort ahead of the lectures.
+        slides = self.downloads / "aaa_slides"
+        slides.mkdir()
+        for index in range(12):
+            (slides / f"{index:03}.pdf").write_bytes(b"x")
+        self.client.post("/api/source-dir", json={"path": str(self.downloads)})
+
+        with unittest.mock.patch.object(webui, "LIST_FILE_LIMIT", 5):
+            names = self.names()
+            located = self.client.get(
+                "/api/locate", params={"name": "lecture04.mp4", "size": 1}
+            ).json()
+
+        self.assertEqual(names, ["lecture03.MOV", "lecture04.mp4"])
+        self.assertTrue(located["found"])
+
+    def test_walk_limited_counts_only_matching_files_but_stays_bounded(self):
+        for index in range(10):
+            (self.project / f"note{index}.txt").write_bytes(b"x")
+        (self.project / "zz.mp4").write_bytes(b"x")
+
+        def walk(**bounds):
+            return [
+                path.name
+                for path in webui.walk_limited(
+                    self.project,
+                    max_depth=1,
+                    want_dirs=False,
+                    suffixes=webui.MEDIA_SUFFIXES,
+                    **bounds,
+                )
+            ]
+
+        self.assertEqual(walk(limit=1), ["old.mp4"])
+        self.assertEqual(walk(limit=5), ["old.mp4", "zz.mp4"])
+        # Looking at names is what costs time, so that is bounded too.
+        self.assertEqual(walk(limit=5, scan_limit=5), [])
+
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")
 class DroppedFileTests(unittest.TestCase):

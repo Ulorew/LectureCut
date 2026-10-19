@@ -55,6 +55,9 @@ PROBE_LIMIT = 400
 # A chosen folder can be a home directory; walking all of it would stall the page.
 LIST_DEPTH = 3
 LIST_FILE_LIMIT = 2000
+# Every name a listing looks at, matching or not: what keeps a walk of a huge
+# tree of non-media files fast now that only media count against the limit.
+LIST_SCAN_LIMIT = 50000
 DIR_LIST_LIMIT = 500
 RECENT_SOURCE_DIRS = 8
 # Mutating requests must carry this header. A cross-site page cannot add a custom
@@ -658,16 +661,28 @@ class Config:
 
 
 def walk_limited(
-    root: Path, *, max_depth: int, limit: int, want_dirs: bool
+    root: Path,
+    *,
+    max_depth: int,
+    limit: int,
+    want_dirs: bool,
+    suffixes: set[str] | None = None,
+    scan_limit: int = LIST_SCAN_LIMIT,
 ) -> Iterator[Path]:
     """Yield files (or directories) under root, bounded in depth and count.
 
     A chosen input folder can be as broad as a home directory. rglob would walk
     every cache and dependency tree underneath it before the page could answer.
     Hidden directories are skipped for the same reason.
+
+    With `suffixes`, only matching files are yielded and only they count against
+    `limit`: a course folder with thousands of slides and PDFs must not use up
+    the budget before the walk reaches the lectures. `scan_limit` bounds every
+    name looked at, so a huge tree of other files still answers quickly.
     """
 
     produced = 0
+    scanned = 0
     for current, dirnames, filenames in os.walk(root):
         depth = len(Path(current).relative_to(root).parts)
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
@@ -675,8 +690,11 @@ def walk_limited(
             dirnames[:] = []
         names = dirnames if want_dirs else sorted(filenames)
         for name in names:
-            if produced >= limit:
+            if produced >= limit or scanned >= scan_limit:
                 return
+            scanned += 1
+            if suffixes is not None and Path(name).suffix.lower() not in suffixes:
+                continue
             produced += 1
             yield Path(current) / name
 
@@ -794,11 +812,13 @@ def list_arnndn_models(config: Config) -> list[dict[str, Any]]:
             sorted(directory.glob(f"*{core.ARNNDN_MODEL_SUFFIX}"))
             if directory == core.model_cache_dir()
             else sorted(
-                path
-                for path in walk_limited(
-                    directory, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+                walk_limited(
+                    directory,
+                    max_depth=LIST_DEPTH,
+                    limit=LIST_FILE_LIMIT,
+                    want_dirs=False,
+                    suffixes={core.ARNNDN_MODEL_SUFFIX},
                 )
-                if path.suffix == core.ARNNDN_MODEL_SUFFIX
             )
         )
         for path in paths:
@@ -891,10 +911,12 @@ def list_media(config: Config, index: ProcessedIndex | None = None) -> list[dict
     root = config.current_source_dir()
     if root.exists():
         for path in walk_limited(
-            root, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+            root,
+            max_depth=LIST_DEPTH,
+            limit=LIST_FILE_LIMIT,
+            want_dirs=False,
+            suffixes=MEDIA_SUFFIXES,
         ):
-            if path.suffix.lower() not in MEDIA_SUFFIXES:
-                continue
             try:
                 stat = path.stat()
             except OSError:
@@ -1025,8 +1047,14 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         for root in [config.current_source_dir(), *config.roots]:
             if not root.is_dir():
                 continue
+            # Only media, like the listing: a dropped lecture must be found
+            # however many other files share its folder.
             for path in walk_limited(
-                root, max_depth=LIST_DEPTH, limit=LIST_FILE_LIMIT, want_dirs=False
+                root,
+                max_depth=LIST_DEPTH,
+                limit=LIST_FILE_LIMIT,
+                want_dirs=False,
+                suffixes=MEDIA_SUFFIXES,
             ):
                 try:
                     if path.name == wanted and path.stat().st_size == size:
