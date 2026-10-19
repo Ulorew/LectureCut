@@ -1773,12 +1773,11 @@ def analyze_audio(
         f"Analyzing audio: {len(starts)} window(s) of {window:.0f}s...",
     )
     start_phase(PHASE_MEASURE)
-    windows: list[WindowStats] = []
-    for index, start in enumerate(starts):
-        windows.append(
-            measure_window(input_path, start=args.start + start, duration=window)
-        )
-        report_progress((index + 1) / len(starts))
+    windows = map_probes(
+        lambda start: measure_window(input_path, start=args.start + start, duration=window),
+        starts,
+        progress=True,
+    )
 
     loudness = [item.lufs for item in windows if item.lufs is not None]
     floors = [item.noise_floor_db for item in windows if item.noise_floor_db is not None]
@@ -2341,17 +2340,16 @@ def measure_processed_loudness(
         args, analysis=analysis, gain_plan=gain_plan, include_speed=False
     )
     window = min(args.analysis_window, GAIN_CALIBRATION_WINDOW)
-    measured: list[float] = []
-    for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]:
-        log = run_audio_probe(
-            input_path,
-            start=args.start + start,
-            duration=window,
-            audio_filter=",".join([*chain, "ebur128=peak=true"]),
-        )
-        value = first_match(EBUR128_I_RE, log)
-        if value is not None:
-            measured.append(value)
+    audio_filter = ",".join([*chain, "ebur128=peak=true"])
+    logs = map_probes(
+        lambda start: run_audio_probe(
+            input_path, start=args.start + start, duration=window, audio_filter=audio_filter
+        ),
+        analysis.starts[:GAIN_CALIBRATION_WINDOWS],
+    )
+    measured = [
+        value for value in (first_match(EBUR128_I_RE, log) for log in logs) if value is not None
+    ]
     return combine_loudness(measured) if measured else None
 
 
@@ -2462,18 +2460,26 @@ def measure_denoise_effect(
     treated: list[float] = []
     plain_tilt: list[float] = []
     treated_tilt: list[float] = []
-    for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]:
+    jobs = [
+        (start, chain, loud_sink, tilt_sink)
+        for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]
         for chain, loud_sink, tilt_sink in (
             (prefix, plain, plain_tilt),
             (prefix + denoise, treated, treated_tilt),
-        ):
-            loudness, tilt = run_spectral_probe(
-                input_path, start=args.start + start, duration=window, chain=chain
-            )
-            if loudness is not None:
-                loud_sink.append(loudness)
-            if tilt is not None:
-                tilt_sink.append(tilt)
+        )
+    ]
+    readings = map_probes(
+        lambda job: run_spectral_probe(
+            input_path, start=args.start + job[0], duration=window, chain=job[1]
+        ),
+        jobs,
+    )
+    # Sinks are filled here, on the caller's thread, in the original order.
+    for (_, _, loud_sink, tilt_sink), (loudness, tilt) in zip(jobs, readings):
+        if loudness is not None:
+            loud_sink.append(loudness)
+        if tilt is not None:
+            tilt_sink.append(tilt)
     if not plain or not treated:
         return None
     return DenoiseCheck(
