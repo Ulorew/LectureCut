@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import json
 import math
@@ -22,7 +23,7 @@ from statistics import median
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, TypeVar
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -1182,8 +1183,18 @@ def run_command(
     for reader in readers:
         reader.start()
 
+    # Wait on the process, not on the cancel event: sleeping a whole poll
+    # interval after each check made every short probe last at least 0.2 s. A
+    # 20 s silencedetect window takes 58 ms by itself but cost 201 ms here, and
+    # threshold calibration runs dozens of them - 11 s of a 17.7 s analysis on
+    # a 10-minute lecture. Cancellation is still noticed within one interval.
     cancelled = False
-    while process.poll() is None:
+    while True:
+        try:
+            process.wait(timeout=CANCEL_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            pass
         if cancel.is_set():
             cancelled = True
             process.terminate()
@@ -1192,7 +1203,6 @@ def run_command(
             except subprocess.TimeoutExpired:
                 process.kill()
             break
-        cancel.wait(CANCEL_POLL_SECONDS)
 
     process.wait()
     for reader in readers:
@@ -1628,6 +1638,58 @@ def parse_astats_blocks(log: str) -> tuple[list[dict[str, float | None]], dict[s
     return channels, overall
 
 
+# Probe windows are independent short ffmpeg runs, so a few go at once: on a
+# 10-minute synthetic, threshold calibration fell from 4.0 s to 1.4 s with 4.
+# Kept small because the machine is often rendering another lecture meanwhile.
+PROBE_WORKERS = 4
+
+_Item = TypeVar("_Item")
+_Result = TypeVar("_Result")
+
+
+def map_probes(
+    probe: Callable[[_Item], _Result],
+    items: Iterable[_Item],
+    *,
+    progress: bool = False,
+) -> list[_Result]:
+    """Run probe over items on a few threads, results in input order.
+
+    A ThreadPoolExecutor worker starts with an empty context, where the cancel
+    event and reporter set for this job are invisible: cancel_event() would make
+    a fresh Event nobody sets, and reports would miss the web job's log. So each
+    task runs in its OWN copy of the caller's context - never one shared copy,
+    which a second thread cannot enter (the bug that once killed a pipe drain).
+    """
+
+    items = list(items)
+    # Materialise the defaults here, so the copies share the caller's objects
+    # rather than each creating its own.
+    cancel_event()
+    reporter()
+    progress_tracker()
+    if len(items) <= 1:
+        results = [probe(item) for item in items]
+        if progress and items:
+            report_progress(1.0)
+        return results
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(PROBE_WORKERS, len(items))
+    ) as pool:
+        futures = [pool.submit(copy_context().run, probe, item) for item in items]
+        try:
+            results = []
+            for index, future in enumerate(futures):
+                results.append(future.result())
+                if progress:
+                    report_progress((index + 1) / len(items))
+            return results
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+
+
 def run_audio_probe(
     path: Path,
     *,
@@ -1824,15 +1886,16 @@ def measure_silence_fraction(
 ) -> float:
     total = 0.0
     silent = 0.0
-    for start in starts:
-        log = run_audio_probe(
-            input_path,
-            start=offset + start,
-            duration=window,
-            audio_filter=(
-                f"silencedetect=noise={threshold_db:.1f}dB:d={format_seconds(min_silence)}"
-            ),
-        )
+    audio_filter = (
+        f"silencedetect=noise={threshold_db:.1f}dB:d={format_seconds(min_silence)}"
+    )
+    logs = map_probes(
+        lambda start: run_audio_probe(
+            input_path, start=offset + start, duration=window, audio_filter=audio_filter
+        ),
+        starts,
+    )
+    for log in logs:
         silences = parse_silencedetect_log(log, window)
         silent += sum(silence.duration for silence in silences)
         total += window

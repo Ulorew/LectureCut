@@ -1647,6 +1647,64 @@ class ReporterAndCancelTests(unittest.TestCase):
         self.assertEqual(len(kept), main.STDERR_TAIL_LINES)
         self.assertEqual(kept[-1], "line 4999")
 
+    def test_a_short_child_is_not_held_for_a_whole_poll_interval(self):
+        token = main.ACTIVE_CANCEL.set(threading.Event())
+        try:
+            start = time.monotonic()
+            for _ in range(5):
+                main.run_command(["true"], capture=True)
+            elapsed = time.monotonic() - start
+        finally:
+            main.ACTIVE_CANCEL.reset(token)
+
+        # Sleeping CANCEL_POLL_SECONDS per check made this at least 1 s.
+        self.assertLess(elapsed, 5 * main.CANCEL_POLL_SECONDS * 0.75)
+
+    def test_parallel_probes_see_the_jobs_reporter_and_cancel_event(self):
+        lines = []
+        cancel = threading.Event()
+        reporter = main.Reporter(
+            on_line=lambda text, error: lines.append(text), on_event=lambda kind, fields: None
+        )
+
+        def probe(item):
+            main.report(f"probe {item}")
+            return main.cancel_event() is cancel
+
+        def job():
+            main.ACTIVE_REPORTER.set(reporter)
+            main.ACTIVE_CANCEL.set(cancel)
+            return main.map_probes(probe, range(8))
+
+        import contextvars
+
+        results = contextvars.Context().run(job)
+
+        self.assertEqual(results, [True] * 8)
+        self.assertEqual(sorted(lines), sorted(f"probe {i}" for i in range(8)))
+
+    def test_parallel_probes_keep_input_order(self):
+        def probe(item):
+            time.sleep(0.01 * (8 - item))
+            return item
+
+        self.assertEqual(main.map_probes(probe, range(8)), list(range(8)))
+
+    def test_cancel_stops_parallel_probes(self):
+        cancel = threading.Event()
+
+        def job():
+            main.ACTIVE_CANCEL.set(cancel)
+            threading.Timer(0.3, cancel.set).start()
+            return main.map_probes(lambda _: main.run_command(["sleep", "30"]), range(6))
+
+        import contextvars
+
+        start = time.monotonic()
+        with self.assertRaises(main.PipelineCancelled):
+            contextvars.Context().run(job)
+        self.assertLess(time.monotonic() - start, 10.0)
+
 
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:
     """A video stream as ffprobe reports one carrying a display matrix."""
