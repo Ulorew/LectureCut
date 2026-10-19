@@ -1131,6 +1131,40 @@ class ParserSchemaTests(unittest.TestCase):
                 main.parse_args(argv)
 
 
+class NumericOptionTests(unittest.TestCase):
+    def assert_rejected(self, *argv: str) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main.parse_args(["input.mp4", *argv])
+
+    def test_no_float_option_takes_inf_or_nan(self):
+        float_options = [
+            action.option_strings[-1]
+            for action in main.build_parser()._actions
+            if main.field_kind(action) == "number"
+        ]
+        self.assertIn("--speed", float_options)
+        self.assertIn("--target-lufs", float_options)
+        for option in float_options:
+            for value in ("inf", "-inf", "nan", "Infinity"):
+                with self.subTest(option=option, value=value):
+                    self.assert_rejected(f"{option}={value}")
+
+    def test_quality_values_stay_on_the_encoder_scale(self):
+        args = main.parse_args(["input.mp4", "--cq=0", "--crf=51"])
+        self.assertEqual((args.cq, args.crf), (0, 51))
+        for argv in ("--cq=52", "--cq=-1", "--crf=60", "--crf=-5"):
+            with self.subTest(argv=argv):
+                self.assert_rejected(argv)
+
+    def test_atempo_filters_refuses_a_speed_it_cannot_reach(self):
+        for speed in (float("inf"), float("nan"), 0.0, -1.0):
+            with self.subTest(speed=speed):
+                with self.assertRaises(main.PipelineError):
+                    main.atempo_filters(speed)
+        self.assertEqual(main.atempo_filters(5.0), ["atempo=2.000000"] * 2 + ["atempo=1.250000"])
+
+
 class SilenceThresholdTests(unittest.TestCase):
     def parse_rejected(self, *argv: str) -> str:
         stderr = io.StringIO()

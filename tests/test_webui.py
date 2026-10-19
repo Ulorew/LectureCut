@@ -144,6 +144,20 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_job_creation_rejects_an_infinite_speed(self):
+        # Once queued, inf sent atempo_filters into a loop that cancel cannot stop.
+        for speed in ("inf", "nan"):
+            with self.subTest(speed=speed):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    response = self.client.post(
+                        "/api/jobs",
+                        json={
+                            "source": str(self.root / "lecture.mp4"),
+                            "settings": {"speed": speed},
+                        },
+                    )
+                self.assertEqual(response.status_code, 400)
+
     def test_job_creation_rejects_a_threshold_that_carries_filters(self):
         # The threshold lands in an -af filtergraph; a comma would append a filter
         # that writes wherever it is told, outside the roots included.

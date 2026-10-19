@@ -551,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     silence_group.add_argument(
         "--silence-bias",
-        type=float,
+        type=finite_float,
         default=0.0,
         help=(
             "Nudge the auto threshold in dB: positive cuts more pauses, negative "
@@ -624,13 +624,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audio_group.add_argument(
         "--target-lufs",
-        type=float,
+        type=finite_float,
         default=-17.0,
         help="Integrated loudness target used for automatic gain calibration",
     )
     audio_group.add_argument(
         "--true-peak",
-        type=float,
+        type=finite_float,
         default=-1.0,
         help="Output true peak ceiling in dBFS, enforced by alimiter",
     )
@@ -642,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audio_group.add_argument(
         "--denoise-loss-limit",
-        type=float,
+        type=finite_float,
         default=DENOISE_LOSS_LIMIT_DB,
         help=(
             "Fall back to a predictable denoiser if the chosen one quietens speech "
@@ -666,24 +666,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audio_group.add_argument(
         "--gain-bias",
-        type=float,
+        type=finite_float,
         help="Static trim in dB after the loudness stage; default is calibrated",
     )
     audio_group.add_argument(
         "--loudnorm-i",
-        type=float,
+        type=finite_float,
         default=-16.0,
         help="Integrated loudness target for loudnorm",
     )
     audio_group.add_argument(
         "--loudnorm-tp",
-        type=float,
+        type=finite_float,
         default=-1.5,
         help="True peak target for loudnorm",
     )
     audio_group.add_argument(
         "--loudnorm-lra",
-        type=float,
+        type=finite_float,
         default=11.0,
         help="Loudness range target for loudnorm",
     )
@@ -726,19 +726,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     video_group.add_argument(
         "--cq",
-        type=int,
+        type=quality_value,
         default=28,
         help="NVENC constant quality value; higher means a smaller file",
     )
     video_group.add_argument(
         "--crf",
-        type=int,
+        type=quality_value,
         default=23,
         help="libx264 CRF value",
     )
     video_group.add_argument(
         "--max-fps",
-        type=float,
+        type=non_negative_float,
         default=0.0,
         help=(
             "Cap the output frame rate, e.g. 30; 0 keeps the source rate. A slower "
@@ -857,9 +857,11 @@ def field_kind(action: argparse.Action) -> str:
         return "flag"
     if action.choices:
         return "choice"
-    if action.type in (positive_int, int):
+    if action.type in (positive_int, quality_value, int):
         return "integer"
-    if action.type in (positive_float, non_negative_float, unit_interval, float):
+    if action.type in (
+        positive_float, non_negative_float, unit_interval, finite_float, float
+    ):
         return "number"
     if action.type is Path:
         return "path"
@@ -928,8 +930,18 @@ def settings_to_argv(source: str, settings: dict[str, object]) -> list[str]:
     return argv
 
 
-def positive_float(value: str) -> float:
+def finite_float(value: str) -> float:
+    # float() also parses "inf" and "nan", and neither is a setting: nan passes
+    # every `<` and `<=` check below, and --speed inf sent atempo_filters halving
+    # forever, growing a list by gigabytes while SIGTERM only set an Event.
     parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = finite_float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
@@ -943,16 +955,30 @@ def positive_int(value: str) -> int:
 
 
 def unit_interval(value: str) -> float:
-    parsed = float(value)
+    parsed = finite_float(value)
     if not 0.0 <= parsed <= 1.0:
         raise argparse.ArgumentTypeError("must be between 0 and 1")
     return parsed
 
 
 def non_negative_float(value: str) -> float:
-    parsed = float(value)
+    parsed = finite_float(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+# NVENC's -cq and libx264's -crf (8-bit) share the 0..51 scale. Outside it the
+# encoder decides, and late: cq 60 and crf -5 fail only when the encoder opens,
+# after the analysis minutes, while crf 60 is taken without a word.
+QUALITY_LIMITS = (0, 51)
+
+
+def quality_value(value: str) -> int:
+    parsed = int(value)
+    low, high = QUALITY_LIMITS
+    if not low <= parsed <= high:
+        raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
     return parsed
 
 
@@ -1432,6 +1458,10 @@ def merge_segments(segments: Iterable[Segment], *, max_gap: float) -> list[Segme
 
 
 def atempo_filters(speed: float) -> list[str]:
+    # The loops below halve or double toward 1, which inf never reaches and nan
+    # skips entirely; argparse refuses both, this keeps any other caller honest.
+    if not (math.isfinite(speed) and speed > 0):
+        raise PipelineError(f"Speed must be a finite number above 0, got {speed}")
     remaining = speed
     filters: list[str] = []
     while remaining > 2.0:
