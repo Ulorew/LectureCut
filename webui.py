@@ -48,6 +48,8 @@ MEDIA_SUFFIXES = {
     ".aac",
     ".flac",
 }
+# Where removable and extra drives are mounted, so lectures on them can be chosen.
+SOURCE_DIR_MOUNT_BASES = ("/media", "/mnt", "/run/media", "/Volumes")
 UPLOAD_CHUNK = 1024 * 1024
 PROBE_WORKERS = 8
 # A listing should stay responsive even when pointed at a large archive.
@@ -402,6 +404,17 @@ class JobManager:
                 for job_id in reversed(self._order)
             ]
 
+    def outputs(self) -> set[Path]:
+        """Every file a job here has written."""
+
+        with self._lock:
+            results = [job.result for job in self._jobs.values()]
+        return {
+            Path(str(result["output"])).resolve()
+            for result in results
+            if result and result.get("output")
+        }
+
     def queue_remaining(self) -> dict[str, Any]:
         """Time until the whole queue is through, and whether that is complete."""
 
@@ -590,6 +603,11 @@ class Config:
     allowed_hosts: set[str] | None = None
     require_csrf_header: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # The roots given at startup, before the page added any folders of its own.
+    base_roots: list[Path] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.base_roots = list(self.roots)
 
     def current_source_dir(self) -> Path:
         if self.source_dir is not None and self.source_dir.is_dir():
@@ -644,13 +662,18 @@ class Config:
             return
         if not self.allow_browse:
             return
+        # The same rule as choosing one, so a folder saved before it existed
+        # does not come back through the file.
         recent = [Path(p) for p in payload.get("recent_source_dirs") or []]
-        self.recent_source_dirs = recent[:RECENT_SOURCE_DIRS]
+        # Missing folders stay (a drive that is not mounted yet), forbidden ones go.
+        self.recent_source_dirs = [
+            d for d in recent if source_dir_allowed(d, self)
+        ][:RECENT_SOURCE_DIRS]
         for folder in self.recent_source_dirs:
             if folder.is_dir() and folder not in self.roots:
                 self.roots.append(folder)
         chosen = payload.get("source_dir")
-        if chosen:
+        if chosen and source_dir_allowed(Path(chosen), self):
             self.source_dir = Path(chosen)
             if self.source_dir.is_dir() and self.source_dir not in self.roots:
                 self.roots.append(self.source_dir)
@@ -664,6 +687,42 @@ class Config:
                 str(d) for d in self.recent_source_dirs if not d.is_dir()
             ],
         }
+
+
+def source_dir_bases(config: Config) -> list[Path]:
+    """Where an input folder may be chosen: wherever lectures plausibly live."""
+
+    bases = [Path.home(), Path(tempfile.gettempdir()), *config.base_roots]
+    if os.name == "nt":
+        # No common mount point; any drive, though not a drive itself.
+        bases += [Path(f"{letter}:\\") for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+    else:
+        bases += [Path(p) for p in SOURCE_DIR_MOUNT_BASES]
+    return [base.resolve() for base in bases]
+
+
+def source_dir_allowed(folder: Path, config: Config) -> bool:
+    """Whether the page may make this folder readable.
+
+    Choosing a folder adds it to the roots, so "/" or ~/.ssh would hand the
+    page everything under it. Lectures live in a home directory, on a mounted
+    drive or in the folders the server was started with; system trees and
+    hidden folders are none of those, and the picker never shows them anyway.
+    """
+
+    folder = folder.resolve()
+    if folder.parent == folder:
+        return False  # a filesystem root
+    for base in source_dir_bases(config):
+        if base.parent == base and os.name != "nt":
+            continue  # a home of "/" must not admit everything
+        try:
+            inside = folder.relative_to(base)
+        except ValueError:
+            continue
+        if not any(part.startswith(".") for part in inside.parts):
+            return True
+    return False
 
 
 def walk_limited(
@@ -1056,6 +1115,20 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     app.state.jobs = manager
     app.state.processed = processed
 
+    def require_media(path: Path) -> Path:
+        """Media, or a file a job here wrote - never anything else under a root.
+
+        A root is a whole folder, often a home directory or one the page chose;
+        the page only ever plays, opens or downloads lectures and results, so
+        nothing else in it needs to leave this server.
+        """
+
+        if path.suffix.lower() in MEDIA_SUFFIXES or path in manager.outputs():
+            return path
+        raise HTTPException(
+            status_code=403, detail=f"Only media files and results are served: {path.name}"
+        )
+
     @app.get("/api/schema")
     def schema() -> dict[str, Any]:
         return {
@@ -1135,6 +1208,14 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
             ) from None
         if not folder.is_dir():
             raise HTTPException(status_code=400, detail=f"Not a folder: {folder}")
+        if not source_dir_allowed(folder, config):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Not offered as an input folder: {folder}. Choose one in your "
+                    "home folder or on a mounted drive"
+                ),
+            )
         config.choose_source_dir(folder)
         return {
             "source_dir": str(folder),
@@ -1227,6 +1308,10 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         if not config.allow_open:
             raise HTTPException(status_code=403, detail="Opening files is disabled")
         target = resolve_within_roots(str(payload.get("path") or ""), config)
+        # A folder, or a result to play: for anything else under a root the
+        # desktop's handler may start a program (a .desktop file, say).
+        if not target.is_dir():
+            require_media(target)
         if payload.get("reveal"):
             target = target.parent
         try:
@@ -1243,6 +1328,9 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
     @app.get("/api/file")
     def download(path: str = Query(...)) -> FileResponse:
         resolved = resolve_within_roots(path, config)
+        if not resolved.is_file():
+            raise HTTPException(status_code=404, detail=f"Not a file: {path}")
+        require_media(resolved)
         return FileResponse(str(resolved), filename=resolved.name)
 
     @app.get("/api/jobs")

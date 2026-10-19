@@ -579,6 +579,49 @@ class SourceFolderTests(unittest.TestCase):
 
         self.assertEqual(len(found), 4)
 
+    def test_unsuitable_folders_cannot_be_made_readable(self):
+        roots = list(self.config.roots)
+        for folder in ("/", "/etc", str(self.downloads / ".cache")):
+            with self.subTest(folder=folder):
+                response = self.client.post("/api/source-dir", json={"path": folder})
+
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.config.roots, roots)
+        self.assertEqual(
+            self.client.get("/api/file", params={"path": "/etc/hostname"}).status_code, 403
+        )
+
+    def test_lecture_folders_can_be_chosen_wherever_they_plausibly_live(self):
+        allowed = lambda path: webui.source_dir_allowed(Path(path), self.config)
+
+        self.assertTrue(allowed(Path.home()))
+        self.assertTrue(allowed(Path.home() / "Lectures" / "week1"))
+        self.assertTrue(allowed("/mnt/drive/Lectures"))
+        self.assertTrue(allowed("/media/someone/USB"))
+        self.assertTrue(allowed(self.project / "sub"))
+        self.assertFalse(allowed("/"))
+        self.assertFalse(allowed("/usr/share"))
+        self.assertFalse(allowed(Path.home() / ".ssh"))
+
+    def test_a_saved_unsuitable_folder_is_not_restored(self):
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text(
+            json.dumps(
+                {"source_dir": "/", "recent_source_dirs": ["/", "/etc", str(self.downloads)]}
+            )
+        )
+        reborn = webui.Config(
+            roots=[self.project.resolve()],
+            upload_dir=self.config.upload_dir,
+            state_path=self.state,
+        )
+        reborn.load_state()
+
+        self.assertEqual(reborn.recent_source_dirs, [self.downloads])
+        self.assertNotIn(Path("/"), reborn.roots)
+        self.assertNotIn(Path("/etc"), reborn.roots)
+        self.assertEqual(reborn.current_source_dir(), self.project.resolve())
+
     def test_other_files_do_not_use_up_the_listing_limit(self):
         # A course folder whose slides sort ahead of the lectures.
         slides = self.downloads / "aaa_slides"
@@ -784,7 +827,8 @@ class OutputAndOpenTests(unittest.TestCase):
             roots=[self.root.resolve()],
             upload_dir=(Path(self.temp.name) / "uploads").resolve(),
         )
-        self.client = TestClient(webui.create_app(self.config))
+        self.app = webui.create_app(self.config)
+        self.client = TestClient(self.app)
         self.opened = []
 
     def tearDown(self):
@@ -856,6 +900,36 @@ class OutputAndOpenTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"rendered")
+
+    def test_download_serves_only_media_and_results(self):
+        (self.root / "done" / "notes.txt").write_text("private")
+        (self.root / "done" / "result.bin").write_bytes(b"made here")
+        get = lambda name: self.client.get(
+            "/api/file", params={"path": str(self.root / "done" / name)}
+        )
+
+        self.assertEqual(get("notes.txt").status_code, 403)
+        self.assertEqual(get("result.bin").status_code, 403)
+        self.assertEqual(
+            self.client.get("/api/file", params={"path": str(self.root / "done")}).status_code,
+            404,
+        )
+        # Whatever a job wrote is the page's to fetch, whatever it is called.
+        made = {(self.root / "done" / "result.bin").resolve()}
+        with unittest.mock.patch.object(self.app.state.jobs, "outputs", return_value=made):
+            self.assertEqual(get("result.bin").content, b"made here")
+
+    def test_open_takes_folders_and_media_but_nothing_else(self):
+        (self.root / "done" / "launcher.desktop").write_text("[Desktop Entry]")
+        with unittest.mock.patch.object(webui.subprocess, "Popen", self.fake_popen):
+            other = self.client.post(
+                "/api/open", json={"path": str(self.root / "done" / "launcher.desktop")}
+            )
+            folder = self.client.post("/api/open", json={"path": str(self.root / "done")})
+
+        self.assertEqual(other.status_code, 403)
+        self.assertEqual(folder.status_code, 200)
+        self.assertEqual(self.opened, [webui.desktop_open_command((self.root / "done").resolve())])
 
     def test_download_refuses_paths_outside_the_roots(self):
         response = self.client.get(
