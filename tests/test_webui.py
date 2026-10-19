@@ -118,6 +118,30 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_an_unreadable_file_is_a_400_with_ffprobes_reason(self):
+        """A failing ffprobe used to escape as CalledProcessError: a bare 500."""
+
+        failure = main.CommandFailed(
+            ["ffprobe", "lecture.mp4"], 1, "lecture.mp4: Invalid data found when processing input\n"
+        )
+        with unittest.mock.patch.object(webui.core, "probe_media", side_effect=failure):
+            response = self.client.get(
+                "/api/probe", params={"path": str(self.root / "lecture.mp4")}
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid data found", response.json()["detail"])
+
+    @unittest.skipUnless(shutil.which("ffprobe"), "needs ffprobe")
+    def test_probing_a_file_that_is_not_media_is_a_400(self):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            response = self.client.get(
+                "/api/probe", params={"path": str(self.root / "lecture.mp4")}
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("ffprobe failed", response.json()["detail"])
+
     def test_job_creation_rejects_a_source_outside_the_roots(self):
         response = self.client.post(
             "/api/jobs",
@@ -1180,6 +1204,20 @@ class JobLifecycleTests(unittest.TestCase):
         self.assertTrue(
             any(event["type"] == "line" and event["error"] for event in job.events)
         )
+
+    @unittest.skipUnless(shutil.which("ffprobe"), "needs ffprobe")
+    def test_a_failing_ffprobe_tells_the_job_why(self):
+        """The job used to show only "CalledProcessError: ... exit status 1"."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "broken.mp4"
+            source.write_bytes(b"not really video")
+            job = self.manager.submit(kind="convert", source=str(source), settings={})
+            self.wait_for(job, {webui.STATUS_ERROR})
+
+        self.assertIn("ffprobe failed", job.error)
+        self.assertIn("Invalid data found", job.error)
+        self.assertNotIn("CalledProcessError", job.error)
 
     def test_cancelling_before_the_worker_starts_skips_the_work(self):
         job = webui.Job(id="x", kind="convert", source="/missing.mp4", settings={})

@@ -941,7 +941,7 @@ def effective_duration(source: Path, settings: dict[str, Any]) -> float | None:
         media = core.probe_media(
             source, start=start, limit=float(limit) if limit not in (None, "") else None
         )
-    except (core.PipelineError, subprocess.CalledProcessError, ValueError, OSError):
+    except (core.PipelineError, ValueError, OSError):
         # An unreadable file still gets queued; the pipeline reports what is wrong.
         return None
     return media.duration if media.duration > 0 else None

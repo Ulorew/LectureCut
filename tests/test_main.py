@@ -1058,6 +1058,51 @@ class LivePreviewTests(unittest.TestCase):
         # A player must reload: the second encoder writes a new playlist.
         self.assertEqual(attempts, [1, 2])
 
+    def test_when_every_encoder_fails_the_error_says_why(self):
+        """A web job used to get only "returned non-zero exit status 234"."""
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        args = main.parse_args(["in.MOV", "--encoder", "auto"])
+        reasons = iter(
+            [
+                "[h264_nvenc] OpenEncodeSessionEx failed: unsupported device\n",
+                "x264 [error]: invalid preset 'bogus'\nConversion failed!\n",
+            ]
+        )
+        lines = []
+
+        def fake_run(command, capture=False, check=True, progress_total=None):
+            return subprocess.CompletedProcess(command, 234, "", next(reasons))
+
+        reporter = main.Reporter(
+            on_line=lambda text, error: lines.append(text), on_event=lambda *a: None
+        )
+        token = main.ACTIVE_REPORTER.set(reporter)
+        try:
+            with unittest.mock.patch.object(main, "run_command", fake_run), \
+                    unittest.mock.patch.object(
+                        main, "encoder_candidates", lambda args: ["h264_nvenc", "libx264"]
+                    ):
+                with self.assertRaises(main.PipelineError) as caught:
+                    main.render_with_fallback(
+                        input_path=Path("in.MOV"),
+                        output_path=base / "out.mp4",
+                        filtergraph_path=base / "graph",
+                        args=args,
+                    )
+        finally:
+            main.ACTIVE_REPORTER.reset(token)
+
+        message = str(caught.exception)
+        self.assertIn("h264_nvenc, libx264", message)
+        self.assertIn("exit code 234", message)
+        self.assertIn("invalid preset 'bogus'", message)
+        self.assertNotIn("Conversion failed!", message)
+        # The fallback itself is still announced, not raised.
+        self.assertTrue(any("falling back to libx264" in line for line in lines))
+
     def test_live_options_are_grouped_for_the_page_to_skip(self):
         titles = [group["title"] for group in main.parser_schema()]
 
@@ -1489,10 +1534,65 @@ class ReporterAndCancelTests(unittest.TestCase):
         cancel = threading.Event()
         token = main.ACTIVE_CANCEL.set(cancel)
         try:
-            with self.assertRaises(subprocess.CalledProcessError):
+            with self.assertRaises(main.PipelineError):
                 main.run_command(["false"], capture=True)
         finally:
             main.ACTIVE_CANCEL.reset(token)
+
+    def test_a_failed_command_says_why(self):
+        """A bare CalledProcessError was a traceback in the CLI and a 500 in /api/probe."""
+
+        failing = (
+            "import sys\n"
+            "sys.stderr.write('banner\\n' * 50)\n"
+            "sys.stderr.write('bad.mp4: Invalid data found when processing input\\n')\n"
+            "sys.exit(3)\n"
+        )
+        token = main.ACTIVE_CANCEL.set(threading.Event())
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(main.CommandFailed) as caught:
+                    main.run_command([sys.executable, "-c", failing], capture=True)
+        finally:
+            main.ACTIVE_CANCEL.reset(token)
+
+        self.assertIsInstance(caught.exception, main.PipelineError)
+        self.assertEqual(caught.exception.returncode, 3)
+        message = str(caught.exception)
+        self.assertIn("exit code 3", message)
+        self.assertIn("Invalid data found when processing input", message)
+        # Only the tail is quoted, not the whole banner.
+        self.assertLessEqual(message.count("banner"), main.ERROR_TAIL_LINES)
+
+    def test_ffmpeg_closing_summary_is_not_quoted_as_the_reason(self):
+        stderr = (
+            "x264 [error]: invalid preset 'bogus'\n"
+            "frame=    0 fps=0.0 q=0.0 Lsize=       0kB time=N/A\n"
+            "Conversion failed!\n"
+        )
+
+        self.assertEqual(main.stderr_tail(stderr), "x264 [error]: invalid preset 'bogus'")
+
+    def test_uncaptured_stderr_passes_through_but_only_its_tail_is_kept(self):
+        """A long render writes to stderr for hours; keep only what an error needs."""
+
+        chatty = (
+            "import sys\n"
+            "for i in range(5000):\n"
+            "    sys.stderr.write(f'line {i}\\n')\n"
+        )
+        console = io.StringIO()
+        token = main.ACTIVE_CANCEL.set(threading.Event())
+        try:
+            with contextlib.redirect_stderr(console):
+                result = main.run_command([sys.executable, "-c", chatty])
+        finally:
+            main.ACTIVE_CANCEL.reset(token)
+
+        self.assertEqual(console.getvalue().count("\n"), 5000)
+        kept = result.stderr.splitlines()
+        self.assertEqual(len(kept), main.STDERR_TAIL_LINES)
+        self.assertEqual(kept[-1], "line 4999")
 
 
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:

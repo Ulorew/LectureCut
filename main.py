@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from statistics import median
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
@@ -58,6 +59,14 @@ ACTIVE_CANCEL: ContextVar[threading.Event] = ContextVar("ACTIVE_CANCEL")
 RENDER_COST_RATIO = 8.5
 CANCEL_POLL_SECONDS = 0.2
 CANCEL_GRACE_SECONDS = 5.0
+# How much of an uncaptured child's stderr is kept for an error message. A long
+# render writes to stderr for its whole run, so only the end is remembered.
+STDERR_TAIL_LINES = 40
+# How many of those lines an error message quotes. A failed libx264 open ends
+# with six lines of consequences after the one that names the bad preset.
+ERROR_TAIL_LINES = 8
+# ffmpeg's closing summary: never the reason, always the last lines.
+STDERR_NOISE_RE = re.compile(r"^(frame=|size=|Conversion failed!)")
 
 
 class PipelineCancelled(Exception):
@@ -211,6 +220,35 @@ class PipelineError(Exception):
     Raised instead of SystemExit so callers other than the CLI - the web UI's
     worker, tests - can catch it and report it in their own way.
     """
+
+
+class CommandFailed(PipelineError):
+    """A child process (ffmpeg, ffprobe, yt-dlp) exited with an error.
+
+    A PipelineError rather than subprocess.CalledProcessError: the bare error
+    reached the CLI as a traceback, a web job as "Command [...] returned
+    non-zero exit status 1" with no reason, and /api/probe as a 500.
+    """
+
+    def __init__(self, command: list[str], returncode: int, stderr: str = "") -> None:
+        self.command = command
+        self.returncode = returncode
+        self.stderr = stderr
+        name = Path(command[0]).name if command else "command"
+        message = f"{name} failed (exit code {returncode})"
+        tail = stderr_tail(stderr)
+        super().__init__(f"{message}: {tail}" if tail else message)
+
+
+def stderr_tail(stderr: str, lines: int = ERROR_TAIL_LINES) -> str:
+    """The last few non-blank lines of a child's stderr - usually the reason."""
+
+    kept = [
+        line.strip()[:300]
+        for line in stderr.splitlines()
+        if line.strip() and not STDERR_NOISE_RE.match(line.strip())
+    ]
+    return "\n".join(kept[-lines:])
 
 
 SILENCE_START_RE = re.compile(r"silence_start:\s*(?P<start>[0-9.]+)")
@@ -1070,6 +1108,11 @@ def run_command(
 
     Popen rather than subprocess.run so a cancel can reach the child: a blocking
     run() would leave ffmpeg working for the rest of a long render.
+
+    Without capture, the child's stderr is still passed through to ours, but
+    only its last STDERR_TAIL_LINES are kept (in result.stderr), so a failed
+    render can say why without holding hours of ffmpeg chatter in memory.
+    A failure under check raises CommandFailed quoting that stderr.
     """
 
     cancel = cancel_event()
@@ -1091,11 +1134,13 @@ def run_command(
         # character only spoils the tag; every line we parse is ASCII.
         errors="replace",
         stdout=subprocess.PIPE if want_stdout else None,
-        stderr=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE,
     )
 
     stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
+    stderr_parts: "list[str] | deque[str]" = (
+        [] if capture else deque(maxlen=STDERR_TAIL_LINES)
+    )
 
     def drain_stdout() -> None:
         assert process.stdout is not None
@@ -1111,6 +1156,9 @@ def run_command(
         assert process.stderr is not None
         for line in process.stderr:
             stderr_parts.append(line)
+            if not capture and sys.stderr is not None:
+                sys.stderr.write(line)
+                sys.stderr.flush()
 
     # Both pipes are drained in threads: silencedetect over a long lecture emits
     # far more than a pipe buffer holds, and a full pipe would stall ffmpeg.
@@ -1127,8 +1175,7 @@ def run_command(
     readers: list[threading.Thread] = []
     if want_stdout:
         readers.append(threading.Thread(target=in_context(drain_stdout), daemon=True))
-    if capture:
-        readers.append(threading.Thread(target=in_context(drain_stderr), daemon=True))
+    readers.append(threading.Thread(target=in_context(drain_stderr), daemon=True))
     for reader in readers:
         reader.start()
 
@@ -1163,9 +1210,10 @@ def run_command(
     if check and result.returncode != 0:
         if result.stdout:
             report(result.stdout, error=True)
-        if result.stderr:
+        # Uncaptured stderr has already gone to the console as it was written.
+        if capture and result.stderr:
             report(result.stderr, error=True)
-        raise subprocess.CalledProcessError(result.returncode, command)
+        raise CommandFailed(command, result.returncode, result.stderr)
     return result
 
 
@@ -2853,7 +2901,7 @@ def render_with_fallback(
     manual_rotation: bool = False,
 ) -> tuple[str, float]:
     candidates = encoder_candidates(args)
-    last_error: subprocess.CalledProcessError | None = None
+    last_error: CommandFailed | None = None
     temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
     if temp_output.exists():
         temp_output.unlink()
@@ -2913,17 +2961,24 @@ def render_with_fallback(
                 clear_live_dir(live_dir)
             return encoder, elapsed
 
-        last_error = subprocess.CalledProcessError(result.returncode, command)
+        # run_command kept the tail of ffmpeg's stderr: without it a failed
+        # render reached a web job as nothing but an exit status.
+        last_error = CommandFailed(command, result.returncode, result.stderr)
         if temp_output.exists():
             temp_output.unlink()
         if index + 1 < len(candidates):
             report(
-                f"{encoder} failed; falling back to {candidates[index + 1]}...",
+                f"{encoder} failed (exit code {result.returncode}); "
+                f"falling back to {candidates[index + 1]}...",
                 error=True,
             )
 
     assert last_error is not None
-    raise last_error
+    tried = ", ".join(candidates)
+    raise PipelineError(
+        f"Rendering failed with every encoder tried ({tried}). "
+        f"Last error: {last_error}"
+    ) from last_error
 
 
 def format_seconds(value: float) -> str:
