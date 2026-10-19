@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextvars
+import ipaddress
 import json
 import os
 import queue
@@ -1514,7 +1515,24 @@ def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Keep the page to the given roots instead of letting it choose folders",
     )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help=(
+            "Allow a --host other than loopback. There is no login: anyone who can "
+            "reach the port can browse folders, play media and start jobs"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False  # a name that may resolve to anything, or "" for all
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -1571,6 +1589,17 @@ def serve(argv: list[str] | None = None) -> int:
     import uvicorn
 
     args = parse_server_args(argv)
+    # The server has no login, so reaching it from the network is handing this
+    # account's lecture folders and a job queue to whoever is there. That can
+    # be wanted, but should not happen through a copied command line.
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        print(
+            f"Refusing to listen on {args.host}: there is no authentication, so "
+            "anyone who can reach it may browse folders, read media and start "
+            "jobs. Pass --allow-remote if that is what you want.",
+            file=sys.stderr,
+        )
+        return 2
     if shutil.which("ffmpeg") is None:
         print("Warning: ffmpeg was not found on PATH; jobs will fail.")
     config = build_config(args)
@@ -1580,9 +1609,9 @@ def serve(argv: list[str] | None = None) -> int:
     print(f"  input folder: {config.current_source_dir()}", flush=True)
     for root in config.roots:
         print(f"  root: {root}", flush=True)
-    if config.allowed_hosts is None:
+    if not is_loopback_host(args.host):
         print(
-            "  Warning: bound to all interfaces. There is no authentication: "
+            "  Warning: reachable from the network. There is no authentication: "
             "anyone who can reach this port may browse folders, read media "
             "from them and start jobs on this machine.",
             flush=True,

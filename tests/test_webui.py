@@ -811,6 +811,34 @@ class RequestGuardTests(unittest.TestCase):
         self.assertIsNone(webui.allowed_hosts_for("0.0.0.0", 8765))
         self.assertIn("localhost:8765", webui.allowed_hosts_for("127.0.0.1", 8765))
 
+    def test_loopback_hosts_are_told_apart_from_the_rest(self):
+        for host in ("127.0.0.1", "127.0.1.1", "localhost", "::1", "[::1]"):
+            self.assertTrue(webui.is_loopback_host(host), host)
+        for host in ("0.0.0.0", "::", "", "192.168.1.5", "myhost.local"):
+            self.assertFalse(webui.is_loopback_host(host), host)
+
+    def test_a_network_bind_needs_to_be_asked_for(self):
+        def serve(*argv):
+            started = []
+            fake_uvicorn = unittest.mock.Mock(run=lambda *a, **k: started.append(a))
+            stderr = io.StringIO()
+            with unittest.mock.patch.dict("sys.modules", {"uvicorn": fake_uvicorn}), \
+                    unittest.mock.patch.object(webui, "build_config"), \
+                    unittest.mock.patch.object(webui, "create_app"), \
+                    unittest.mock.patch.object(webui, "purge_stale_previews"), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(stderr):
+                code = webui.serve(list(argv))
+            return code, started, stderr.getvalue()
+
+        code, started, message = serve("--host", "0.0.0.0")
+        self.assertEqual((code, started), (2, []))
+        self.assertIn("--allow-remote", message)
+
+        for argv in (("--host", "0.0.0.0", "--allow-remote"), ("--host", "127.0.0.1")):
+            code, started, _ = serve(*argv)
+            self.assertEqual((code, len(started)), (0, 1), argv)
+
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")
 class OutputAndOpenTests(unittest.TestCase):
