@@ -541,7 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--filtergraph-mode",
         choices=("select", "concat"),
         default="select",
-        help="select is faster for long lectures; concat is useful for debugging",
+        help=(
+            "select streams the lecture in one pass; concat is for debugging short "
+            "clips only, as it holds the frames of later segments in memory"
+        ),
     )
 
     input_group = parser.add_argument_group("input")
@@ -2708,6 +2711,19 @@ def segment_pts_expression(segments: list[Segment]) -> str:
     return segment_search_tree(segments, "T", leaf)
 
 
+# Every trim branch below reads the whole [0:v]/[0:a]; ffmpeg hands each frame
+# to all of them while concat drains one at a time, so the frames of later
+# segments queue in memory. A 3-minute 160x120 synthetic with 46 segments
+# peaked at 453 MB against 88 MB in select mode, and the queue grows with
+# length and frame size, so an HD lecture can exhaust RAM. Giving each segment
+# its own -ss/-t input is no cure: the same clip then peaked at 1.1 GB, one
+# open decoder per segment. The mode stays as a readable graph for debugging.
+CONCAT_MEMORY_WARNING = (
+    "Warning: --filtergraph-mode concat buffers frames for every later segment "
+    "and its memory grows with the input; use it on short clips only"
+)
+
+
 def build_concat_filtergraph(
     segments: list[Segment],
     args: argparse.Namespace,
@@ -3109,6 +3125,8 @@ def render_segments(
     filtergraph_path.write_text(filtergraph, encoding="utf-8")
 
     report(describe_plan(media=media, silences=silences, segments=segments, speed=args.speed))
+    if args.filtergraph_mode == "concat" and not args.dry_run:
+        report(CONCAT_MEMORY_WARNING, error=True)
     if args.dry_run:
         print_dry_run_filtergraph(filtergraph_path, filtergraph)
 

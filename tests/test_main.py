@@ -168,6 +168,25 @@ class LectureCutTests(unittest.TestCase):
         self.assertIn("[vcat]setpts=PTS/1.25000000[vout]", filtergraph)
         self.assertIn("[acat]anull[aout]", filtergraph)
 
+    def test_only_concat_mode_warns_about_memory(self):
+        media = main.MediaInfo(duration=10.0, has_audio=True, has_video=True, video_fps=30.0)
+        for mode, warned in (("concat", True), ("select", False)):
+            args = self.audio_args(filtergraph_mode=mode, audio_chain=["anull"])
+            stderr = io.StringIO()
+            with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(
+                main, "render_with_fallback", return_value=("libx264", 1.0)
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                main.render_segments(
+                    input_path=Path("in.mp4"),
+                    output_path=Path(tmp) / "out.mp4",
+                    workdir=Path(tmp),
+                    media=media,
+                    silences=[],
+                    segments=[main.Segment(0.0, 4.0), main.Segment(6.0, 10.0)],
+                    args=args,
+                )
+            self.assertEqual(main.CONCAT_MEMORY_WARNING in stderr.getvalue(), warned, mode)
+
     def test_build_select_filtergraph_uses_single_linear_pass(self):
         args = self.audio_args(
             speed=2.0,

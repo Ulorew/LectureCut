@@ -163,8 +163,13 @@ lecture; a busier frame will need more.
 The default `--filtergraph-mode select` is intended for speed on long lectures.
 It preserves sync by mapping every kept segment back onto a shared output
 timeline for audio and video. `--filtergraph-mode concat` keeps the older
-per-segment trim/concat graph for debugging, but it can be much slower when
-silence cutting creates many segments.
+per-segment trim/concat graph for debugging short clips. Every trim branch reads
+the whole input and concat drains them one at a time, so the frames of later
+segments wait in memory: a 3-minute 160x120 synthetic with 46 segments peaked at
+453 MB against 88 MB in select mode, and the queue grows with length and frame
+size, enough to exhaust RAM on an HD lecture. Splitting the input into one
+`-ss`/`-t` input per segment was worse (1.1 GB, one decoder per segment), so the
+mode stays as it is and warns when it renders.
 
 ## Recognising a finished render
 
