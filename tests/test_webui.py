@@ -144,6 +144,24 @@ class WebUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_job_creation_rejects_a_threshold_that_carries_filters(self):
+        # The threshold lands in an -af filtergraph; a comma would append a filter
+        # that writes wherever it is told, outside the roots included.
+        target = self.outside / "written.txt"
+        injected = f"-45dB,ametadata=mode=print:file={target},silencedetect=n=-45dB"
+        with contextlib.redirect_stderr(io.StringIO()):
+            response = self.client.post(
+                "/api/jobs",
+                json={
+                    "source": str(self.root / "lecture.mp4"),
+                    "settings": {"silence_threshold": injected},
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"], [])
+        self.assertFalse(target.exists())
+
     def test_schema_explains_the_denoisers_and_lists_models(self):
         (self.root / "sh.rnnn").write_bytes(b"model")
         body = self.client.get("/api/schema").json()

@@ -542,6 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     silence_group.add_argument(
         "--silence-threshold",
+        type=silence_threshold,
         default="auto",
         help=(
             "silencedetect noise threshold, e.g. -45dB. 'auto' derives it from the "
@@ -799,6 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preview_group.add_argument(
         "--preview-thresholds",
+        type=silence_threshold_list,
         default="-45dB",
         help="Comma-separated silencedetect thresholds to compare",
     )
@@ -952,6 +954,51 @@ def non_negative_float(value: str) -> float:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
+
+
+# The threshold is spliced into an -af filtergraph, so anything it carries
+# becomes filtergraph syntax: "-45dB,ametadata=mode=print:file=PATH" appended a
+# filter that created or truncated PATH. Only a number gets through, rewritten.
+# A bare "-45" is read as dB: ffmpeg takes a bare number as linear amplitude and
+# rejects a negative one as out of range, so dB is the only thing it can mean.
+SILENCE_THRESHOLD_PATTERN = re.compile(
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:db)?", re.IGNORECASE
+)
+# Wider than the auto search (SILENCE_THRESHOLD_LIMITS) to leave room for a
+# deliberate choice, but no wider than means anything. Below -90 dBFS sits under
+# the dither floor of 16-bit audio, so silencedetect would find nothing; at or
+# above 0 dBFS everything is "silence" - a forgotten minus ("45dB") cut ~99% of a
+# lecture without an error - and above -10 dBFS even loud speech would be cut.
+EXPLICIT_SILENCE_THRESHOLD_LIMITS = (-90.0, -10.0)
+
+
+def silence_threshold_db(value: str) -> str:
+    match = SILENCE_THRESHOLD_PATTERN.fullmatch(value.strip())
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a level in dB, e.g. -45dB"
+        )
+    level = float(match.group(1))
+    low, high = EXPLICIT_SILENCE_THRESHOLD_LIMITS
+    if not low <= level <= high:
+        raise argparse.ArgumentTypeError(
+            f"{level:g}dB is outside {low:g}dB..{high:g}dB; a silence threshold "
+            "is a negative level in dBFS, e.g. -45dB"
+        )
+    return f"{level:g}dB"
+
+
+def silence_threshold(value: str) -> str:
+    if value.strip().lower() == "auto":
+        return "auto"
+    return silence_threshold_db(value)
+
+
+def silence_threshold_list(value: str) -> str:
+    levels = [silence_threshold_db(item) for item in csv_values(value)]
+    if not levels:
+        raise argparse.ArgumentTypeError("needs at least one level, e.g. -45dB")
+    return ",".join(levels)
 
 
 def is_url(value: str) -> bool:

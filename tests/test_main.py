@@ -1131,6 +1131,72 @@ class ParserSchemaTests(unittest.TestCase):
                 main.parse_args(argv)
 
 
+class SilenceThresholdTests(unittest.TestCase):
+    def parse_rejected(self, *argv: str) -> str:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                main.parse_args(["input.mp4", *argv])
+        return stderr.getvalue()
+
+    def test_spellings_of_a_level_become_one_canonical_form(self):
+        for given, expected in (
+            ("-45dB", "-45dB"),
+            ("-45 dB", "-45dB"),
+            ("-45db", "-45dB"),
+            ("-45.5dB", "-45.5dB"),
+            ("-45", "-45dB"),
+            (" -45dB ", "-45dB"),
+            ("AUTO", "auto"),
+        ):
+            with self.subTest(given=given):
+                args = main.parse_args(["input.mp4", f"--silence-threshold={given}"])
+                self.assertEqual(args.silence_threshold, expected)
+
+    def test_filtergraph_syntax_cannot_ride_along(self):
+        for value in (
+            "-45dB,ametadata=mode=print:file=/tmp/x",
+            "-45dB:d=0",
+            "-45dB;[a]anull",
+            "nan",
+            "-infdB",
+        ):
+            with self.subTest(value=value):
+                message = self.parse_rejected(f"--silence-threshold={value}")
+                self.assertIn("--silence-threshold", message)
+
+    def test_a_forgotten_minus_is_refused_rather_than_cutting_everything(self):
+        for value in ("45dB", "45", "0dB", "-5dB", "-120dB"):
+            with self.subTest(value=value):
+                message = self.parse_rejected(f"--silence-threshold={value}")
+                self.assertIn("e.g. -45dB", message)
+
+    def test_preview_thresholds_are_checked_one_by_one(self):
+        args = main.parse_args(["input.mp4", "--preview-thresholds= -40 , -45db,"])
+        self.assertEqual(args.preview_thresholds, "-40dB,-45dB")
+
+        self.parse_rejected("--preview-thresholds=-40dB,auto")
+        self.parse_rejected("--preview-thresholds=-40dB,anull")
+        self.parse_rejected("--preview-thresholds=,")
+
+    def test_detect_silences_receives_only_the_canonical_level(self):
+        args = main.parse_args(["input.mp4", "--silence-threshold=-45 dB"])
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with unittest.mock.patch.object(main, "require_command"), \
+                unittest.mock.patch.object(main, "run_command", return_value=result) as run:
+            main.detect_silences(
+                Path("input.mp4"),
+                threshold=args.silence_threshold,
+                min_silence=0.35,
+                duration=10.0,
+                start=0.0,
+                limit=None,
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-af") + 1], "silencedetect=noise=-45dB:d=0.35")
+
+
 class ProgressTests(unittest.TestCase):
     def test_parse_progress_seconds(self):
         self.assertEqual(main.parse_progress_seconds("out_time_us=1500000"), 1.5)
