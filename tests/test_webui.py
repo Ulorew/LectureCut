@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -19,6 +20,19 @@ import main
 
 if TestClient is not None:
     import webui
+
+
+def make_tiny_lecture(path: Path, seconds: int = 10) -> None:
+    """Speech-like 1.5 s tone bursts with 1 s pauses, over a tiny test picture."""
+
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=10:duration={seconds}",
+         "-f", "lavfi", "-i",
+         f"sine=frequency=300:duration={seconds},volume='if(lt(mod(t,2.5),1.5),0.3,0)':eval=frame",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)],
+        check=True,
+    )
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")
@@ -1466,6 +1480,26 @@ class JobLifecycleTests(unittest.TestCase):
         second_lines = [e for e in second.events if e["type"] == "line"]
         self.assertTrue(all("missing-one" in e["text"] for e in first_lines))
         self.assertTrue(all("missing-two" in e["text"] for e in second_lines))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_a_real_job_runs_to_done(self):
+        """Every other job here fails early; this one renders."""
+
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "talk.mp4"
+            make_tiny_lecture(source)
+            job = self.manager.submit(
+                kind="convert",
+                source=str(source),
+                settings={"encoder": "libx264", "analysis_samples": 2},
+            )
+            self.wait_for(job, {webui.STATUS_DONE, webui.STATUS_ERROR}, timeout=120.0)
+            output = Path(job.result["output"]) if job.result else None
+
+            self.assertEqual(job.status, webui.STATUS_DONE, job.error)
+            self.assertTrue(output and output.exists())
+            self.assertEqual(output.parent, source.parent)
+            self.assertTrue(main.read_lecturecut_tag(output))
 
     def wait_for(self, job, statuses, timeout=15.0):
         deadline = time.monotonic() + timeout

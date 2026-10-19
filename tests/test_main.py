@@ -1706,6 +1706,41 @@ class ReporterAndCancelTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 10.0)
 
 
+def make_tiny_lecture(path: Path, seconds: int = 10) -> None:
+    """Speech-like 1.5 s tone bursts with 1 s pauses, over a tiny test picture."""
+
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=10:duration={seconds}",
+         "-f", "lavfi", "-i",
+         f"sine=frequency=300:duration={seconds},volume='if(lt(mod(t,2.5),1.5),0.3,0)':eval=frame",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)],
+        check=True,
+    )
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+class PipelineEndToEndTests(unittest.TestCase):
+    """The render path with real ffmpeg; everything else in this file mocks it."""
+
+    def test_a_lecture_comes_out_cut_tagged_and_whole(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = Path(directory) / "talk.mp4", Path(directory) / "out.mp4"
+            make_tiny_lecture(source)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = main.main([str(source), "-o", str(output), "--encoder=libx264",
+                                  "--analysis-samples=2", "--speed=1.0"])
+            self.assertEqual(code, 0)
+            media = main.probe_media(output)
+            tag = main.read_lecturecut_tag(output)
+
+        self.assertTrue(media.has_audio and media.has_video)
+        # 4 pauses of about 1 s go, minus the padding kept around speech.
+        self.assertLess(media.duration, 9.0)
+        self.assertGreater(media.duration, 5.0)
+        self.assertTrue(tag)
+
+
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:
     """A video stream as ffprobe reports one carrying a display matrix."""
 
