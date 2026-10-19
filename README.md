@@ -97,7 +97,9 @@ python3 -m unittest discover -v
 ```
 
 The web tests skip themselves unless the `web` extra is installed, so check that
-the summary does not end in `skipped=`.
+the summary does not end in `skipped=`. One slower test (about 25 s) renders a
+synthetic lecture and checks that sound stays with the picture across 300 cuts;
+it runs only with `LECTURECUT_SLOW_TESTS=1`.
 
 ## Notes
 

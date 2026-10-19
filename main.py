@@ -2461,6 +2461,10 @@ def video_tail_filters(
     return filters
 
 
+# Hard-correct any drift past 10 ms against the timestamps; start at zero.
+AUDIO_RESYNC_FILTER = "aresample=async=1:min_hard_comp=0.01:first_pts=0"
+
+
 def build_select_filtergraph(
     segments: list[Segment],
     args: argparse.Namespace,
@@ -2477,6 +2481,15 @@ def build_select_filtergraph(
     audio_filters = [
         f"aselect='{select_expression}'",
         f"asetpts='({pts_expression})/TB'",
+        # aselect keeps whole audio frames, and asetpts stamps them correctly,
+        # but everything downstream (atempo, the encoder, players) reads audio
+        # as one run of samples and ignores gaps and overlaps in those stamps.
+        # Each join was then off by part of a frame, and the errors added up:
+        # +270 ms after 311 joins in a 12-minute test, video being exact per
+        # frame. Resampling against the stamps pads the gaps with silence and
+        # trims the overlaps - at joins that sit in pauses anyway - which keeps
+        # the offset where it is with no cuts at all.
+        AUDIO_RESYNC_FILTER,
         *build_audio_filters(args),
     ]
     return (
