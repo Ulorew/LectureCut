@@ -224,17 +224,31 @@ were drained.
 light, a white balance that wanders as the camera adjusts, a faint marker. Each
 frame is divided by its own background - the frame shrunk, max-filtered so thin
 strokes vanish, blurred - which turns the board white wherever the light falls
-and leaves the strokes as the only dark parts. `clean` then sends near-white to
-white (erased-marker ghosts go), darkens strokes and keeps colour; `ink` builds
-its grey from green and blue, where a faded brown or orange marker keeps its
-contrast, and renders the strokes black.
+and leaves the strokes as the only dark parts. A curve then sends everything
+above `--board-white` to white and darkens the rest.
 
-On a close shot with a faded marker, writing that had almost vanished became
-legible in both. The price is the people in front of the board, who come out
-harsh in `clean` and nearly black in `ink`, and the time: on 20 s of that
-lecture the render took 7 s without it, 27 s with `clean` and 22 s with `ink`,
-on a heavily loaded machine. Thickening the strokes as well was tried and merged
-subscripts.
+That threshold is a trade, not a constant. At 0.88 the far side of a close shot
+lost half an expression of faint writing; at 0.95 it stayed. Erased-marker
+ghosts on another lecture are just as faint, so 0.95 brings them back as a grey
+haze. Two things that looked like they could tell them apart did not:
+
+- a background estimated over ~8 px instead of ~40 px does whiten broad ghosts,
+  but outlines their edges in dark rings;
+- averaging neighbouring frames changed nothing visible: the board's
+  frame-to-frame noise was 0.2 of 255 to begin with.
+
+So 0.95 is the default, and a lecture with heavy ghosts wants ~0.90.
+
+`clean` keeps colour but mutes it, which turns pink ghosts grey. `ink` renders
+the strokes black from the darkest of the three channels: a stroke of any
+colour is dark in at least one. Tested on faint strokes in five colours, that
+gave 80 of 255 for all of them, where a green+blue mix left a blue marker at 155
+- nearly gone after the curve.
+
+The price is the people in front of the board, who come out harsh in `clean`
+and nearly black in `ink`, and the time: on 20 s of a lecture the render took
+7 s without it and 22-27 s with it, on a heavily loaded machine. Thickening the
+strokes was tried and merged subscripts.
 
 ## Recognising a finished render
 

@@ -799,6 +799,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     video_group.add_argument(
+        "--board-white",
+        type=board_white,
+        default=0.95,
+        help=(
+            "With --board: brightness above which the evened-out board becomes pure "
+            "white. Lower hides erased-marker ghosts, higher keeps faint, distant "
+            "writing"
+        ),
+    )
+    video_group.add_argument(
         "--tonemap",
         choices=("auto", "off"),
         default="auto",
@@ -931,7 +941,7 @@ def field_kind(action: argparse.Action) -> str:
     if action.type in (positive_int, quality_value, int):
         return "integer"
     if action.type in (
-        positive_float, non_negative_float, unit_interval, finite_float, float
+        positive_float, non_negative_float, unit_interval, finite_float, board_white, float
     ):
         return "number"
     if action.type is Path:
@@ -1029,6 +1039,17 @@ def unit_interval(value: str) -> float:
     parsed = finite_float(value)
     if not 0.0 <= parsed <= 1.0:
         raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+BOARD_WHITE_RANGE = (0.80, 0.99)
+
+
+def board_white(value: str) -> float:
+    parsed = finite_float(value)
+    low, high = BOARD_WHITE_RANGE
+    if not low <= parsed <= high:
+        raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
     return parsed
 
 
@@ -2825,7 +2846,10 @@ def build_filtergraph(
     if mode != "off":
         if not all(size):
             raise PipelineError("--board needs the video's frame size, which ffprobe did not report")
-        board = board_graph(mode, output_size(*size, upright), "vbase", "vout")
+        board = board_graph(
+            mode, output_size(*size, upright), "vbase", "vout",
+            white=getattr(args, "board_white", 0.95),
+        )
     if args.filtergraph_mode == "concat":
         graph = build_concat_filtergraph(segments, args, tail=tail, video_label="vbase" if board else "vout")
     else:
@@ -2862,23 +2886,25 @@ def video_tail_filters(
 
 
 BOARD_MODES = ("off", "clean", "ink")
-# What follows the flattening, per mode. clean keeps colour: a curve that sends
-# near-white (0.88 and up) to white - erased-marker ghosts vanish - and darkens
-# strokes, then milder saturation and a light sharpen. ink builds its grey from
-# green and blue, where a faded brown or orange marker has its contrast (red
-# stayed at 255 on the board while blue dropped to 148 on such a stroke), and
-# pushes it harder; thickening the strokes as well merged subscripts.
-BOARD_FINISH = {
-    "clean": (
-        "curves=all='0/0 0.45/0.12 0.75/0.55 0.88/0.97 1/1',"
-        "format=yuv420p,hue=s=0.75,cas=strength=0.5"
-    ),
-    "ink": (
-        "colorchannelmixer=rr=0.15:rg=0.35:rb=0.5:gr=0.15:gg=0.35:gb=0.5"
-        ":br=0.15:bg=0.35:bb=0.5,"
-        "curves=all='0/0 0.55/0.05 0.8/0.45 0.9/0.97 1/1',format=yuv420p"
-    ),
-}
+
+
+def board_finish(mode: str, white: float) -> str:
+    """What follows the flattening: a curve with its knee at `white`, per mode.
+
+    Everything brighter than the knee becomes white. At 0.88 that also took
+    faint writing on the far side of a close shot - half an expression went -
+    while at 0.95 it stayed; erased-marker ghosts are as faint as that writing,
+    so the knee is the user's trade, not a constant. clean keeps colour but
+    mutes it hard, which turns pink ghosts grey. ink takes the darkest of the
+    three channels: a stroke of any colour is dark in at least one, where a
+    green+blue mix left a blue marker at 155 of 255 against 80 for the others.
+    """
+
+    if mode == "clean":
+        curve = f"0/0 {0.53 * white:.3f}/0.12 {0.84 * white:.3f}/0.5 {white:.3f}/0.97 1/1"
+        return f"curves=all='{curve}',format=yuv420p,hue=s=0.5,cas=strength=0.5"
+    curve = f"0/0 {0.625 * white:.3f}/0.05 {0.885 * white:.3f}/0.45 {white:.3f}/0.97 1/1"
+    return f"curves=all='{curve}',format=yuv420p"
 
 
 def output_size(width: int, height: int, upright: tuple[str, ...] | None) -> tuple[int, int]:
@@ -2889,7 +2915,9 @@ def output_size(width: int, height: int, upright: tuple[str, ...] | None) -> tup
     return width, height
 
 
-def board_graph(mode: str, size: tuple[int, int], source: str, target: str) -> str:
+def board_graph(
+    mode: str, size: tuple[int, int], source: str, target: str, white: float = 0.95
+) -> str:
     """Even out a whiteboard: divide each frame by its own blurred background.
 
     A board under uneven light, with the camera's white balance wandering
@@ -2908,11 +2936,18 @@ def board_graph(mode: str, size: tuple[int, int], source: str, target: str) -> s
         f"scale={max(1, width // 4)}:{max(1, height // 4)},dilation,dilation,"
         f"gblur=sigma={sigma:.1f},scale={width}:{height}:flags=bicubic"
     )
-    return (
+    flattened = (
         f"[{source}]format=gbrp,split[bpage][bblur];\n"
         f"[bblur]{background}[bfond];\n"
-        f"[bpage][bfond]blend=all_mode=divide,{BOARD_FINISH[mode]}[{target}]"
+        f"[bpage][bfond]blend=all_mode=divide"
     )
+    if mode == "ink":
+        return (
+            f"{flattened},extractplanes=r+g+b[bred][bgreen][bblue];\n"
+            "[bred][bgreen]blend=all_mode=darken[bdark];\n"
+            f"[bdark][bblue]blend=all_mode=darken,{board_finish(mode, white)}[{target}]"
+        )
+    return f"{flattened},{board_finish(mode, white)}[{target}]"
 
 
 # Hard-correct any drift past 10 ms against the timestamps; start at zero.

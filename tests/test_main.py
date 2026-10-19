@@ -1865,6 +1865,41 @@ class BoardTests(unittest.TestCase):
         with self.assertRaises(main.PipelineError):
             main.build_filtergraph(self.SEGMENTS, args, size=(0, 0))
 
+    def test_the_white_threshold_moves_the_curve_knee(self):
+        for mode in ("clean", "ink"):
+            with self.subTest(mode=mode):
+                self.assertIn("0.900/0.97", main.board_finish(mode, 0.90))
+                self.assertIn("0.950/0.97", main.board_finish(mode, 0.95))
+
+    def test_the_white_threshold_is_bounded(self):
+        for value in ("0.5", "1.2", "nan"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    main.parse_args(["in.mp4", f"--board-white={value}"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_ink_keeps_a_faint_stroke_of_any_colour(self):
+        """A green+blue mix left a blue marker at 155 of 255 against 80 for the others."""
+
+        colours = {"black": "0x606060", "blue": "0x5070D0", "red": "0xD05050",
+                   "green": "0x50A050", "orange": "0xD09050"}
+        boxes = ",".join(
+            f"drawbox=x={40 + 120 * i}:y=40:w=80:h=6:c={c}:t=fill"
+            for i, c in enumerate(colours.values())
+        )
+        graph = main.board_graph("ink", (640, 200), "0:v", "out", white=0.95)
+        greys = {}
+        for i, name in enumerate(colours):
+            stats = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color=white:s=640x200:d=0.1,format=rgb24,{boxes}",
+                 "-filter_complex", f"{graph};[out]crop=10:4:{80 + 120 * i}:41,signalstats,metadata=print:file=-",
+                 "-frames:v", "1", "-f", "null", "-"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            greys[name] = float(re.search(r"YAVG=([\d.]+)", stats).group(1))
+        self.assertLess(max(greys.values()) - min(greys.values()), 20, greys)
+        self.assertLess(max(greys.values()), 120, greys)
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
     def test_both_modes_render_a_frame_whose_height_does_not_divide_by_four(self):
         with tempfile.TemporaryDirectory() as directory:
