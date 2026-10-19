@@ -446,6 +446,8 @@ class MediaInfo:
     upright: tuple[str, ...] | None = ()
     # "HLG" or "PQ" for an HDR source, "" for SDR.
     hdr: str = ""
+    # zscale's description of the HDR input (tin/pin/min), "" for SDR.
+    hdr_input: str = ""
     # Filters that turn an HDR source into SDR BT.709; empty for SDR.
     sdr: tuple[str, ...] = ()
 
@@ -1397,6 +1399,7 @@ def probe_media(
         video_fps=stream_fps(video_stream),
         upright=upright_filters(video_stream),
         hdr=HDR_TRANSFERS.get(str(video_stream.get("color_transfer") or ""), ""),
+        hdr_input=hdr_input_spec(video_stream),
         sdr=hdr_to_sdr_filters(video_stream),
     )
 
@@ -1446,41 +1449,126 @@ def upright_filters(stream: dict[str, object]) -> tuple[str, ...] | None:
 
 # Transfer functions that mean HDR, as ffprobe names them.
 HDR_TRANSFERS = {"arib-std-b67": "HLG", "smpte2084": "PQ"}
-# BT.2408 puts diffuse white at 203 cd/m2 for both HLG and PQ; mapping it to
-# SDR white keeps a lit board where it was and leaves headroom for highlights.
-HDR_REFERENCE_WHITE_NITS = 203
+# BT.2408 puts diffuse white at 203 cd/m2; it is only the starting point; see
+# measure_hdr_white for why a recording's own white is measured instead.
+HDR_REFERENCE_WHITE_NITS = 203.0
 HDR_PRIMARIES = {"bt2020", "bt709"}
 HDR_MATRICES = {"bt2020nc", "bt2020c", "bt709"}
+# Frames sampled to find a recording's white, and the luminance they are read
+# at: at 1000 cd/m2 nothing an HLG phone recording holds is clipped yet.
+HDR_PROBE_FRAMES = 8
+HDR_PROBE_NITS = 1000.0
+# Where that white lands in SDR: 92% leaves a little room above the board.
+HDR_WHITE_TARGET = 0.92
+HDR_NPL_RANGE = (100.0, 1000.0)
 
 
-def hdr_to_sdr_filters(stream: dict[str, object]) -> tuple[str, ...]:
-    """Filters that make an HDR stream ordinary SDR BT.709, or () if it is SDR.
+def hdr_input_spec(stream: dict[str, object]) -> str:
+    """zscale's tin/pin/min for an HDR stream, or "" if the stream is SDR."""
+
+    transfer = str(stream.get("color_transfer") or "")
+    if transfer not in HDR_TRANSFERS:
+        return ""
+    primaries = str(stream.get("color_primaries") or "")
+    matrix = str(stream.get("color_space") or "")
+    return (
+        f"tin={transfer}"
+        f":pin={primaries if primaries in HDR_PRIMARIES else 'bt2020'}"
+        f":min={matrix if matrix in HDR_MATRICES else 'bt2020nc'}"
+    )
+
+
+def sdr_filters(hdr_input: str, npl: float = HDR_REFERENCE_WHITE_NITS) -> tuple[str, ...]:
+    """One zscale step from HDR to SDR BT.709, with npl cd/m2 as SDR white.
 
     Phones record lectures as HLG in BT.2020, 10 bit. Squeezing that into 8 bit
     without converting kept the HDR tags on an SDR-range file: players that
     honour them showed it warm, those that did not showed it grey, and the
     BT.2020 primaries read as BT.709 drained the colour either way.
 
-    One zscale step maps reference white to SDR white and clips what lies
-    above it - lamps, a white wall, glare. Tone mapping through linear float
-    with mobius kept those highlights but cost five times as much (2.8x
-    realtime against 15x at 1080p30) and, compressing from 30% of peak up,
-    dimmed the board from about 230 to 190 of 255. A lecture's board sits
-    below reference white, so clipping above it loses nothing worth keeping.
+    One zscale step clips what lies above npl. Tone mapping through linear
+    float with mobius kept those highlights but cost five times as much (2.8x
+    realtime against 8x at 1080p30) and, compressing from 30% of peak up,
+    dimmed the board. What matters is that the board lands below the clip,
+    which is what the measured npl is for.
     """
 
-    transfer = str(stream.get("color_transfer") or "")
-    if transfer not in HDR_TRANSFERS:
+    if not hdr_input:
         return ()
-    primaries = str(stream.get("color_primaries") or "")
-    matrix = str(stream.get("color_space") or "")
     return (
-        f"zscale=tin={transfer}"
-        f":pin={primaries if primaries in HDR_PRIMARIES else 'bt2020'}"
-        f":min={matrix if matrix in HDR_MATRICES else 'bt2020nc'}"
-        f":t=bt709:p=bt709:m=bt709:r=tv:npl={HDR_REFERENCE_WHITE_NITS}",
+        f"zscale={hdr_input}:t=bt709:p=bt709:m=bt709:r=tv:npl={npl:.0f}",
         "format=yuv420p",
     )
+
+
+def hdr_to_sdr_filters(
+    stream: dict[str, object], npl: float = HDR_REFERENCE_WHITE_NITS
+) -> tuple[str, ...]:
+    """Filters that make an HDR stream ordinary SDR BT.709, or () if it is SDR."""
+
+    return sdr_filters(hdr_input_spec(stream), npl)
+
+
+def expose_hdr(path: Path, media: MediaInfo, args: argparse.Namespace) -> MediaInfo:
+    """Media whose SDR conversion is exposed for this recording's own white."""
+
+    npl = measure_hdr_white(path, media, args)
+    report(
+        f"HDR source ({media.hdr}): converting to SDR BT.709, "
+        f"white measured at {npl * bt709_to_linear(16.0 + HDR_WHITE_TARGET * 219.0):.0f} cd/m2 (npl {npl:.0f})"
+    )
+    return replace(media, sdr=sdr_filters(media.hdr_input, npl))
+
+
+def bt709_to_linear(code: float) -> float:
+    """A limited-range 8-bit BT.709 code value as relative linear light."""
+
+    v = min(max((code - 16.0) / 219.0, 0.0), 1.0)
+    return ((v + 0.099) / 1.099) ** (1 / 0.45) if v >= 0.081 else v / 4.5
+
+
+def measure_hdr_white(path: Path, media: MediaInfo, args: argparse.Namespace) -> float:
+    """The npl that puts this recording's white at HDR_WHITE_TARGET of SDR.
+
+    The reference 203 cd/m2 assumes the camera exposed diffuse white there.
+    Phones do not: three HLG lectures put the board at 420-500 cd/m2, so at 203
+    the board clipped - on a close shot of a faint marker, red and green sat at
+    255 across the board and half the strokes' contrast went with them. The
+    90th percentile of a frame's luma is the board or a white wall, and it held
+    within 2% across each lecture, so the median of a few frames sets npl.
+    """
+
+    if not media.hdr_input:
+        return HDR_REFERENCE_WHITE_NITS
+    start = args.start or 0.0
+    span = media.duration
+    times = [start + span * (0.05 + 0.9 * (k + 0.5) / HDR_PROBE_FRAMES) for k in range(HDR_PROBE_FRAMES)]
+
+    def probe(at: float) -> float | None:
+        result = run_command(
+            [
+                "ffmpeg", "-hide_banner", "-nostdin",
+                "-ss", format_seconds(at), "-i", str(path),
+                "-frames:v", "1", "-an",
+                "-vf",
+                f"zscale={media.hdr_input}:t=bt709:p=bt709:m=bt709:r=tv"
+                f":npl={HDR_PROBE_NITS:.0f},format=yuv420p,"
+                "signalstats,metadata=print:file=-",
+                "-f", "null", "-",
+            ],
+            capture=True,
+            check=False,
+        )
+        found = re.search(r"YHIGH=(\d+)", result.stdout or "")
+        return float(found.group(1)) if found else None
+
+    highs = [value for value in map_probes(probe, times) if value is not None]
+    if not highs:
+        return HDR_REFERENCE_WHITE_NITS
+    white = HDR_PROBE_NITS * bt709_to_linear(percentile(highs, 0.5))
+    npl = white / bt709_to_linear(16.0 + HDR_WHITE_TARGET * 219.0)
+    low, high = HDR_NPL_RANGE
+    return min(high, max(low, npl))
 
 
 def stream_fps(stream: dict[str, object]) -> float:
@@ -3299,6 +3387,8 @@ def run_preview_sweep(
     preview_args.dry_run = False
 
     media = probe_media(input_path, start=preview_args.start, limit=preview_args.limit)
+    if media.hdr and args.tonemap != "off":
+        media = expose_hdr(input_path, media, preview_args)
     if media.duration <= 0:
         raise PipelineError("Preview sample is outside the input duration")
     if not media.has_video:
@@ -3426,12 +3516,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
             raise PipelineError("Input has no video stream")
         if not media.has_audio:
             raise PipelineError("Input has no audio stream")
-        if media.hdr:
-            report(
-                f"HDR source ({media.hdr}): converting to SDR BT.709"
-                if args.tonemap != "off"
-                else f"HDR source ({media.hdr}): passed through unconverted (--tonemap off)"
-            )
+        if media.hdr and args.tonemap != "off":
+            media = expose_hdr(input_path, media, args)
+        elif media.hdr:
+            report(f"HDR source ({media.hdr}): passed through unconverted (--tonemap off)")
 
         ACTIVE_PROGRESS.set(plan_progress_weights(duration=media.duration, args=args))
 

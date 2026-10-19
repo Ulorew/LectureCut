@@ -187,20 +187,36 @@ iPhones record HLG in BT.2020 at 10 bit. These used to be squeezed into 8 bit
 without converting, keeping their HDR tags: players that honour the tags showed
 the file warm, others grey, and the BT.2020 primaries read as BT.709 drained the
 colour. `--tonemap auto` (the default) converts HLG and PQ sources to ordinary
-SDR BT.709 with one zscale step that maps reference white (203 cd/m², as
-BT.2408 puts it) to SDR white and clips above it.
+SDR BT.709 with one zscale step.
 
-| conversion | 1080p30, decode and filter | board brightness of 255 |
+That step maps a chosen luminance (`npl`) to SDR white and clips above it, so
+the choice decides whether the board survives. The standard reference white,
+203 cd/m², assumes the camera put diffuse white there; phones do not. Read at
+1000 cd/m², where nothing clips yet, three lectures put the board at:
+
+| recording | board | npl chosen |
 | --- | --- | --- |
-| none (before) | 15x realtime | grey, colours drained |
-| one zscale step | 8x | about 230 |
-| linear float + `tonemap=mobius` | 2.8x | about 190 |
+| Lecture 9 (close shot, faint marker) | ~470 cd/m² | 555 |
+| IMG_8653 | ~500 cd/m² | 588 |
+| IMG_8654 | ~420 cd/m² | 499 |
 
-Tone mapping keeps the highlights the single step clips - lamps, the white wall,
-glare on the board - but costs five times as much and dims the board, since
-mobius starts compressing at 30% of peak. A lecture's board sits below
-reference white, so nothing worth keeping is lost. The room's warm light does
-show now; it was hidden only because the colours were drained.
+At 203 the close shot clipped: red and green sat at 255 across the board, and a
+corner of faint writing vanished with them. So the pipeline samples eight
+frames, takes the median of each frame's 90th-percentile luma - the board or a
+white wall, steady within 2% across a lecture - and sets `npl` so that it lands
+at 92% of SDR white. Lamps and glare still clip, which is what the single step
+gives up for its speed:
+
+| conversion | 1080p30, decode and filter |
+| --- | --- |
+| none (before) | 15x realtime |
+| one zscale step | 8x |
+| linear float + `tonemap=mobius` | 2.8x |
+
+Tone mapping through linear float keeps the highlights, but costs five times as
+much and, since mobius starts compressing at 30% of peak, dims the board too.
+The room's warm light does show now; it was hidden only because the colours
+were drained.
 
 ## Recognising a finished render
 

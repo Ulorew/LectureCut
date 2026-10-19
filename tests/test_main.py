@@ -1768,6 +1768,46 @@ class HdrTests(unittest.TestCase):
         args = main.parse_args(["in.mp4", "--tonemap=off"])
         self.assertEqual(main.video_tail_filters(args, video_fps=30, upright=(), sdr=("zscale=x",)), [])
 
+    def measured(self, highs, hdr_input="tin=arib-std-b67:pin=bt2020:min=bt2020nc"):
+        media = main.MediaInfo(duration=600.0, has_audio=True, has_video=True, video_fps=30.0,
+                               hdr="HLG" if hdr_input else "", hdr_input=hdr_input)
+        values = iter(highs)
+
+        def fake_run(command, **kwargs):
+            value = next(values)
+            return subprocess.CompletedProcess(command, 0, f"lavfi.signalstats.YHIGH={value}\n", "")
+
+        with unittest.mock.patch.object(main, "run_command", fake_run):
+            return main.measure_hdr_white(Path("phone.mov"), media, main.parse_args(["phone.mov"]))
+
+    def test_white_is_put_at_the_target_rather_than_at_203(self):
+        """Phones exposed the board at 420-500 cd/m2; at 203 it clipped to 255."""
+
+        npl = self.measured([167] * main.HDR_PROBE_FRAMES)  # what Lecture 9 measured
+        white = main.HDR_PROBE_NITS * main.bt709_to_linear(167)
+        self.assertGreater(npl, 450)
+        self.assertAlmostEqual(
+            white / npl, main.bt709_to_linear(16 + main.HDR_WHITE_TARGET * 219), places=6
+        )
+
+    def test_the_measured_npl_stays_in_range(self):
+        self.assertEqual(self.measured([20] * main.HDR_PROBE_FRAMES), main.HDR_NPL_RANGE[0])
+        self.assertEqual(self.measured([235] * main.HDR_PROBE_FRAMES), main.HDR_NPL_RANGE[1])
+
+    def test_a_stray_frame_does_not_move_the_exposure(self):
+        steady = self.measured([167] * main.HDR_PROBE_FRAMES)
+        with_outliers = self.measured([167] * (main.HDR_PROBE_FRAMES - 2) + [40, 235])
+        self.assertAlmostEqual(steady, with_outliers, delta=steady * 0.02)
+
+    def test_sdr_needs_no_measurement(self):
+        with unittest.mock.patch.object(main, "run_command", side_effect=AssertionError("probed")):
+            self.assertEqual(self.measured([], hdr_input=""), main.HDR_REFERENCE_WHITE_NITS)
+
+    def test_code_values_map_to_linear_light(self):
+        self.assertEqual(main.bt709_to_linear(16), 0.0)
+        self.assertAlmostEqual(main.bt709_to_linear(235), 1.0, places=6)
+        self.assertLess(main.bt709_to_linear(126), 0.3)  # mid code is far below mid light
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
     def test_an_hlg_recording_comes_out_tagged_sdr(self):
         def tags(path: Path) -> str:
