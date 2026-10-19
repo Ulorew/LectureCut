@@ -1438,6 +1438,36 @@ class ReporterAndCancelTests(unittest.TestCase):
         self.assertEqual(len(result.stderr), 400000)
         self.assertEqual(fractions, [0.5])
 
+    def test_undecodable_output_does_not_kill_the_drain(self):
+        """ffmpeg echoes a cp1251 title tag as raw bytes in its banner.
+
+        A strict decoder raised inside the drain thread, so everything after the
+        banner - the silencedetect lines - was lost and, past a pipe buffer's
+        worth of output, the child blocked for good. The output here stays under
+        a pipe buffer so a regression fails instead of hanging the suite.
+        """
+
+        noisy = (
+            "import sys\n"
+            "title = '\\u041b\\u0435\\u043a\\u0446\\u0438\\u044f'.encode('cp1251')\n"
+            "sys.stderr.buffer.write(b'    title           : ' + title + b'\\n')\n"
+            "sys.stderr.buffer.write(b'[silencedetect] silence_start: 1.5\\n' * 1000)\n"
+            "sys.stdout.buffer.write(title + b'\\nout\\n')\n"
+        )
+        died = []
+        previous_hook = threading.excepthook
+        threading.excepthook = lambda hook_args: died.append(hook_args.exc_value)
+        token = main.ACTIVE_CANCEL.set(threading.Event())
+        try:
+            result = main.run_command([sys.executable, "-c", noisy], capture=True)
+        finally:
+            main.ACTIVE_CANCEL.reset(token)
+            threading.excepthook = previous_hook
+
+        self.assertEqual(died, [])
+        self.assertEqual(result.stderr.count("silence_start: 1.5"), 1000)
+        self.assertTrue(result.stdout.endswith("out\n"))
+
     def test_progress_flags_are_only_added_for_ffmpeg(self):
         self.assertEqual(
             main.with_progress_output(["printf", "hello"]), ["printf", "hello"]

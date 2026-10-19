@@ -1083,6 +1083,13 @@ def run_command(
     process = subprocess.Popen(
         command,
         text=True,
+        # ffmpeg echoes the input's metadata as raw bytes, so a title tag written
+        # in cp1251 reaches us as invalid UTF-8. A strict decoder raised
+        # UnicodeDecodeError inside the drain thread, which died silently: the
+        # silencedetect log came back empty (the lecture was rendered uncut) and,
+        # on a long input, ffmpeg blocked on the undrained pipe. A replacement
+        # character only spoils the tag; every line we parse is ASCII.
+        errors="replace",
         stdout=subprocess.PIPE if want_stdout else None,
         stderr=subprocess.PIPE if capture else None,
     )
