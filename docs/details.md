@@ -161,8 +161,11 @@ size to expect per hour and for the selected file. That estimate comes from this
 lecture; a busier frame will need more.
 
 The default `--filtergraph-mode select` is intended for speed on long lectures.
-It preserves sync by mapping every kept segment back onto a shared output
-timeline for audio and video. `--filtergraph-mode concat` keeps the older
+It maps every kept segment back onto a shared output timeline for audio and
+video, and then resamples the audio against those timestamps: aselect keeps
+whole audio frames, and players play samples back to back, so without that the
+sound drifted off the picture - up to 335 ms after 305 cuts on a synthetic
+lecture, and growing with every cut. `--filtergraph-mode concat` keeps the older
 per-segment trim/concat graph for debugging short clips. Every trim branch reads
 the whole input and concat drains them one at a time, so the frames of later
 segments wait in memory: a 3-minute 160x120 synthetic with 46 segments peaked at
@@ -170,6 +173,34 @@ segments wait in memory: a 3-minute 160x120 synthetic with 46 segments peaked at
 size, enough to exhaust RAM on an HD lecture. Splitting the input into one
 `-ss`/`-t` input per segment was worse (1.1 GB, one decoder per segment), so the
 mode stays as it is and warns when it renders.
+
+## Frame rate
+
+A screen recording at 60 fps doubles the frames without adding anything a
+lecture needs. `--max-fps 30` caps the output; on a 60 fps lecture that halved
+both the render time (24 s to 13 s for two minutes) and the file (4.9 to
+2.4 MB). A source that is already slower is left alone.
+
+## Phone recordings in HDR
+
+iPhones record HLG in BT.2020 at 10 bit. These used to be squeezed into 8 bit
+without converting, keeping their HDR tags: players that honour the tags showed
+the file warm, others grey, and the BT.2020 primaries read as BT.709 drained the
+colour. `--tonemap auto` (the default) converts HLG and PQ sources to ordinary
+SDR BT.709 with one zscale step that maps reference white (203 cd/m², as
+BT.2408 puts it) to SDR white and clips above it.
+
+| conversion | 1080p30, decode and filter | board brightness of 255 |
+| --- | --- | --- |
+| none (before) | 15x realtime | grey, colours drained |
+| one zscale step | 8x | about 230 |
+| linear float + `tonemap=mobius` | 2.8x | about 190 |
+
+Tone mapping keeps the highlights the single step clips - lamps, the white wall,
+glare on the board - but costs five times as much and dims the board, since
+mobius starts compressing at 30% of peak. A lecture's board sits below
+reference white, so nothing worth keeping is lost. The room's warm light does
+show now; it was hidden only because the colours were drained.
 
 ## Recognising a finished render
 

@@ -444,6 +444,10 @@ class MediaInfo:
     video_fps: float
     # Filters that apply the display matrix; None leaves it to ffmpeg's autorotate.
     upright: tuple[str, ...] | None = ()
+    # "HLG" or "PQ" for an HDR source, "" for SDR.
+    hdr: str = ""
+    # Filters that turn an HDR source into SDR BT.709; empty for SDR.
+    sdr: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -777,6 +781,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=quality_value,
         default=23,
         help="libx264 CRF value",
+    )
+    video_group.add_argument(
+        "--tonemap",
+        choices=("auto", "off"),
+        default="auto",
+        help=(
+            "auto converts HDR sources (HLG or PQ, as phones record) to ordinary "
+            "SDR BT.709; off passes them through unconverted"
+        ),
     )
     video_group.add_argument(
         "--max-fps",
@@ -1356,7 +1369,8 @@ def probe_media(
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate"
+        "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,"
+        "color_transfer,color_primaries,color_space"
         ":stream_side_data=side_data_type,rotation,displaymatrix",
         "-of",
         "json",
@@ -1382,6 +1396,8 @@ def probe_media(
         has_video=any(stream.get("codec_type") == "video" for stream in streams),
         video_fps=stream_fps(video_stream),
         upright=upright_filters(video_stream),
+        hdr=HDR_TRANSFERS.get(str(video_stream.get("color_transfer") or ""), ""),
+        sdr=hdr_to_sdr_filters(video_stream),
     )
 
 
@@ -1426,6 +1442,45 @@ def upright_filters(stream: dict[str, object]) -> tuple[str, ...] | None:
                 return filters
         return None
     return ()
+
+
+# Transfer functions that mean HDR, as ffprobe names them.
+HDR_TRANSFERS = {"arib-std-b67": "HLG", "smpte2084": "PQ"}
+# BT.2408 puts diffuse white at 203 cd/m2 for both HLG and PQ; mapping it to
+# SDR white keeps a lit board where it was and leaves headroom for highlights.
+HDR_REFERENCE_WHITE_NITS = 203
+HDR_PRIMARIES = {"bt2020", "bt709"}
+HDR_MATRICES = {"bt2020nc", "bt2020c", "bt709"}
+
+
+def hdr_to_sdr_filters(stream: dict[str, object]) -> tuple[str, ...]:
+    """Filters that make an HDR stream ordinary SDR BT.709, or () if it is SDR.
+
+    Phones record lectures as HLG in BT.2020, 10 bit. Squeezing that into 8 bit
+    without converting kept the HDR tags on an SDR-range file: players that
+    honour them showed it warm, those that did not showed it grey, and the
+    BT.2020 primaries read as BT.709 drained the colour either way.
+
+    One zscale step maps reference white to SDR white and clips what lies
+    above it - lamps, a white wall, glare. Tone mapping through linear float
+    with mobius kept those highlights but cost five times as much (2.8x
+    realtime against 15x at 1080p30) and, compressing from 30% of peak up,
+    dimmed the board from about 230 to 190 of 255. A lecture's board sits
+    below reference white, so clipping above it loses nothing worth keeping.
+    """
+
+    transfer = str(stream.get("color_transfer") or "")
+    if transfer not in HDR_TRANSFERS:
+        return ()
+    primaries = str(stream.get("color_primaries") or "")
+    matrix = str(stream.get("color_space") or "")
+    return (
+        f"zscale=tin={transfer}"
+        f":pin={primaries if primaries in HDR_PRIMARIES else 'bt2020'}"
+        f":min={matrix if matrix in HDR_MATRICES else 'bt2020nc'}"
+        f":t=bt709:p=bt709:m=bt709:r=tv:npl={HDR_REFERENCE_WHITE_NITS}",
+        "format=yuv420p",
+    )
 
 
 def stream_fps(stream: dict[str, object]) -> float:
@@ -2657,8 +2712,9 @@ def build_filtergraph(
     *,
     video_fps: float = 30.0,
     upright: tuple[str, ...] | None = (),
+    sdr: tuple[str, ...] = (),
 ) -> str:
-    tail = video_tail_filters(args, video_fps=video_fps, upright=upright)
+    tail = video_tail_filters(args, video_fps=video_fps, upright=upright, sdr=sdr)
     if args.filtergraph_mode == "concat":
         return build_concat_filtergraph(segments, args, tail=tail)
     return build_select_filtergraph(segments, args, tail=tail)
@@ -2669,8 +2725,9 @@ def video_tail_filters(
     *,
     video_fps: float,
     upright: tuple[str, ...] | None,
+    sdr: tuple[str, ...] = (),
 ) -> list[str]:
-    """What runs on the kept frames after the cuts: the rate cap, then rotation.
+    """What runs on the kept frames after the cuts: rate cap, HDR->SDR, rotation.
 
     Both go last on purpose. Everything after the cuts costs per kept frame, and
     the cap halves those on a 60 fps source - in a measured render that took a
@@ -2683,6 +2740,8 @@ def video_tail_filters(
     max_fps = getattr(args, "max_fps", 0.0) or 0.0
     if max_fps > 0 and video_fps * args.speed > max_fps + 0.01:
         filters.append(f"fps={format_seconds(max_fps)}")
+    if getattr(args, "tonemap", "auto") != "off":
+        filters.extend(sdr)
     filters.extend(upright or ())
     return filters
 
@@ -3188,7 +3247,11 @@ def render_segments(
     filtergraph_name: str = "filtergraph.ffmpeg",
 ) -> tuple[str, float]:
     filtergraph = build_filtergraph(
-        segments, args, video_fps=media.video_fps, upright=media.upright
+        segments,
+        args,
+        video_fps=media.video_fps,
+        upright=media.upright,
+        sdr=media.sdr,
     )
     filtergraph_path = workdir / filtergraph_name
     filtergraph_path.write_text(filtergraph, encoding="utf-8")
@@ -3363,6 +3426,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
             raise PipelineError("Input has no video stream")
         if not media.has_audio:
             raise PipelineError("Input has no audio stream")
+        if media.hdr:
+            report(
+                f"HDR source ({media.hdr}): converting to SDR BT.709"
+                if args.tonemap != "off"
+                else f"HDR source ({media.hdr}): passed through unconverted (--tonemap off)"
+            )
 
         ACTIVE_PROGRESS.set(plan_progress_weights(duration=media.duration, args=args))
 

@@ -58,6 +58,8 @@ The options worth knowing:
 | `--target-lufs -17` | loudness to aim for |
 | `--encoder auto` | `auto` (NVENC), `libx264`, `hevc_nvenc` |
 | `--cq 28`, `--crf 23` | quality; higher means a smaller file |
+| `--max-fps 30` | cap the frame rate; halves a 60 fps screen recording |
+| `--tonemap auto` | convert HDR phone recordings to ordinary SDR |
 | `--mono` | downmix, for a recorder with one useful channel |
 | `--no-cut-silence` | keep the whole timeline, only clean and speed up |
 | `--live-dir DIR` | render through a playlist you can watch as it grows |

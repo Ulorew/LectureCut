@@ -1706,7 +1706,7 @@ class ReporterAndCancelTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 10.0)
 
 
-def make_tiny_lecture(path: Path, seconds: int = 10) -> None:
+def make_tiny_lecture(path: Path, seconds: int = 10, extra: tuple[str, ...] = ()) -> None:
     """Speech-like 1.5 s tone bursts with 1 s pauses, over a tiny test picture."""
 
     subprocess.run(
@@ -1714,7 +1714,7 @@ def make_tiny_lecture(path: Path, seconds: int = 10) -> None:
          "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=10:duration={seconds}",
          "-f", "lavfi", "-i",
          f"sine=frequency=300:duration={seconds},volume='if(lt(mod(t,2.5),1.5),0.3,0)':eval=frame",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)],
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", *extra, "-c:a", "aac", "-shortest", str(path)],
         check=True,
     )
 
@@ -1739,6 +1739,58 @@ class PipelineEndToEndTests(unittest.TestCase):
         self.assertLess(media.duration, 9.0)
         self.assertGreater(media.duration, 5.0)
         self.assertTrue(tag)
+
+
+HLG_TAGS = ("-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc")
+
+
+class HdrTests(unittest.TestCase):
+    def test_hlg_and_pq_are_converted_and_sdr_is_left_alone(self):
+        hlg = {"color_transfer": "arib-std-b67", "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        pq = {"color_transfer": "smpte2084", "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        self.assertIn("tin=arib-std-b67", main.hdr_to_sdr_filters(hlg)[0])
+        self.assertIn("tin=smpte2084", main.hdr_to_sdr_filters(pq)[0])
+        for filters in (main.hdr_to_sdr_filters(hlg), main.hdr_to_sdr_filters(pq)):
+            self.assertIn("t=bt709:p=bt709:m=bt709", filters[0])
+        for sdr in ({}, {"color_transfer": "bt709"}, {"color_transfer": "iec61966-2-1"}):
+            self.assertEqual(main.hdr_to_sdr_filters(sdr), ())
+
+    def test_unknown_primaries_fall_back_to_what_hdr_uses(self):
+        filters = main.hdr_to_sdr_filters({"color_transfer": "arib-std-b67", "color_primaries": "unknown"})
+        self.assertIn("pin=bt2020:min=bt2020nc", filters[0])
+
+    def test_conversion_follows_the_cap_and_precedes_rotation(self):
+        args = main.parse_args(["in.mp4", "--max-fps=30"])
+        tail = main.video_tail_filters(args, video_fps=60, upright=("hflip", "vflip"), sdr=("zscale=x", "format=yuv420p"))
+        self.assertEqual(tail, ["fps=30", "zscale=x", "format=yuv420p", "hflip", "vflip"])
+
+    def test_off_passes_hdr_through(self):
+        args = main.parse_args(["in.mp4", "--tonemap=off"])
+        self.assertEqual(main.video_tail_filters(args, video_fps=30, upright=(), sdr=("zscale=x",)), [])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_an_hlg_recording_comes_out_tagged_sdr(self):
+        def tags(path: Path) -> str:
+            return subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                 "stream=color_transfer,color_primaries", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "phone.mp4"
+            make_tiny_lecture(source, extra=HLG_TAGS)
+            self.assertEqual(main.probe_media(source).hdr, "HLG")
+            results = {}
+            for mode in ("auto", "off"):
+                output = Path(directory) / f"{mode}.mp4"
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(main.main([str(source), "-o", str(output), "--encoder=libx264",
+                                                "--analysis-samples=2", f"--tonemap={mode}"]), 0)
+                results[mode] = tags(output)
+
+        self.assertEqual(results["auto"], "bt709,bt709")
+        self.assertEqual(results["off"], "arib-std-b67,bt2020")
 
 
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:
