@@ -442,6 +442,9 @@ class MediaInfo:
     has_audio: bool
     has_video: bool
     video_fps: float
+    # Decoded frame size, before any rotation.
+    width: int = 0
+    height: int = 0
     # Filters that apply the display matrix; None leaves it to ffmpeg's autorotate.
     upright: tuple[str, ...] | None = ()
     # "HLG" or "PQ" for an HDR source, "" for SDR.
@@ -783,6 +786,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=quality_value,
         default=23,
         help="libx264 CRF value",
+    )
+    video_group.add_argument(
+        "--board",
+        choices=BOARD_MODES,
+        default="off",
+        help=(
+            "Whiteboard clean-up: clean evens out the lighting and white balance so "
+            "the board turns white and strokes dark; ink also renders the strokes "
+            "black in greyscale, for a faint or coloured marker. Roughly doubles "
+            "the per-frame filtering cost"
+        ),
     )
     video_group.add_argument(
         "--tonemap",
@@ -1371,7 +1385,7 @@ def probe_media(
         "-v",
         "error",
         "-show_entries",
-        "format=duration:stream=codec_type,avg_frame_rate,r_frame_rate,"
+        "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,"
         "color_transfer,color_primaries,color_space"
         ":stream_side_data=side_data_type,rotation,displaymatrix",
         "-of",
@@ -1397,6 +1411,8 @@ def probe_media(
         has_audio=any(stream.get("codec_type") == "audio" for stream in streams),
         has_video=any(stream.get("codec_type") == "video" for stream in streams),
         video_fps=stream_fps(video_stream),
+        width=int(video_stream.get("width") or 0),
+        height=int(video_stream.get("height") or 0),
         upright=upright_filters(video_stream),
         hdr=HDR_TRANSFERS.get(str(video_stream.get("color_transfer") or ""), ""),
         hdr_input=hdr_input_spec(video_stream),
@@ -2801,11 +2817,22 @@ def build_filtergraph(
     video_fps: float = 30.0,
     upright: tuple[str, ...] | None = (),
     sdr: tuple[str, ...] = (),
+    size: tuple[int, int] = (0, 0),
 ) -> str:
     tail = video_tail_filters(args, video_fps=video_fps, upright=upright, sdr=sdr)
+    board = ""
+    mode = getattr(args, "board", "off")
+    if mode != "off":
+        if not all(size):
+            raise PipelineError("--board needs the video's frame size, which ffprobe did not report")
+        board = board_graph(mode, output_size(*size, upright), "vbase", "vout")
     if args.filtergraph_mode == "concat":
-        return build_concat_filtergraph(segments, args, tail=tail)
-    return build_select_filtergraph(segments, args, tail=tail)
+        graph = build_concat_filtergraph(segments, args, tail=tail, video_label="vbase" if board else "vout")
+    else:
+        graph = build_select_filtergraph(segments, args, tail=tail, video_label="vbase" if board else "vout")
+    if not board:
+        return graph
+    return graph.rstrip("\n") + ";\n" + board + "\n"
 
 
 def video_tail_filters(
@@ -2834,6 +2861,60 @@ def video_tail_filters(
     return filters
 
 
+BOARD_MODES = ("off", "clean", "ink")
+# What follows the flattening, per mode. clean keeps colour: a curve that sends
+# near-white (0.88 and up) to white - erased-marker ghosts vanish - and darkens
+# strokes, then milder saturation and a light sharpen. ink builds its grey from
+# green and blue, where a faded brown or orange marker has its contrast (red
+# stayed at 255 on the board while blue dropped to 148 on such a stroke), and
+# pushes it harder; thickening the strokes as well merged subscripts.
+BOARD_FINISH = {
+    "clean": (
+        "curves=all='0/0 0.45/0.12 0.75/0.55 0.88/0.97 1/1',"
+        "format=yuv420p,hue=s=0.75,cas=strength=0.5"
+    ),
+    "ink": (
+        "colorchannelmixer=rr=0.15:rg=0.35:rb=0.5:gr=0.15:gg=0.35:gb=0.5"
+        ":br=0.15:bg=0.35:bb=0.5,"
+        "curves=all='0/0 0.55/0.05 0.8/0.45 0.9/0.97 1/1',format=yuv420p"
+    ),
+}
+
+
+def output_size(width: int, height: int, upright: tuple[str, ...] | None) -> tuple[int, int]:
+    """Frame size after the rotation filters: a quarter turn swaps the sides."""
+
+    if any(name.startswith("transpose") for name in (upright or ())):
+        return height, width
+    return width, height
+
+
+def board_graph(mode: str, size: tuple[int, int], source: str, target: str) -> str:
+    """Even out a whiteboard: divide each frame by its own blurred background.
+
+    A board under uneven light, with the camera's white balance wandering
+    through the lecture, is mostly one smooth surface plus thin strokes. Shrunk,
+    max-filtered (so thin dark strokes vanish) and blurred, the frame becomes
+    that surface alone; dividing by it turns the board white wherever the light
+    falls, and leaves strokes as the only dark parts. The background goes back
+    to the exact frame size, not a multiple of the shrink factor: a 1342-pixel
+    screen recording does not divide by four, and blend refuses mismatched
+    inputs. People in front of the board come out harsh - the trade for it.
+    """
+
+    width, height = size
+    sigma = max(2.0, 10.0 * height / 1080.0)
+    background = (
+        f"scale={max(1, width // 4)}:{max(1, height // 4)},dilation,dilation,"
+        f"gblur=sigma={sigma:.1f},scale={width}:{height}:flags=bicubic"
+    )
+    return (
+        f"[{source}]format=gbrp,split[bpage][bblur];\n"
+        f"[bblur]{background}[bfond];\n"
+        f"[bpage][bfond]blend=all_mode=divide,{BOARD_FINISH[mode]}[{target}]"
+    )
+
+
 # Hard-correct any drift past 10 ms against the timestamps; start at zero.
 AUDIO_RESYNC_FILTER = "aresample=async=1:min_hard_comp=0.01:first_pts=0"
 
@@ -2843,6 +2924,7 @@ def build_select_filtergraph(
     args: argparse.Namespace,
     *,
     tail: list[str] = [],  # noqa: B006 - never mutated
+    video_label: str = "vout",
 ) -> str:
     select_expression = segment_select_expression(segments)
     pts_expression = segment_pts_expression(segments)
@@ -2866,7 +2948,7 @@ def build_select_filtergraph(
         *build_audio_filters(args),
     ]
     return (
-        f"[0:v]{','.join(video_filters)}[vout];\n"
+        f"[0:v]{','.join(video_filters)}[{video_label}];\n"
         f"[0:a]{','.join(audio_filters)}[aout]\n"
     )
 
@@ -2945,6 +3027,7 @@ def build_concat_filtergraph(
     args: argparse.Namespace,
     *,
     tail: list[str] = [],  # noqa: B006 - never mutated
+    video_label: str = "vout",
 ) -> str:
     lines: list[str] = []
     concat_inputs: list[str] = []
@@ -2961,7 +3044,7 @@ def build_concat_filtergraph(
 
     joined_inputs = "".join(concat_inputs)
     lines.append(f"{joined_inputs}concat=n={len(segments)}:v=1:a=1[vcat][acat]")
-    lines.append(f"[vcat]{','.join([f'setpts=PTS/{args.speed:.8f}', *tail])}[vout]")
+    lines.append(f"[vcat]{','.join([f'setpts=PTS/{args.speed:.8f}', *tail])}[{video_label}]")
     lines.append(f"[acat]{','.join(build_audio_filters(args))}[aout]")
     return ";\n".join(lines) + "\n"
 
@@ -3340,6 +3423,7 @@ def render_segments(
         video_fps=media.video_fps,
         upright=media.upright,
         sdr=media.sdr,
+        size=(media.width, media.height),
     )
     filtergraph_path = workdir / filtergraph_name
     filtergraph_path.write_text(filtergraph, encoding="utf-8")

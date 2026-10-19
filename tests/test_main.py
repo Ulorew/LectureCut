@@ -1706,12 +1706,14 @@ class ReporterAndCancelTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 10.0)
 
 
-def make_tiny_lecture(path: Path, seconds: int = 10, extra: tuple[str, ...] = ()) -> None:
+def make_tiny_lecture(
+    path: Path, seconds: int = 10, extra: tuple[str, ...] = (), size: str = "64x48"
+) -> None:
     """Speech-like 1.5 s tone bursts with 1 s pauses, over a tiny test picture."""
 
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y",
-         "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=10:duration={seconds}",
+         "-f", "lavfi", "-i", f"testsrc=size={size}:rate=10:duration={seconds}",
          "-f", "lavfi", "-i",
          f"sine=frequency=300:duration={seconds},volume='if(lt(mod(t,2.5),1.5),0.3,0)':eval=frame",
          "-c:v", "libx264", "-pix_fmt", "yuv420p", *extra, "-c:a", "aac", "-shortest", str(path)],
@@ -1831,6 +1833,52 @@ class HdrTests(unittest.TestCase):
 
         self.assertEqual(results["auto"], "bt709,bt709")
         self.assertEqual(results["off"], "arib-std-b67,bt2020")
+
+
+class BoardTests(unittest.TestCase):
+    SEGMENTS = [main.Segment(0.0, 1.0), main.Segment(2.0, 3.0)]
+
+    def test_off_leaves_the_graph_alone(self):
+        args = main.parse_args(["in.mp4"])
+        graph = main.build_filtergraph(self.SEGMENTS, args, size=(1920, 1080))
+        self.assertNotIn("blend=all_mode=divide", graph)
+        self.assertIn("[vout]", graph)
+
+    def test_both_modes_divide_by_a_background_of_the_exact_frame_size(self):
+        for mode in ("clean", "ink"):
+            for graph_mode in ("select", "concat"):
+                args = main.parse_args(["in.mp4", f"--board={mode}", f"--filtergraph-mode={graph_mode}"])
+                graph = main.build_filtergraph(self.SEGMENTS, args, size=(1920, 1342))
+                with self.subTest(mode=mode, graph=graph_mode):
+                    self.assertIn("[vbase];", graph)
+                    self.assertIn("scale=1920:1342:flags=bicubic[bfond]", graph)
+                    self.assertTrue(graph.rstrip().endswith("[vout]"))
+                    self.assertEqual(graph.count("[vout]"), 1)
+
+    def test_a_quarter_turn_swaps_the_background_size(self):
+        args = main.parse_args(["in.mp4", "--board=clean"])
+        graph = main.build_filtergraph(self.SEGMENTS, args, size=(1920, 1080), upright=("transpose=clock",))
+        self.assertIn("scale=1080:1920:flags=bicubic", graph)
+
+    def test_an_unknown_frame_size_is_an_error_not_a_broken_graph(self):
+        args = main.parse_args(["in.mp4", "--board=ink"])
+        with self.assertRaises(main.PipelineError):
+            main.build_filtergraph(self.SEGMENTS, args, size=(0, 0))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_both_modes_render_a_frame_whose_height_does_not_divide_by_four(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "talk.mp4"
+            make_tiny_lecture(source, size="96x50")
+            for mode in ("clean", "ink"):
+                output = Path(directory) / f"{mode}.mp4"
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = main.main([str(source), "-o", str(output), "--encoder=libx264",
+                                      "--analysis-samples=2", f"--board={mode}"])
+                with self.subTest(mode=mode):
+                    self.assertEqual(code, 0)
+                    media = main.probe_media(output)
+                    self.assertEqual((media.width, media.height), (96, 50))
 
 
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:

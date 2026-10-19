@@ -60,6 +60,7 @@ The options worth knowing:
 | `--cq 28`, `--crf 23` | quality; higher means a smaller file |
 | `--max-fps 30` | cap the frame rate; halves a 60 fps screen recording |
 | `--tonemap auto` | convert HDR phone recordings to ordinary SDR |
+| `--board clean` | whiten the board and darken the marker; `ink` for a faint one |
 | `--mono` | downmix, for a recorder with one useful channel |
 | `--no-cut-silence` | keep the whole timeline, only clean and speed up |
 | `--live-dir DIR` | render through a playlist you can watch as it grows |

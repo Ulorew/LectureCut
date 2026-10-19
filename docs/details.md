@@ -218,6 +218,24 @@ much and, since mobius starts compressing at 30% of peak, dims the board too.
 The room's warm light does show now; it was hidden only because the colours
 were drained.
 
+## Whiteboard clean-up
+
+`--board clean` and `--board ink` are for a board that is hard to read: uneven
+light, a white balance that wanders as the camera adjusts, a faint marker. Each
+frame is divided by its own background - the frame shrunk, max-filtered so thin
+strokes vanish, blurred - which turns the board white wherever the light falls
+and leaves the strokes as the only dark parts. `clean` then sends near-white to
+white (erased-marker ghosts go), darkens strokes and keeps colour; `ink` builds
+its grey from green and blue, where a faded brown or orange marker keeps its
+contrast, and renders the strokes black.
+
+On a close shot with a faded marker, writing that had almost vanished became
+legible in both. The price is the people in front of the board, who come out
+harsh in `clean` and nearly black in `ink`, and the time: on 20 s of that
+lecture the render took 7 s without it, 27 s with `clean` and 22 s with `ink`,
+on a heavily loaded machine. Thickening the strokes as well was tried and merged
+subscripts.
+
 ## Recognising a finished render
 
 Every output is named `<stem>_lecturecut.mp4` and carries a `lecturecut`
