@@ -52,6 +52,8 @@ const state = {
   browsing: null,
   checked: new Set(),
   jobs: [],
+  // Results the file list has already been reloaded for.
+  listedOutputs: new Set(),
   watching: null,
   player: { jobId: null, mode: null, hls: null },
   stream: null,
@@ -1084,13 +1086,18 @@ async function refreshJobs() {
     state.jobs = data.jobs;
     renderJobs();
     renderQueueSummary(data.queue);
-    // Results land in folders the picker may not have listed yet.
-    if (state.jobs.some((job) => job.status === "done")) {
-      const known = new Set(state.files.map((file) => file.path));
-      const fresh = state.jobs.some(
-        (job) => job.result && job.result.output && !known.has(job.result.output)
-      );
-      if (fresh) await loadFiles();
+    // Results land in folders the picker may not have listed yet. Reload once
+    // per new result: one written outside the input folder never shows up in
+    // the listing, and retrying on every tick would rebuild the list - and
+    // reset its scroll - every 1.5 seconds for as long as the page is open.
+    const known = new Set(state.files.map((file) => file.path));
+    const fresh = state.jobs
+      .filter((job) => job.status === "done" && job.result && job.result.output)
+      .map((job) => job.result.output)
+      .filter((output) => !known.has(output) && !state.listedOutputs.has(output));
+    if (fresh.length) {
+      for (const output of fresh) state.listedOutputs.add(output);
+      await loadFiles();
     }
   } catch (error) {
     /* the poller keeps trying */
