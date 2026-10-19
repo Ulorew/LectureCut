@@ -1731,5 +1731,49 @@ class FrameRateCapTests(unittest.TestCase):
                 self.assertRegex(graph, r",fps=30,hflip,vflip\[vout\]")
 
 
+class DownloadCacheTests(unittest.TestCase):
+    @staticmethod
+    def fake_ytdlp(command, capture=False, **kwargs):
+        # Mimics yt-dlp: a file already at source.mp4 counts as downloaded and
+        # is printed again without fetching the new URL.
+        workdir = Path(command[command.index("-P") + 1])
+        target = workdir / "source.mp4"
+        if not target.exists():
+            target.write_text(command[-1])
+        return subprocess.CompletedProcess(command, 0, stdout=f"{target}\n", stderr="")
+
+    def fetch(self, url, workdir, fmt="best"):
+        with unittest.mock.patch.object(main, "require_command"), unittest.mock.patch.object(
+            main, "run_command", side_effect=self.fake_ytdlp
+        ) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            path = main.prepare_input(url, workdir, fmt)
+        return path, run
+
+    def test_a_reused_workdir_downloads_a_new_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            first, _ = self.fetch("https://example.com/a", workdir)
+            self.assertEqual(first.read_text(), "https://example.com/a")
+            second, _ = self.fetch("https://example.com/b", workdir)
+            self.assertEqual(second.read_text(), "https://example.com/b")
+
+    def test_the_same_url_keeps_its_cached_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            first, _ = self.fetch("https://example.com/a", workdir)
+            first.write_text("cached")
+            second, _ = self.fetch("https://example.com/a", workdir)
+            self.assertEqual(second.read_text(), "cached")
+
+    def test_an_unrecorded_leftover_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "source.webm").write_text("old")
+            (workdir / "source.mp4.part").write_text("old")
+            path, _ = self.fetch("https://example.com/a", workdir)
+            self.assertEqual(path.read_text(), "https://example.com/a")
+            self.assertEqual(sorted(p.name for p in workdir.glob("source.*")), ["source.mp4"])
+
+
 if __name__ == "__main__":
     unittest.main()

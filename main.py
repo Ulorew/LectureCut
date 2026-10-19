@@ -1275,6 +1275,10 @@ def is_already_processed(path: Path) -> bool:
     return name_suggests_output(path)
 
 
+# Named outside the source.* pattern so the fallback glob never returns it.
+DOWNLOAD_MARKER = ".lecturecut-download.json"
+
+
 def prepare_input(source: str, workdir: Path, download_format: str) -> Path:
     if not is_url(source):
         input_path = Path(source).expanduser()
@@ -1283,6 +1287,22 @@ def prepare_input(source: str, workdir: Path, download_format: str) -> Path:
         return input_path
 
     require_command("yt-dlp")
+    # yt-dlp writes to the fixed name source.%(ext)s and skips a download whose
+    # file is already there, so a reused --workdir handed back the previous
+    # URL's video under the new name (and the source.* fallback picked it too).
+    # The URL and format of the cached download are recorded beside it; on any
+    # mismatch the old source.* files, partial ones included, are removed first.
+    marker = workdir / DOWNLOAD_MARKER
+    wanted = {"url": source, "format": download_format}
+    try:
+        recorded = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        recorded = None
+    if recorded != wanted:
+        marker.unlink(missing_ok=True)
+        for stale in workdir.glob("source.*"):
+            if stale.is_file():
+                stale.unlink()
     command = [
         "yt-dlp",
         "--no-playlist",
@@ -1301,13 +1321,14 @@ def prepare_input(source: str, workdir: Path, download_format: str) -> Path:
     report("Downloading input with yt-dlp...")
     result = run_command(command, capture=True)
     candidates = [Path(line.strip()) for line in result.stdout.splitlines() if line.strip()]
-    for candidate in reversed(candidates):
-        if candidate.exists():
-            return candidate
-    files = sorted(workdir.glob("source.*"), key=lambda path: path.stat().st_mtime)
-    if files:
-        return files[-1]
-    raise PipelineError("yt-dlp finished, but no downloaded file was found")
+    downloaded = next((path for path in reversed(candidates) if path.exists()), None)
+    if downloaded is None:
+        files = sorted(workdir.glob("source.*"), key=lambda path: path.stat().st_mtime)
+        if not files:
+            raise PipelineError("yt-dlp finished, but no downloaded file was found")
+        downloaded = files[-1]
+    marker.write_text(json.dumps(wanted), encoding="utf-8")
+    return downloaded
 
 
 def probe_media(
