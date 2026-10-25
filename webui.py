@@ -688,7 +688,7 @@ class Config:
 
         if folder.is_dir():
             return folder
-        moved = relocated_folder(folder)
+        moved = core.relocated_folder(folder)
         if moved is None:
             return folder
         self.recent_source_dirs = [
@@ -741,62 +741,6 @@ def source_dir_allowed(folder: Path, config: Config) -> bool:
         if not any(part.startswith(".") for part in inside.parts):
             return True
     return False
-
-
-def mount_points() -> list[Path]:
-    """Where real drives are mounted now, the root excepted (Linux; [] elsewhere)."""
-
-    try:
-        lines = Path("/proc/self/mounts").read_text().splitlines()
-    except OSError:
-        return []
-    points: list[Path] = []
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 2 or not fields[0].startswith("/dev/"):
-            continue
-        # mounts escapes spaces and the like as octal: \040
-        target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
-        if target != "/":
-            points.append(Path(target))
-    return points
-
-
-def readable_dir(path: Path) -> bool:
-    """is_dir without the PermissionError it raises under /boot/efi and the like."""
-
-    try:
-        return path.is_dir()
-    except OSError:
-        return False
-
-
-def relocated_folder(folder: Path, mounts: list[Path] | None = None) -> Path | None:
-    """The same folder on a drive now mounted somewhere else, if that is certain.
-
-    A remembered folder lives at a path that names its mount point, and that
-    point changes: the same lectures drive was /mnt/sda3, then
-    /media/<user>/Data, then /mnt/sda3 again, as device letters and labels
-    moved. The tail of the path below the mount point does not move, so it is
-    looked for under every current mount - longest tail first, at least two
-    components, and only a single match counts.
-    """
-
-    parts = folder.parts[1:]  # without the leading "/"
-    for start in range(1, len(parts) - 1):
-        tail = parts[start:]
-        if len(tail) < 2:
-            break
-        found = {
-            mount.joinpath(*tail)
-            for mount in (mount_points() if mounts is None else mounts)
-            if readable_dir(mount.joinpath(*tail))
-        }
-        if len(found) == 1:
-            return found.pop()
-        if found:
-            return None  # ambiguous: better "unavailable" than someone else's folder
-    return None
 
 
 def walk_limited(

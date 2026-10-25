@@ -96,6 +96,25 @@ it at, so it refuses a `--host` other than loopback unless you add
 `--no-browse --no-open --no-upload` narrows it to the `--root` folders if you
 ever need to.
 
+## New lectures from Yandex Disk
+
+`lecturecut-watch` follows shared Yandex Disk folders and processes what
+appears in them:
+
+```bash
+lecturecut-watch add https://disk.yandex.ru/d/... --to ~/Lectures/Course -- --max-fps=30
+lecturecut-watch run --dry-run     # what is new
+lecturecut-watch install-timer     # run every hour, as a systemd user timer
+lecturecut-watch list
+```
+
+Files already in the share when it is added count as known; later ones are
+downloaded into `.incoming` (resuming a dropped download, checked against the
+disk's sha256), processed with the options after `--`, and the raw file is
+deleted. A folder on a drive that is not mounted is skipped rather than created
+on the system disk, and one that moved to another mount point is followed.
+Standard library only, like the command line tool.
+
 ## Tests
 
 ```bash

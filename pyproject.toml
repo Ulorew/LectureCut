@@ -15,6 +15,7 @@ web = ["fastapi>=0.110", "uvicorn>=0.27"]
 [project.scripts]
 lecturecut = "main:main"
 lecturecut-web = "webui:serve"
+lecturecut-watch = "watch:main"
 
 [tool.setuptools]
-py-modules = ["main", "webui"]
+py-modules = ["main", "webui", "watch"]

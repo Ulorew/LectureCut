@@ -435,7 +435,7 @@ class SourceFolderTests(unittest.TestCase):
         )
         self.client = TestClient(webui.create_app(self.config))
         # The machine's real drives must not answer for a test's missing folder.
-        self.mounts = unittest.mock.patch.object(webui, "mount_points", lambda: [])
+        self.mounts = unittest.mock.patch.object(webui.core, "mount_points", lambda: [])
         self.mounts.start()
 
     def tearDown(self):
@@ -694,7 +694,7 @@ class MovedDriveTests(unittest.TestCase):
         (self.new / "lecture.MOV").write_bytes(b"x")
         self.state = self.base / "config" / "webui.json"
         self.state.parent.mkdir()
-        self.mounts = unittest.mock.patch.object(webui, "mount_points", lambda: [self.mount])
+        self.mounts = unittest.mock.patch.object(webui.core, "mount_points", lambda: [self.mount])
         self.mounts.start()
 
     def tearDown(self):
@@ -705,16 +705,16 @@ class MovedDriveTests(unittest.TestCase):
         return webui.Config(roots=[self.base], upload_dir=self.base / "uploads", state_path=self.state)
 
     def test_the_tail_below_the_mount_point_is_found_again(self):
-        self.assertEqual(webui.relocated_folder(self.old, [self.mount]), self.new)
+        self.assertEqual(webui.core.relocated_folder(self.old, [self.mount]), self.new)
 
     def test_two_drives_holding_the_tail_are_not_guessed_between(self):
         twin = self.base / "mnt" / "backup"
         (twin / "Media" / "Lectures" / "RP").mkdir(parents=True)
-        self.assertIsNone(webui.relocated_folder(self.old, [self.mount, twin]))
+        self.assertIsNone(webui.core.relocated_folder(self.old, [self.mount, twin]))
 
     def test_a_one_component_tail_is_not_enough(self):
         (self.mount / "RP").mkdir()
-        self.assertIsNone(webui.relocated_folder(self.base / "gone" / "RP", [self.mount]))
+        self.assertIsNone(webui.core.relocated_folder(self.base / "gone" / "RP", [self.mount]))
 
     def test_a_restart_finds_the_drive_and_heals_the_state_file(self):
         self.state.write_text(json.dumps({
