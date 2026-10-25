@@ -434,8 +434,12 @@ class SourceFolderTests(unittest.TestCase):
             state_path=self.state,
         )
         self.client = TestClient(webui.create_app(self.config))
+        # The machine's real drives must not answer for a test's missing folder.
+        self.mounts = unittest.mock.patch.object(webui, "mount_points", lambda: [])
+        self.mounts.start()
 
     def tearDown(self):
+        self.mounts.stop()
         self.client.close()
         self.temp.cleanup()
 
@@ -674,6 +678,87 @@ class SourceFolderTests(unittest.TestCase):
         self.assertEqual(walk(limit=5), ["old.mp4", "zz.mp4"])
         # Looking at names is what costs time, so that is bounded too.
         self.assertEqual(walk(limit=5, scan_limit=5), [])
+
+
+@unittest.skipIf(TestClient is None, "install the web extra to run these tests")
+class MovedDriveTests(unittest.TestCase):
+    """The lectures drive came back at another mount point."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name).resolve()
+        self.old = self.base / "media" / "user" / "Data" / "Media" / "Lectures" / "RP"
+        self.mount = self.base / "mnt" / "sda3"
+        self.new = self.mount / "Media" / "Lectures" / "RP"
+        self.new.mkdir(parents=True)
+        (self.new / "lecture.MOV").write_bytes(b"x")
+        self.state = self.base / "config" / "webui.json"
+        self.state.parent.mkdir()
+        self.mounts = unittest.mock.patch.object(webui, "mount_points", lambda: [self.mount])
+        self.mounts.start()
+
+    def tearDown(self):
+        self.mounts.stop()
+        self.temp.cleanup()
+
+    def config(self):
+        return webui.Config(roots=[self.base], upload_dir=self.base / "uploads", state_path=self.state)
+
+    def test_the_tail_below_the_mount_point_is_found_again(self):
+        self.assertEqual(webui.relocated_folder(self.old, [self.mount]), self.new)
+
+    def test_two_drives_holding_the_tail_are_not_guessed_between(self):
+        twin = self.base / "mnt" / "backup"
+        (twin / "Media" / "Lectures" / "RP").mkdir(parents=True)
+        self.assertIsNone(webui.relocated_folder(self.old, [self.mount, twin]))
+
+    def test_a_one_component_tail_is_not_enough(self):
+        (self.mount / "RP").mkdir()
+        self.assertIsNone(webui.relocated_folder(self.base / "gone" / "RP", [self.mount]))
+
+    def test_a_restart_finds_the_drive_and_heals_the_state_file(self):
+        self.state.write_text(json.dumps({
+            "source_dir": str(self.old),
+            "recent_source_dirs": [str(self.new), str(self.old)],
+        }))
+        config = self.config()
+        config.load_state()
+
+        self.assertEqual(config.current_source_dir(), self.new)
+        self.assertEqual(config.recent_source_dirs, [self.new])  # one entry, not two
+        self.assertIn(self.new, config.roots)
+        saved = json.loads(self.state.read_text())
+        self.assertEqual(saved["recent_source_dirs"], [str(self.new)])
+
+    def test_picking_a_moved_folder_from_the_recent_list_works(self):
+        config = self.config()
+        config.recent_source_dirs = [self.old]
+        with TestClient(webui.create_app(config)) as client:
+            response = client.post("/api/source-dir", json={"path": str(self.old)})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["source_dir"], str(self.new))
+
+    def test_processed_flags_survive_a_restart(self):
+        cache = self.base / "config" / "processed.json"
+        media = [self.new / "lecture.MOV"]
+        with unittest.mock.patch.object(webui.core, "is_already_processed", return_value=False) as probe:
+            webui.ProcessedIndex(cache).flags(media)
+            webui.ProcessedIndex(cache).flags(media)  # a restart
+        self.assertEqual(probe.call_count, 1)
+
+        (self.new / "lecture.MOV").write_bytes(b"re-rendered")  # size changes
+        with unittest.mock.patch.object(webui.core, "is_already_processed", return_value=True) as probe:
+            flags = webui.ProcessedIndex(cache).flags(media)
+        self.assertEqual(probe.call_count, 1)
+        self.assertTrue(flags[str(media[0])])
+
+    def test_a_damaged_cache_only_costs_the_probes(self):
+        cache = self.base / "config" / "processed.json"
+        cache.write_text("{not json")
+        with unittest.mock.patch.object(webui.core, "is_already_processed", return_value=False) as probe:
+            webui.ProcessedIndex(cache).flags([self.new / "lecture.MOV"])
+        self.assertEqual(probe.call_count, 1)
 
 
 @unittest.skipIf(TestClient is None, "install the web extra to run these tests")

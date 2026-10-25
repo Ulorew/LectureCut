@@ -530,6 +530,15 @@ function resetFormState() {
 function renderFiles() {
   const list = el("file-list");
   list.textContent = "";
+  if (state.listing) {
+    // Anything that re-renders meanwhile (a language switch, say) must not
+    // claim the folder is empty while it is still being read.
+    const note = document.createElement("li");
+    note.className = "muted";
+    note.textContent = t("files.loading");
+    list.appendChild(note);
+    return;
+  }
   const matches = visibleFiles();
   if (!matches.length) {
     const empty = document.createElement("li");
@@ -672,7 +681,12 @@ async function describeFile(file) {
 }
 
 async function loadFiles() {
-  const data = await api("/api/files");
+  let data;
+  try {
+    data = await api("/api/files");
+  } finally {
+    state.listing = false;
+  }
   state.files = data.files;
   state.schema.source_dir = data.source_dir;
   renderSourceDir();
@@ -750,12 +764,14 @@ function openFolderBrowser() {
 
 async function chooseFolder(path) {
   if (!path) return;
+  showListing();
   try {
     const data = await api("/api/source-dir", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     });
+    state.listing = false;
     state.schema.source_dir = data.source_dir;
     state.schema.recent_source_dirs = data.recent_source_dirs;
     state.schema.unavailable_source_dirs = data.unavailable_source_dirs;
@@ -770,6 +786,8 @@ async function chooseFolder(path) {
     await loadDirs();
     if (el("folder-dialog").open) el("folder-dialog").close();
   } catch (error) {
+    state.listing = false;
+    renderFiles(); // the old folder is still the current one
     const message = t("folder.failed", { error: error.message });
     if (el("folder-dialog").open) {
       el("folder-note").classList.add("warn");
@@ -1350,9 +1368,13 @@ async function init() {
   }
   applyDefaults();
   buildAdvanced();
-  await Promise.all([loadFiles(), loadDirs()]);
+  // The folder controls need nothing but the schema. They used to wait for the
+  // file listing, which reads every file's tag and took 5-10 s on a cold
+  // external drive - with "Change..." and the recent folders dead meanwhile.
+  renderSourceDir();
+  showListing();
+  await loadDirs();
   restoreFormState();
-  await refreshJobs();
 
   el("file-filter").addEventListener("input", renderFiles);
   for (const button of document.querySelectorAll("#lang-switch button")) {
@@ -1458,7 +1480,14 @@ async function init() {
   window.addEventListener("drop", (event) => event.preventDefault());
 
   applyLanguage();
+  await loadFiles();
+  await refreshJobs();
   state.poller = setInterval(refreshJobs, JOB_POLL_MS);
+}
+
+function showListing() {
+  state.listing = true;
+  renderFiles();
 }
 
 init().catch((error) => {

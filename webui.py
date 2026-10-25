@@ -601,6 +601,7 @@ class Config:
     recent_source_dirs: list[Path] = field(default_factory=list)
     state_path: Path | None = None
     throughput_path: Path | None = None
+    processed_path: Path | None = None
     allowed_hosts: set[str] | None = None
     require_csrf_header: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -665,19 +666,35 @@ class Config:
             return
         # The same rule as choosing one, so a folder saved before it existed
         # does not come back through the file.
-        recent = [Path(p) for p in payload.get("recent_source_dirs") or []]
+        saved = [Path(p) for p in payload.get("recent_source_dirs") or []]
+        recent = [self.locate(p) for p in saved]
         # Missing folders stay (a drive that is not mounted yet), forbidden ones go.
-        self.recent_source_dirs = [
-            d for d in recent if source_dir_allowed(d, self)
-        ][:RECENT_SOURCE_DIRS]
+        self.recent_source_dirs = list(
+            dict.fromkeys(d for d in recent if source_dir_allowed(d, self))
+        )[:RECENT_SOURCE_DIRS]
         for folder in self.recent_source_dirs:
             if folder.is_dir() and folder not in self.roots:
                 self.roots.append(folder)
         chosen = payload.get("source_dir")
-        if chosen and source_dir_allowed(Path(chosen), self):
-            self.source_dir = Path(chosen)
+        if chosen and source_dir_allowed(self.locate(Path(chosen)), self):
+            self.source_dir = self.locate(Path(chosen))
             if self.source_dir.is_dir() and self.source_dir not in self.roots:
                 self.roots.append(self.source_dir)
+        if recent != saved or (chosen and self.source_dir != Path(chosen)):
+            self.save_state()  # a drive found at its new mount point stays found
+
+    def locate(self, folder: Path) -> Path:
+        """folder itself, or where its drive is mounted now if it has moved."""
+
+        if folder.is_dir():
+            return folder
+        moved = relocated_folder(folder)
+        if moved is None:
+            return folder
+        self.recent_source_dirs = [
+            moved if d == folder else d for d in self.recent_source_dirs
+        ]
+        return moved
 
     def recent_payload(self) -> dict[str, list[str]]:
         """The remembered folders, and which of them cannot be opened now."""
@@ -724,6 +741,62 @@ def source_dir_allowed(folder: Path, config: Config) -> bool:
         if not any(part.startswith(".") for part in inside.parts):
             return True
     return False
+
+
+def mount_points() -> list[Path]:
+    """Where real drives are mounted now, the root excepted (Linux; [] elsewhere)."""
+
+    try:
+        lines = Path("/proc/self/mounts").read_text().splitlines()
+    except OSError:
+        return []
+    points: list[Path] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 2 or not fields[0].startswith("/dev/"):
+            continue
+        # mounts escapes spaces and the like as octal: \040
+        target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
+        if target != "/":
+            points.append(Path(target))
+    return points
+
+
+def readable_dir(path: Path) -> bool:
+    """is_dir without the PermissionError it raises under /boot/efi and the like."""
+
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def relocated_folder(folder: Path, mounts: list[Path] | None = None) -> Path | None:
+    """The same folder on a drive now mounted somewhere else, if that is certain.
+
+    A remembered folder lives at a path that names its mount point, and that
+    point changes: the same lectures drive was /mnt/sda3, then
+    /media/<user>/Data, then /mnt/sda3 again, as device letters and labels
+    moved. The tail of the path below the mount point does not move, so it is
+    looked for under every current mount - longest tail first, at least two
+    components, and only a single match counts.
+    """
+
+    parts = folder.parts[1:]  # without the leading "/"
+    for start in range(1, len(parts) - 1):
+        tail = parts[start:]
+        if len(tail) < 2:
+            break
+        found = {
+            mount.joinpath(*tail)
+            for mount in (mount_points() if mounts is None else mounts)
+            if readable_dir(mount.joinpath(*tail))
+        }
+        if len(found) == 1:
+            return found.pop()
+        if found:
+            return None  # ambiguous: better "unavailable" than someone else's folder
+    return None
 
 
 def walk_limited(
@@ -968,16 +1041,42 @@ def model_catalogue() -> list[dict[str, Any]]:
 
 
 class ProcessedIndex:
-    """Remembers which files already carry a LectureCut tag.
+    """Remembers which files already carry a LectureCut tag, across restarts.
 
-    Reading the tag costs an ffprobe call - around 30 ms - which is nothing once,
-    and far too much on every listing of a full archive. Results are keyed by
-    path, size and mtime, so a re-render invalidates its own entry.
+    Reading the tag costs an ffprobe call. Warm that is ~0.1 s a file; on a
+    cold external NTFS drive, reading the headers of thirty-five 0.5-6 GB
+    recordings kept the first listing 5-10 s behind every server start, and
+    with it the whole page. Results are keyed by path, size and mtime - a
+    re-render invalidates its own entry - and saved, so a restart needs only a
+    stat per file.
     """
 
-    def __init__(self) -> None:
+    MAX_ENTRIES = 5000
+
+    def __init__(self, path: Path | None = None) -> None:
         self._cache: dict[tuple[str, int, float], bool] = {}
         self._lock = threading.Lock()
+        self._path = path
+        if path is not None:
+            try:
+                rows = json.loads(path.read_text())
+                for row in rows[-self.MAX_ENTRIES :]:
+                    self._cache[(str(row[0]), int(row[1]), float(row[2]))] = bool(row[3])
+            except (OSError, ValueError, TypeError, IndexError):
+                pass  # no file yet, or a damaged one: probe again
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
+        with self._lock:
+            rows = [[*key, value] for key, value in self._cache.items()][-self.MAX_ENTRIES :]
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._path.with_name(f".{self._path.name}.part")
+            temporary.write_text(json.dumps(rows, ensure_ascii=False))
+            os.replace(temporary, self._path)
+        except OSError:
+            pass  # a lost cache only costs the probes again
 
     def flags(self, paths: list[Path]) -> dict[str, bool]:
         keys: dict[str, tuple[str, int, float]] = {}
@@ -1007,6 +1106,7 @@ class ProcessedIndex:
             with self._lock:
                 for (_, key), value in zip(unknown, results):
                     self._cache[key] = value
+            self._save()
 
         with self._lock:
             return {path: self._cache.get(key, False) for path, key in keys.items()}
@@ -1111,7 +1211,7 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         return response
 
     manager = jobs or JobManager(ThroughputModel.load(config.throughput_path))
-    processed = ProcessedIndex()
+    processed = ProcessedIndex(config.processed_path)
     app.state.config = config
     app.state.jobs = manager
     app.state.processed = processed
@@ -1195,6 +1295,8 @@ def create_app(config: Config, jobs: JobManager | None = None) -> FastAPI:
         if not config.allow_browse:
             raise HTTPException(status_code=403, detail="Choosing folders is disabled")
         raw = str(payload.get("path") or "")
+        if Path(raw) in config.recent_source_dirs:
+            raw = str(config.locate(Path(raw)))  # its drive may be mounted elsewhere now
         try:
             folder = Path(raw).expanduser().resolve(strict=True)
         except (FileNotFoundError, RuntimeError):
@@ -1563,6 +1665,7 @@ def build_config(args: argparse.Namespace) -> Config:
         live_preview=not args.no_live_preview,
         state_path=state_file_path(),
         throughput_path=state_file_path().with_name("throughput.json"),
+        processed_path=state_file_path().with_name("processed.json"),
         allowed_hosts=allowed_hosts_for(args.host, args.port),
         require_csrf_header=True,
         source_dir=default_source,
