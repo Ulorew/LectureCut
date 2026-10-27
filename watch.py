@@ -2,6 +2,7 @@
 
     lecturecut-watch add LINK --to DIR [--path /Lectures ...] [-- lecturecut options]
     lecturecut-watch list
+    lecturecut-watch fetch [--missing] [NAME ...]
     lecturecut-watch run [--dry-run]
     lecturecut-watch install-timer
 
@@ -346,6 +347,48 @@ def process_one(watch: dict, folder: Path, item: dict, entry: dict, save) -> boo
         return False
 
 
+def present_locally(folder: Path, name: str) -> bool:
+    """A recording that is already here, raw or processed."""
+
+    stem = Path(name).stem.lower()
+    for path in (*folder.iterdir(), *((folder / INCOMING).iterdir() if (folder / INCOMING).is_dir() else ())):
+        lower = path.name.lower()
+        if lower == name.lower() or lower.startswith(stem + "_lecturecut"):
+            return True
+    return False
+
+
+def command_fetch(args: argparse.Namespace, config: dict, state: dict) -> int:
+    """Queue files the watch counts as known: by name, or all missing here.
+
+    A watch starts by treating what is already shared as known, so recordings
+    uploaded before it was added are never fetched on their own.
+    """
+
+    if not args.missing and not args.patterns:
+        raise WatchError("name the files to fetch (parts of their names), or use --missing")
+    queued = 0
+    for watch in config["watches"]:
+        if args.watch and watch["name"] != args.watch:
+            continue
+        folder = destination(watch)
+        if folder is None and args.missing:
+            raise WatchError(f"{watch['name']}: {watch['to']} is not available, cannot tell what is missing")
+        for path, entry in sorted(state.get(watch["name"], {}).get("files", {}).items()):
+            if entry["status"] not in ("known", "failed", "done"):
+                continue
+            name = Path(path).name
+            wanted = any(pattern.lower() in name.lower() for pattern in args.patterns) or (
+                args.missing and not present_locally(folder, name)
+            )
+            if wanted:
+                entry.update(status="new", attempts=0, error="")
+                queued += 1
+                say(f"{watch['name']}: queued {path}")
+    say(f"{queued} file(s) queued; the next run fetches them" if queued else "Nothing matched")
+    return 0
+
+
 def command_install_timer(args: argparse.Namespace, config: dict, state: dict) -> int:
     units = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
     units.mkdir(parents=True, exist_ok=True)
@@ -406,6 +449,10 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--keep-raw", action="store_true", help="keep downloads in .incoming after processing")
 
     sub.add_parser("list", help="show watches and the state of their files")
+    fetch = sub.add_parser("fetch", help="queue files the watch counts as known")
+    fetch.add_argument("patterns", nargs="*", help="parts of file names, e.g. Lecture_05")
+    fetch.add_argument("--missing", action="store_true", help="everything not here, raw or processed")
+    fetch.add_argument("--watch", help="only this watch")
     run = sub.add_parser("run", help="one pass: fetch and process what is new")
     run.add_argument("--dry-run", action="store_true", help="only say what is new")
     timer = sub.add_parser("install-timer", help="run every hour with a systemd user timer")
@@ -447,6 +494,10 @@ def main(argv: list[str] | None = None) -> int:
                 return code
             if args.command == "list":
                 return command_list(args, config, state)
+            if args.command == "fetch":
+                code = command_fetch(args, config, state)
+                save()
+                return code
             if args.command == "run":
                 return command_run(args, config, state, save)
             return command_install_timer(args, config, state)

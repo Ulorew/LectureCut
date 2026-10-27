@@ -256,6 +256,28 @@ class WatchRunTests(unittest.TestCase):
         self.assertEqual(len(self.processed), 2)
         self.assertTrue((self.to / "Lecture_02_lecturecut.mp4").exists())
 
+    def test_fetch_queues_known_files_by_name(self):
+        self.add()
+        code, _ = self.cli("fetch", "Lecture_01")
+        self.assertEqual(code, 0)
+        self.cli("run")
+        self.assertEqual([name for name, _ in self.processed], ["Lecture_01.MOV"])
+
+    def test_fetch_missing_skips_what_is_here_raw_or_processed(self):
+        self.share["/Lectures"] += [self.item("/Lectures/Lecture_02.MOV"), self.item("/Lectures/Lecture_03.MOV")]
+        self.bodies.update({"/Lectures/Lecture_02.MOV": b"two", "/Lectures/Lecture_03.MOV": b"three"})
+        self.add()
+        (self.to / "Lecture_01_lecturecut.mp4").write_bytes(b"done before")
+        (self.to / "lecture_03.mov").write_bytes(b"raw, other case")
+        self.cli("fetch", "--missing")
+        self.cli("run")
+        self.assertEqual([name for name, _ in self.processed], ["Lecture_02.MOV"])
+
+    def test_fetch_needs_something_to_fetch(self):
+        self.add()
+        code, out = self.cli("fetch")
+        self.assertEqual(code, 1)
+
     def test_options_lecturecut_would_reject_are_refused_when_added(self):
         code, out = self.add("--speed=inf")
         self.assertEqual(code, 1)
