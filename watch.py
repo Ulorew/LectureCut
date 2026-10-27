@@ -8,7 +8,7 @@
 
 A watch is a public folder link and a local folder. What the link already holds
 when the watch is added counts as known; files that appear later are downloaded
-into DIR/.incoming, verified against the sha256 the disk reports, processed with
+into a local cache, verified against the sha256 the disk reports, processed with
 the watch's own options into DIR, and the raw download is then deleted. A failed
 step keeps the raw file and is retried on the next run, up to MAX_ATTEMPTS.
 
@@ -39,7 +39,9 @@ from typing import Any, Iterator
 import main as core
 
 API = "https://cloud-api.yandex.net/v1/disk/public/resources"
-INCOMING = ".incoming"
+# The render writes its result (and a temporary one) next to it: about a
+# tenth of the recording, reserved here as a quarter to be safe.
+OUTPUT_SHARE = 0.25
 MAX_ATTEMPTS = 3
 CHUNK = 8 * 1024 * 1024
 # Room to leave on the drive beyond the download itself: the render writes
@@ -198,6 +200,21 @@ def say(text: str) -> None:
     print(text, flush=True)
 
 
+def incoming_dir(watch: dict[str, Any]) -> Path:
+    """Where raw downloads wait: the local cache, not the destination drive.
+
+    The lectures drive is an NTFS HDD through FUSE that took writes at 9.6 MB/s
+    while the network gave 25 MB/s, so downloading onto it made a 5.5 GB
+    lecture a 25-minute wait. The raw file is deleted after processing anyway;
+    on the local SSD (474 MB/s) the drive only ever receives the ~0.5 GB result.
+    """
+
+    if watch.get("incoming"):
+        return Path(watch["incoming"]).expanduser()
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "lecturecut" / "incoming" / watch["name"]
+
+
 def destination(watch: dict[str, Any]) -> Path | None:
     """The watch's folder, followed to a new mount point; None when absent.
 
@@ -306,21 +323,20 @@ def command_run(args: argparse.Namespace, config: dict, state: dict, save) -> in
 
 
 def process_one(watch: dict, folder: Path, item: dict, entry: dict, save) -> bool:
-    incoming = folder / INCOMING
+    incoming = incoming_dir(watch)
     raw = incoming / item["name"]
     entry["attempts"] = entry.get("attempts", 0) + 1
     entry["updated"] = now()
     try:
         if entry["status"] != "downloaded" or not raw.exists():
             size = int(item.get("size") or 0)
-            incoming.mkdir(exist_ok=True)
+            incoming.mkdir(parents=True, exist_ok=True)
             part = raw.with_name(raw.name + ".part")
             already = part.stat().st_size if part.exists() else 0
-            free = shutil.disk_usage(folder).free
-            if free < size - already + SPACE_MARGIN:
-                raise WatchError(
-                    f"needs {(size - already) / 1e9:.1f} GB, {free / 1e9:.1f} GB free on {folder}"
-                )
+            for where, need in ((incoming, size - already), (folder, size * OUTPUT_SHARE)):
+                free = shutil.disk_usage(where).free
+                if free < need + SPACE_MARGIN:
+                    raise WatchError(f"needs {need / 1e9:.1f} GB, {free / 1e9:.1f} GB free on {where}")
             download(download_link(watch["link"], item["path"]), raw, size=size, sha256=item.get("sha256"))
             entry.update(status="downloaded", error="")
             save()
@@ -347,11 +363,12 @@ def process_one(watch: dict, folder: Path, item: dict, entry: dict, save) -> boo
         return False
 
 
-def present_locally(folder: Path, name: str) -> bool:
+def present_locally(watch: dict[str, Any], folder: Path, name: str) -> bool:
     """A recording that is already here, raw or processed."""
 
     stem = Path(name).stem.lower()
-    for path in (*folder.iterdir(), *((folder / INCOMING).iterdir() if (folder / INCOMING).is_dir() else ())):
+    incoming = incoming_dir(watch)
+    for path in (*folder.iterdir(), *(incoming.iterdir() if incoming.is_dir() else ())):
         lower = path.name.lower()
         if lower == name.lower() or lower.startswith(stem + "_lecturecut"):
             return True
@@ -379,7 +396,7 @@ def command_fetch(args: argparse.Namespace, config: dict, state: dict) -> int:
                 continue
             name = Path(path).name
             wanted = any(pattern.lower() in name.lower() for pattern in args.patterns) or (
-                args.missing and not present_locally(folder, name)
+                args.missing and not present_locally(watch, folder, name)
             )
             if wanted:
                 entry.update(status="new", attempts=0, error="")
@@ -401,8 +418,11 @@ def command_install_timer(args: argparse.Namespace, config: dict, state: dict) -
         f"WorkingDirectory={script.parent}\n"
         f"ExecStart={sys.executable} {script} run\n"
         # A render is long and heavy; it should yield to whatever you are doing.
+        # Lowest best-effort I/O rather than idle: under idle the download
+        # starved to a crawl whenever anything else wrote to the same drive.
         "Nice=10\n"
-        "IOSchedulingClass=idle\n",
+        "IOSchedulingClass=best-effort\n"
+        "IOSchedulingPriority=7\n",
         encoding="utf-8",
     )
     (units / f"{TIMER_NAME}.timer").write_text(
@@ -446,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--to", required=True, help="local folder for the processed lectures")
     add.add_argument("--path", action="append", default=[], help="folder inside the share; repeatable; default all")
     add.add_argument("--name", help="a short name for the watch")
-    add.add_argument("--keep-raw", action="store_true", help="keep downloads in .incoming after processing")
+    add.add_argument("--keep-raw", action="store_true", help="keep raw downloads in the local cache after processing")
 
     sub.add_parser("list", help="show watches and the state of their files")
     fetch = sub.add_parser("fetch", help="queue files the watch counts as known")

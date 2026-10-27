@@ -126,7 +126,8 @@ class WatchRunTests(unittest.TestCase):
         self.bodies = {"/Lectures/Lecture_01.MOV": b"old lecture"}
         self.processed = []
         patches = [
-            unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home)}),
+            unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config_home),
+                                                  "XDG_CACHE_HOME": str(base / "cache")}),
             unittest.mock.patch.object(watch, "api_get", self.fake_api),
             unittest.mock.patch.object(watch, "download", self.fake_download),
             unittest.mock.patch.object(watch.core, "main", self.fake_render),
@@ -192,7 +193,9 @@ class WatchRunTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.processed, [("Lecture_02.MOV", ["--if-exists=suffix", "--max-fps=30", "--silence-bias=5"])])
         self.assertEqual((self.to / "Lecture_02_lecturecut.mp4").read_bytes(), b"rendered new lecture")
-        self.assertFalse((self.to / ".incoming").exists())  # raw gone, folder gone
+        incoming = Path(self.temp.name) / "cache" / "lecturecut" / "incoming" / "rp"
+        self.assertFalse(incoming.exists() and any(incoming.iterdir()))  # the raw file is gone
+        self.assertEqual(sorted(p.name for p in self.to.iterdir()), ["Lecture_02_lecturecut.mp4"])
         entry = self.state()["rp"]["files"]["/Lectures/Lecture_02.MOV"]
         self.assertEqual(entry["status"], "done")
 
@@ -206,7 +209,8 @@ class WatchRunTests(unittest.TestCase):
         self.render_code = 1
         code, out = self.cli("run")
         self.assertEqual(code, 1)
-        self.assertTrue((self.to / ".incoming" / "Lecture_02.MOV").exists())
+        self.assertTrue((Path(self.temp.name) / "cache" / "lecturecut" / "incoming" / "rp" / "Lecture_02.MOV").exists())
+        self.assertFalse(any(self.to.iterdir()))  # nothing raw on the destination drive
         self.assertEqual(self.state()["rp"]["files"]["/Lectures/Lecture_02.MOV"]["status"], "downloaded")
 
         self.render_code = 0
@@ -291,6 +295,35 @@ class WatchRunTests(unittest.TestCase):
             code, out = self.cli("run")
         self.assertEqual(code, 0)
         self.assertIn("Another lecturecut-watch is running", out)
+
+    def test_raw_files_never_touch_the_destination_drive(self):
+        self.add()
+        self.new_lecture()
+        written = []
+        real = self.fake_download
+
+        def spy(href, dest, *, size, sha256):
+            written.append(dest)
+            real(href, dest, size=size, sha256=sha256)
+
+        with unittest.mock.patch.object(watch, "download", spy):
+            self.cli("run")
+        self.assertTrue(written)
+        self.assertFalse(any(self.to in dest.parents for dest in written))
+
+    def test_the_destination_needs_room_for_the_result_too(self):
+        self.add()
+        self.new_lecture()
+
+        def usage(path):
+            free = 10 if Path(path) == self.to else 10**12
+            return unittest.mock.Mock(free=free)
+
+        with unittest.mock.patch.object(watch.shutil, "disk_usage", usage), \
+                unittest.mock.patch.object(watch, "download", side_effect=AssertionError("downloaded")):
+            code, out = self.cli("run")
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.to), out)
 
     def test_not_enough_space_fails_before_downloading(self):
         self.add()

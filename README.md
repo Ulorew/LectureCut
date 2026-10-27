@@ -108,10 +108,11 @@ lecturecut-watch install-timer     # run every hour, as a systemd user timer
 lecturecut-watch list
 ```
 
-Files already in the share when it is added count as known; later ones are
-downloaded into `.incoming` (resuming a dropped download, checked against the
-disk's sha256), processed with the options after `--`, and the raw file is
-deleted. A folder on a drive that is not mounted is skipped rather than created
+Files already in the share when it is added count as known (`fetch NAME` or
+`fetch --missing` queues them anyway); later ones are downloaded into
+`~/.cache/lecturecut/incoming` (resuming a dropped download, checked against the
+disk's sha256), processed with the options after `--` into the folder, and the
+raw file is deleted - so a slow destination drive only ever receives results. A folder on a drive that is not mounted is skipped rather than created
 on the system disk, and one that moved to another mount point is followed.
 Standard library only, like the command line tool.
 
