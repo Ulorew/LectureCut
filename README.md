@@ -23,7 +23,7 @@ what they are, and what was tried and rejected.
 
 - FFmpeg with `ffprobe`, 6.0 or newer
 - Python 3.10 or newer
-- optional: `yt-dlp` for URL inputs, an NVIDIA card for `h264_nvenc`
+- optional: `yt-dlp` for URL inputs, an NVIDIA card and driver for CUDA/NVDEC decoding and NVENC encoding
 
 ```bash
 sudo apt install ffmpeg
@@ -57,12 +57,29 @@ The options worth knowing:
 | `--denoise auto` | `auto`, `afftdn`, `anlmdn`, `arnndn`, `none` |
 | `--target-lufs -17` | loudness to aim for |
 | `--encoder auto` | `auto` (NVENC), `libx264`, `hevc_nvenc` |
+| `--decoder auto` | NVIDIA CUDA/NVDEC decoding, with CPU fallback; `cuda` requires GPU, `cpu` disables it |
 | `--cq 28`, `--crf 23` | quality; higher means a smaller file |
 | `--mono` | downmix, for a recorder with one useful channel |
 | `--no-cut-silence` | keep the whole timeline, only clean and speed up |
 | `--live-dir DIR` | render through a playlist you can watch as it grows |
 
 `python3 main.py --help` lists the rest.
+
+GPU decoding is preferred by default in both the CLI and web UI. It is separate
+from encoding: `--encoder libx264` can still decode on NVIDIA. Use `--decoder cpu`
+to compare with software decoding, or `--decoder cuda` to require GPU decoding.
+The automatic mode retries a failed render with CPU decoding before changing
+encoders; the log and result report which decoder completed the render. The
+audio-only analysis and silence passes do not decode video.
+
+With NVENC and the default `select` mode, decoded frames stay on the GPU through
+the cuts and 8-bit conversion (`scale_cuda`). Rotation downloads only the kept
+frames. FFmpeg builds without that CUDA filter fall back to the CPU in `auto`
+mode. The CPU encoder, `concat` mode, and unusual display matrices use downloaded
+frames with the existing software filters.
+
+[GPU decoding details and measurements](docs/gpu-decoding.md) cover the CUDA
+path and a CPU/GPU comparison on a HEVC Main 10 lecture.
 
 An output is never overwritten: an existing name gets `_2`, `_3` and so on.
 `Ctrl+C` stops FFmpeg and removes the partial file.

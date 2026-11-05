@@ -751,6 +751,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     video_group = parser.add_argument_group("video")
     video_group.add_argument(
+        "--decoder",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="Video decoding; auto tries NVIDIA CUDA/NVDEC, then CPU; cuda requires NVIDIA",
+    )
+    video_group.add_argument(
         "--encoder",
         choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
         default="auto",
@@ -2657,8 +2663,18 @@ def build_filtergraph(
     *,
     video_fps: float = 30.0,
     upright: tuple[str, ...] | None = (),
+    cuda_frames: bool = False,
 ) -> str:
     tail = video_tail_filters(args, video_fps=video_fps, upright=upright)
+    if cuda_frames:
+        # select, setpts and fps only inspect metadata and can keep frames on
+        # the GPU. Convert to 8-bit there, too: NVENC's H.264 output needs it.
+        # Software rotation needs a download, but only for frames we keep.
+        rotation = list(upright or ())
+        tail = video_tail_filters(args, video_fps=video_fps, upright=())
+        tail.append("scale_cuda=format=yuv420p")
+        if rotation:
+            tail.extend(["hwdownload", "format=yuv420p", *rotation])
     if args.filtergraph_mode == "concat":
         return build_concat_filtergraph(segments, args, tail=tail)
     return build_select_filtergraph(segments, args, tail=tail)
@@ -2838,7 +2854,9 @@ def encoder_candidates(args: argparse.Namespace) -> list[str]:
     return ["libx264"]
 
 
-def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
+def video_encoder_args(
+    encoder: str, args: argparse.Namespace, *, cuda_output: bool = False
+) -> list[str]:
     if encoder == "h264_nvenc":
         return [
             "-c:v",
@@ -2850,7 +2868,7 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
             "-b:v",
             "0",
             "-pix_fmt",
-            "yuv420p",
+            "cuda" if cuda_output else "yuv420p",
         ]
     if encoder == "hevc_nvenc":
         return [
@@ -2863,7 +2881,7 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
             "-b:v",
             "0",
             "-pix_fmt",
-            "yuv420p",
+            "cuda" if cuda_output else "yuv420p",
         ]
     if encoder == "libx264":
         return [
@@ -2928,13 +2946,22 @@ def render_command(
     args: argparse.Namespace,
     live_dir: Path | None = None,
     manual_rotation: bool = False,
+    decoder: str | None = None,
+    cuda_frames: bool = False,
+    cuda_output: bool = False,
 ) -> list[str]:
+    decoder = decoder or ("cuda" if args.decoder == "auto" else args.decoder)
     command = [
         "ffmpeg",
         "-hide_banner",
         "-y",
         "-nostdin",
         *ffmpeg_input_options(args.start, args.limit),
+        # The ordinary graph expects host frames. The CUDA graph keeps them
+        # on the device through the cuts and conversion, downloading only
+        # when software rotation requires it.
+        *(["-hwaccel", "cuda"] if decoder == "cuda" else []),
+        *(["-hwaccel_output_format", "cuda"] if cuda_frames else []),
         # The filtergraph turns the kept frames itself; see upright_filters.
         *(["-noautorotate"] if manual_rotation else []),
         "-i",
@@ -2945,7 +2972,7 @@ def render_command(
         "[vout]",
         "-map",
         "[aout]",
-        *video_encoder_args(encoder, args),
+        *video_encoder_args(encoder, args, cuda_output=cuda_output),
         "-c:a",
         "aac",
         "-b:a",
@@ -3006,23 +3033,35 @@ def render_with_fallback(
     args: argparse.Namespace,
     expected_duration: float | None = None,
     manual_rotation: bool = False,
+    cuda_filtergraph_path: Path | None = None,
+    cuda_output: bool = False,
 ) -> tuple[str, float]:
     candidates = encoder_candidates(args)
+    decoders = ["cuda", "cpu"] if args.decoder == "auto" else [args.decoder]
+    attempts = [(encoder, decoder) for encoder in candidates for decoder in decoders]
     last_error: CommandFailed | None = None
     temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
     if temp_output.exists():
         temp_output.unlink()
     live_dir: Path | None = args.live_dir.expanduser() if args.live_dir else None
 
-    for index, encoder in enumerate(candidates):
+    for index, (encoder, decoder) in enumerate(attempts):
+        cuda_graph = (
+            cuda_filtergraph_path
+            if decoder == "cuda" and encoder in {"h264_nvenc", "hevc_nvenc"}
+            else None
+        )
         command = render_command(
             input_path=input_path,
             output_path=temp_output,
-            filtergraph_path=filtergraph_path,
+            filtergraph_path=cuda_graph or filtergraph_path,
             encoder=encoder,
             args=args,
             live_dir=live_dir,
             manual_rotation=manual_rotation,
+            decoder=decoder,
+            cuda_frames=cuda_graph is not None,
+            cuda_output=cuda_graph is not None and cuda_output,
         )
         if args.dry_run:
             report("\nRender command:")
@@ -3037,11 +3076,12 @@ def render_with_fallback(
                 "live",
                 playlist=str(live_dir / LIVE_PLAYLIST),
                 encoder=encoder,
+                decoder=decoder,
                 attempt=index + 1,
             )
 
         start_phase(PHASE_RENDER)
-        report(f"Rendering with {encoder}...")
+        report(f"Rendering with {encoder} (decoder: {decoder})...")
         start = time.monotonic()
         try:
             result = run_command(
@@ -3063,6 +3103,7 @@ def render_with_fallback(
             raise
         elapsed = time.monotonic() - start
         if result.returncode == 0:
+            args.decoder_used = decoder
             os.replace(temp_output, output_path)
             if live_dir is not None and not args.keep_live_dir:
                 clear_live_dir(live_dir)
@@ -3073,10 +3114,12 @@ def render_with_fallback(
         last_error = CommandFailed(command, result.returncode, result.stderr)
         if temp_output.exists():
             temp_output.unlink()
-        if index + 1 < len(candidates):
+        if index + 1 < len(attempts):
+            next_encoder, next_decoder = attempts[index + 1]
             report(
-                f"{encoder} failed (exit code {result.returncode}); "
-                f"falling back to {candidates[index + 1]}...",
+                f"{encoder} (decoder: {decoder}) failed (exit code {result.returncode}); "
+                f"falling back to {next_encoder} (decoder: {next_decoder})... "
+                f"Reason: {stderr_tail(result.stderr)}",
                 error=True,
             )
 
@@ -3084,6 +3127,7 @@ def render_with_fallback(
     tried = ", ".join(candidates)
     raise PipelineError(
         f"Rendering failed with every encoder tried ({tried}). "
+        f"Decoders tried: {', '.join(decoders)}. "
         f"Last error: {last_error}"
     ) from last_error
 
@@ -3192,12 +3236,33 @@ def render_segments(
     )
     filtergraph_path = workdir / filtergraph_name
     filtergraph_path.write_text(filtergraph, encoding="utf-8")
+    cuda_filtergraph_path = None
+    if (
+        args.decoder != "cpu"
+        and args.encoder != "libx264"
+        and args.filtergraph_mode == "select"
+        and media.upright is not None
+    ):
+        # Keep the ordinary graph for CPU retries, concat, and matrices whose
+        # rotation must be handled by FFmpeg's own autorotate.
+        cuda_filtergraph_path = filtergraph_path.with_name(f"cuda_{filtergraph_path.name}")
+        cuda_filtergraph_path.write_text(
+            build_filtergraph(
+                segments, args, video_fps=media.video_fps,
+                upright=media.upright, cuda_frames=True,
+            ),
+            encoding="utf-8",
+        )
 
     report(describe_plan(media=media, silences=silences, segments=segments, speed=args.speed))
     if args.filtergraph_mode == "concat" and not args.dry_run:
         report(CONCAT_MEMORY_WARNING, error=True)
     if args.dry_run:
         print_dry_run_filtergraph(filtergraph_path, filtergraph)
+        if cuda_filtergraph_path is not None:
+            print_dry_run_filtergraph(
+                cuda_filtergraph_path, cuda_filtergraph_path.read_text(encoding="utf-8")
+            )
 
     kept = sum(segment.duration for segment in segments)
     return render_with_fallback(
@@ -3210,6 +3275,8 @@ def render_segments(
         # matrix, ffmpeg's autorotate stays on and a missed one still lands
         # upright, merely without the saving.
         manual_rotation=bool(media.upright),
+        cuda_filtergraph_path=cuda_filtergraph_path,
+        cuda_output=not bool(media.upright),
     )
 
 
@@ -3415,12 +3482,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         realtime = media.duration / elapsed if elapsed > 0 else 0.0
         report(f"Output: {output_path}")
         report(f"Encoder: {encoder}")
+        report(f"Decoder: {args.decoder_used}")
         report(f"Output duration: {output_media.duration:.2f}s")
         report(f"Render time: {elapsed:.2f}s ({realtime:.2f}x input realtime)")
         report_event(
             "result",
             output=str(output_path),
             encoder=encoder,
+            decoder=args.decoder_used,
             input_duration=media.duration,
             output_duration=output_media.duration,
             output_size=output_path.stat().st_size,

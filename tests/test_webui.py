@@ -74,6 +74,12 @@ class WebUITests(unittest.TestCase):
 
         self.assertIn("target_lufs", dests)
         self.assertIn("denoise", dests)
+        decoder = next(
+            field for group in body["groups"] for field in group["fields"]
+            if field["dest"] == "decoder"
+        )
+        self.assertEqual(decoder["default"], "auto")
+        self.assertEqual(decoder["choices"], ["auto", "cuda", "cpu"])
         self.assertEqual(body["roots"], [str(self.root.resolve())])
 
     def test_file_listing_only_offers_media_from_the_roots(self):

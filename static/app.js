@@ -13,6 +13,7 @@ const BASIC_DESTS = new Set([
   "cq",
   "crf",
   "encoder",
+  "decoder",
   "max_fps",
   "if_exists",
   "start",
@@ -235,6 +236,7 @@ function applyDefaults() {
   el("set-arnndn-mix").value = d.arnndn_mix ?? 1;
   renderQualityLevels();
   el("set-encoder").value = ["libx264", "hevc_nvenc"].includes(d.encoder) ? d.encoder : "auto";
+  el("set-decoder").value = d.decoder;
   el("set-max-fps").value = String(Number(d.max_fps) || 0);
   syncQualityHint();
   syncArnndnMix();
@@ -426,6 +428,7 @@ function collectSettings() {
   put("cq", quality.cq);
   put("crf", quality.crf);
   put("encoder", el("set-encoder").value);
+  put("decoder", el("set-decoder").value);
   put("max_fps", Number(el("set-max-fps").value));
   const model = el("set-arnndn-model").value;
   if (model && !el("model-label").classList.contains("hidden")) {
@@ -1178,6 +1181,7 @@ function renderResult(fields) {
   box.textContent = [
     t("res.done", { output: fields.output, size }),
     t("res.encoder", { encoder: fields.encoder }),
+    ...(fields.decoder ? [t("res.decoder", { decoder: fields.decoder })] : []),
     t("res.duration", {
       out: formatDuration(fields.output_duration),
       in: formatDuration(fields.input_duration),
@@ -1321,6 +1325,7 @@ const REQUIRED_ELEMENTS = [
   "set-arnndn-mix",
   "set-quality",
   "set-encoder",
+  "set-decoder",
   "set-max-fps",
   "file-list",
   "folder-dialog",
