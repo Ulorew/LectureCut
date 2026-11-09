@@ -116,7 +116,7 @@ class SyncTests(unittest.TestCase):
             markers = make_lecture(source, 720)
             subprocess.run(
                 [sys.executable, str(ROOT / "main.py"), str(source), "-o", str(output),
-                 "--denoise=none", "--encoder=libx264", "--speed=1.0"],
+                 "--denoise=none", "--encoder=libx264", "--decoder=cpu", "--speed=1.0"],
                 check=True, capture_output=True,
             )
             offsets = audio_minus_video(output)

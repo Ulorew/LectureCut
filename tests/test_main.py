@@ -1013,6 +1013,36 @@ class LivePreviewTests(unittest.TestCase):
         self.assertIn("+faststart+use_metadata_tags", command)
         self.assertNotIn("hls", " ".join(command))
 
+    def test_gpu_decode_is_default_and_is_an_input_option(self):
+        command = self.render()
+        self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
+        self.assertLess(command.index("-hwaccel"), command.index("-i"))
+        # The software cut/rotation filters need downloaded frames.
+        self.assertNotIn("-hwaccel_output_format", command)
+
+    def test_cpu_decode_is_independent_of_the_encoder(self):
+        args = main.parse_args(["in.MOV", "--decoder", "cpu"])
+        command = self.render(args=args, encoder="h264_nvenc")
+        self.assertNotIn("-hwaccel", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "h264_nvenc")
+
+    def test_cuda_graph_keeps_frames_on_gpu_until_encoding(self):
+        args = main.parse_args(["in.MOV"])
+        graph = main.build_filtergraph([main.Segment(1, 3)], args, cuda_frames=True)
+        self.assertIn("scale_cuda=format=yuv420p[vout]", graph)
+        self.assertNotIn("hwdownload", graph)
+        command = self.render(encoder="h264_nvenc", cuda_frames=True, cuda_output=True)
+        self.assertEqual(command[command.index("-hwaccel_output_format") + 1], "cuda")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "cuda")
+
+    def test_cuda_rotation_downloads_only_after_cuts_and_fps_cap(self):
+        args = main.parse_args(["in.MOV", "--max-fps", "15"])
+        graph = main.build_filtergraph(
+            [main.Segment(1, 3)], args, upright=("transpose=clock",), cuda_frames=True
+        )
+        self.assertIn("fps=15,scale_cuda=format=yuv420p,hwdownload,format=yuv420p,transpose=clock", graph)
+        self.assertLess(graph.index("select="), graph.index("hwdownload"))
+
     def test_remux_copies_streams_and_keeps_the_source_metadata(self):
         command = main.remux_live_command(
             live_dir=Path("/live"), source=Path("/in.MOV"), output_path=Path("/out.mp4")
@@ -1041,7 +1071,7 @@ class LivePreviewTests(unittest.TestCase):
     def test_clearing_a_missing_dir_is_harmless(self):
         main.clear_live_dir(Path("/definitely/not/here"))
 
-    def fallback_run(self, *, returncodes, keep=False):
+    def fallback_run(self, *, returncodes, keep=False, decoder="cpu", cuda_graph=False, prefer_cuda=True):
         """Drive render_with_fallback with a fake ffmpeg; return what happened."""
 
         temp = tempfile.TemporaryDirectory()
@@ -1049,7 +1079,7 @@ class LivePreviewTests(unittest.TestCase):
         base = Path(temp.name)
         live = base / "live"
         output = base / "out.mp4"
-        argv = ["in.MOV", "--live-dir", str(live), "--encoder", "auto"]
+        argv = ["in.MOV", "--live-dir", str(live), "--encoder", "auto", "--decoder", decoder]
         if keep:
             argv.append("--keep-live-dir")
         args = main.parse_args(argv)
@@ -1082,6 +1112,9 @@ class LivePreviewTests(unittest.TestCase):
                     output_path=output,
                     filtergraph_path=base / "graph",
                     args=args,
+                    cuda_filtergraph_path=base / "cuda_graph" if cuda_graph else None,
+                    cuda_output=cuda_graph,
+                    prefer_cuda=prefer_cuda,
                 )
         finally:
             main.ACTIVE_REPORTER.reset(token)
@@ -1111,13 +1144,56 @@ class LivePreviewTests(unittest.TestCase):
         # A player must reload: the second encoder writes a new playlist.
         self.assertEqual(attempts, [1, 2])
 
+    def test_decoder_fallback_preserves_nvenc_and_restarts_the_playlist(self):
+        encoder, commands, events, _, output = self.fallback_run(
+            returncodes=[1, 0], decoder="auto", cuda_graph=True
+        )
+        self.assertEqual(encoder, "h264_nvenc")
+        self.assertEqual(output.read_text(), "final")
+        renders = [cmd for cmd in commands if "hls" in cmd]
+        self.assertIn("-hwaccel", renders[0])
+        self.assertNotIn("-hwaccel", renders[1])
+        self.assertEqual(Path(renders[0][renders[0].index("-filter_complex_script") + 1]).name, "cuda_graph")
+        self.assertEqual(Path(renders[1][renders[1].index("-filter_complex_script") + 1]).name, "graph")
+        self.assertEqual(renders[0][renders[0].index("-pix_fmt") + 1], "cuda")
+        self.assertEqual(renders[1][renders[1].index("-pix_fmt") + 1], "yuv420p")
+        live = [fields for kind, fields in events if kind == "live"]
+        self.assertEqual([item["decoder"] for item in live], ["cuda", "cpu"])
+        self.assertEqual([item["attempt"] for item in live], [1, 2])
+
+    def test_encoder_fallback_can_still_decode_on_gpu(self):
+        encoder, commands, _, _, _ = self.fallback_run(
+            returncodes=[1, 1, 0], decoder="auto"
+        )
+        self.assertEqual(encoder, "libx264")
+        self.assertIn("-hwaccel", commands[-2])  # final command is the remux
+
+    def test_software_colour_prefers_cpu_but_explicit_cuda_overrides_it(self):
+        for decoder, expected in (("auto", False), ("cuda", True)):
+            with self.subTest(decoder=decoder):
+                _, commands, events, _, _ = self.fallback_run(
+                    returncodes=[0], decoder=decoder, cuda_graph=True, prefer_cuda=False,
+                )
+                render = next(cmd for cmd in commands if "hls" in cmd)
+                self.assertEqual("-hwaccel" in render, expected)
+                live = [fields for kind, fields in events if kind == "live"]
+                self.assertEqual(live[0]["decoder"], "cuda" if expected else "cpu")
+
+    def test_required_gpu_decoding_survives_encoder_fallback(self):
+        encoder, commands, _, _, _ = self.fallback_run(
+            returncodes=[1, 0], decoder="cuda"
+        )
+        self.assertEqual(encoder, "libx264")
+        for command in commands[:-1]:
+            self.assertIn("-hwaccel", command)
+
     def test_when_every_encoder_fails_the_error_says_why(self):
         """A web job used to get only "returned non-zero exit status 234"."""
 
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         base = Path(temp.name)
-        args = main.parse_args(["in.MOV", "--encoder", "auto"])
+        args = main.parse_args(["in.MOV", "--encoder", "auto", "--decoder", "cpu"])
         reasons = iter(
             [
                 "[h264_nvenc] OpenEncodeSessionEx failed: unsupported device\n",
@@ -1175,6 +1251,8 @@ class ParserSchemaTests(unittest.TestCase):
         self.assertEqual(by_dest["mono"]["kind"], "flag")
         self.assertEqual(by_dest["denoise"]["kind"], "choice")
         self.assertEqual(by_dest["denoise"]["choices"], list(main.AUDIO_DENOISE_MODES))
+        self.assertEqual(by_dest["decoder"]["choices"], ["auto", "cuda", "cpu"])
+        self.assertEqual(by_dest["decoder"]["default"], "auto")
         self.assertEqual(by_dest["target_lufs"]["kind"], "number")
         self.assertEqual(by_dest["analysis_samples"]["kind"], "integer")
         self.assertEqual(by_dest["workdir"]["kind"], "path")
@@ -1730,7 +1808,7 @@ class PipelineEndToEndTests(unittest.TestCase):
             source, output = Path(directory) / "talk.mp4", Path(directory) / "out.mp4"
             make_tiny_lecture(source)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                code = main.main([str(source), "-o", str(output), "--encoder=libx264",
+                code = main.main([str(source), "-o", str(output), "--encoder=libx264", "--decoder=cpu",
                                   "--analysis-samples=2", "--speed=1.0"])
             self.assertEqual(code, 0)
             media = main.probe_media(output)
@@ -1827,12 +1905,61 @@ class HdrTests(unittest.TestCase):
             for mode in ("auto", "off"):
                 output = Path(directory) / f"{mode}.mp4"
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(main.main([str(source), "-o", str(output), "--encoder=libx264",
+                    self.assertEqual(main.main([str(source), "-o", str(output), "--encoder=libx264", "--decoder=cpu",
                                                 "--analysis-samples=2", f"--tonemap={mode}"]), 0)
                 results[mode] = tags(output)
 
         self.assertEqual(results["auto"], "bt709,bt709")
         self.assertEqual(results["off"], "arib-std-b67,bt2020")
+
+
+class CudaSoftwareFiltersTests(unittest.TestCase):
+    def test_hdr_download_keeps_ten_bits_until_tone_conversion(self):
+        args = main.parse_args(["in.mov", "--max-fps=15", "--board=clean"])
+        sdr = main.sdr_filters("tin=arib-std-b67:pin=bt2020:min=bt2020nc", 550)
+        graph = main.build_filtergraph(
+            [main.Segment(0, 1)], args, upright=("transpose=clock",),
+            sdr=sdr, size=(1920, 1080), cuda_frames=True,
+            cuda_download_format="p010le",
+        )
+        self.assertIn("fps=15,hwdownload,format=p010le,zscale=", graph)
+        self.assertNotIn("scale_cuda=format=yuv420p", graph)
+        self.assertLess(graph.index("zscale="), graph.index("transpose=clock"))
+        self.assertIn("scale=1080:1920", graph)
+        self.assertIn("[vbase]format=gbrp", graph)
+
+    def test_render_passes_hdr_and_board_settings_to_both_graphs(self):
+        for board, hdr, fmt in (("off", False, "yuv420p"), ("clean", False, "yuv420p"),
+                                ("off", True, "yuv420p10le"), ("ink", True, "yuv420p10le"),
+                                ("off", True, "unknown")):
+            with self.subTest(board=board, hdr=hdr, fmt=fmt), tempfile.TemporaryDirectory() as tmp:
+                args = main.parse_args(["in.mov", f"--board={board}", "--decoder=cuda"])
+                sdr = main.sdr_filters("tin=arib-std-b67:pin=bt2020:min=bt2020nc", 550) if hdr else ()
+                media = main.MediaInfo(3.0, True, True, 30.0, width=96, height=50,
+                                       pixel_format=fmt, sdr=sdr)
+                with unittest.mock.patch.object(main, "render_with_fallback", return_value=("h264_nvenc", 1)) as render, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main.render_segments(input_path=Path("in.mov"), output_path=Path(tmp) / "out.mp4",
+                                         workdir=Path(tmp), media=media, silences=[],
+                                         segments=[main.Segment(0, 3)], args=args)
+                call = render.call_args.kwargs
+                graph_path = call["cuda_filtergraph_path"]
+                if fmt == "unknown":
+                    self.assertIsNone(graph_path)
+                    continue
+                graph = graph_path.read_text()
+                self.assertEqual(call["cuda_output"], not hdr and board == "off")
+                self.assertEqual("zscale=" in graph, hdr)
+                self.assertEqual("[vbase]" in graph, board != "off")
+                self.assertEqual("hwdownload" in graph, hdr or board != "off")
+                self.assertEqual(call["prefer_cuda"], not hdr and board == "off")
+
+    def test_disabled_tonemap_keeps_the_gpu_only_path(self):
+        args = main.parse_args(["in.mov", "--tonemap=off"])
+        graph = main.build_filtergraph([main.Segment(0, 1)], args,
+                                      sdr=("zscale=x",), cuda_frames=True)
+        self.assertNotIn("zscale", graph)
+        self.assertNotIn("hwdownload", graph)
 
 
 class BoardTests(unittest.TestCase):
@@ -1908,7 +2035,7 @@ class BoardTests(unittest.TestCase):
             for mode in ("clean", "ink"):
                 output = Path(directory) / f"{mode}.mp4"
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    code = main.main([str(source), "-o", str(output), "--encoder=libx264",
+                    code = main.main([str(source), "-o", str(output), "--encoder=libx264", "--decoder=cpu",
                                       "--analysis-samples=2", f"--board={mode}"])
                 with self.subTest(mode=mode):
                     self.assertEqual(code, 0)

@@ -74,6 +74,12 @@ class WebUITests(unittest.TestCase):
 
         self.assertIn("target_lufs", dests)
         self.assertIn("denoise", dests)
+        decoder = next(
+            field for group in body["groups"] for field in group["fields"]
+            if field["dest"] == "decoder"
+        )
+        self.assertEqual(decoder["default"], "auto")
+        self.assertEqual(decoder["choices"], ["auto", "cuda", "cpu"])
         self.assertEqual(body["roots"], [str(self.root.resolve())])
 
     def test_file_listing_only_offers_media_from_the_roots(self):
@@ -1576,7 +1582,7 @@ class JobLifecycleTests(unittest.TestCase):
             job = self.manager.submit(
                 kind="convert",
                 source=str(source),
-                settings={"encoder": "libx264", "analysis_samples": 2},
+                settings={"encoder": "libx264", "decoder": "cpu", "analysis_samples": 2},
             )
             self.wait_for(job, {webui.STATUS_DONE, webui.STATUS_ERROR}, timeout=120.0)
             output = Path(job.result["output"]) if job.result else None

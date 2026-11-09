@@ -453,6 +453,7 @@ class MediaInfo:
     hdr_input: str = ""
     # Filters that turn an HDR source into SDR BT.709; empty for SDR.
     sdr: tuple[str, ...] = ()
+    pixel_format: str = ""
 
 
 @dataclass(frozen=True)
@@ -759,6 +760,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     video_group = parser.add_argument_group("video")
+    video_group.add_argument(
+        "--decoder",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help=("Video decoding; auto prefers NVIDIA for SDR, CPU for HDR conversion or "
+              "board processing; cuda requires NVIDIA; cpu disables GPU decoding"),
+    )
     video_group.add_argument(
         "--encoder",
         choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
@@ -1407,7 +1415,7 @@ def probe_media(
         "error",
         "-show_entries",
         "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,"
-        "color_transfer,color_primaries,color_space"
+        "color_transfer,color_primaries,color_space,pix_fmt"
         ":stream_side_data=side_data_type,rotation,displaymatrix",
         "-of",
         "json",
@@ -1433,6 +1441,7 @@ def probe_media(
         has_video=any(stream.get("codec_type") == "video" for stream in streams),
         video_fps=stream_fps(video_stream),
         width=int(video_stream.get("width") or 0),
+        pixel_format=str(video_stream.get("pix_fmt") or ""),
         height=int(video_stream.get("height") or 0),
         upright=upright_filters(video_stream),
         hdr=HDR_TRANSFERS.get(str(video_stream.get("color_transfer") or ""), ""),
@@ -2895,10 +2904,26 @@ def build_filtergraph(
     upright: tuple[str, ...] | None = (),
     sdr: tuple[str, ...] = (),
     size: tuple[int, int] = (0, 0),
+    cuda_frames: bool = False,
+    cuda_download_format: str = "",
 ) -> str:
     tail = video_tail_filters(args, video_fps=video_fps, upright=upright, sdr=sdr)
-    board = ""
     mode = getattr(args, "board", "off")
+    if cuda_frames:
+        # Cut and limit FPS on the device. HDR must reach zscale at its original
+        # depth; converting to 8 bits on CUDA first loses faint board strokes.
+        tail = video_tail_filters(args, video_fps=video_fps, upright=())
+        convert_hdr = bool(sdr) and args.tonemap != "off"
+        if convert_hdr:
+            if not cuda_download_format:
+                raise PipelineError("HDR CUDA graph needs the decoded pixel format")
+            tail.extend(["hwdownload", f"format={cuda_download_format}", *sdr])
+        else:
+            tail.append("scale_cuda=format=yuv420p")
+            if upright or mode != "off":
+                tail.extend(["hwdownload", "format=yuv420p"])
+        tail.extend(upright or ())
+    board = ""
     if mode != "off":
         if not all(size):
             raise PipelineError("--board needs the video's frame size, which ffprobe did not report")
@@ -3159,7 +3184,9 @@ def encoder_candidates(args: argparse.Namespace) -> list[str]:
     return ["libx264"]
 
 
-def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
+def video_encoder_args(
+    encoder: str, args: argparse.Namespace, *, cuda_output: bool = False
+) -> list[str]:
     if encoder == "h264_nvenc":
         return [
             "-c:v",
@@ -3171,7 +3198,7 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
             "-b:v",
             "0",
             "-pix_fmt",
-            "yuv420p",
+            "cuda" if cuda_output else "yuv420p",
         ]
     if encoder == "hevc_nvenc":
         return [
@@ -3184,7 +3211,7 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
             "-b:v",
             "0",
             "-pix_fmt",
-            "yuv420p",
+            "cuda" if cuda_output else "yuv420p",
         ]
     if encoder == "libx264":
         return [
@@ -3249,13 +3276,22 @@ def render_command(
     args: argparse.Namespace,
     live_dir: Path | None = None,
     manual_rotation: bool = False,
+    decoder: str | None = None,
+    cuda_frames: bool = False,
+    cuda_output: bool = False,
 ) -> list[str]:
+    decoder = decoder or ("cuda" if args.decoder == "auto" else args.decoder)
     command = [
         "ffmpeg",
         "-hide_banner",
         "-y",
         "-nostdin",
         *ffmpeg_input_options(args.start, args.limit),
+        # The ordinary graph expects host frames. The CUDA graph keeps them
+        # on the device through the cuts and conversion, downloading only
+        # when software rotation requires it.
+        *(["-hwaccel", "cuda"] if decoder == "cuda" else []),
+        *(["-hwaccel_output_format", "cuda"] if cuda_frames else []),
         # The filtergraph turns the kept frames itself; see upright_filters.
         *(["-noautorotate"] if manual_rotation else []),
         "-i",
@@ -3266,7 +3302,7 @@ def render_command(
         "[vout]",
         "-map",
         "[aout]",
-        *video_encoder_args(encoder, args),
+        *video_encoder_args(encoder, args, cuda_output=cuda_output),
         "-c:a",
         "aac",
         "-b:a",
@@ -3327,23 +3363,36 @@ def render_with_fallback(
     args: argparse.Namespace,
     expected_duration: float | None = None,
     manual_rotation: bool = False,
+    cuda_filtergraph_path: Path | None = None,
+    cuda_output: bool = False,
+    prefer_cuda: bool = True,
 ) -> tuple[str, float]:
     candidates = encoder_candidates(args)
+    decoders = (["cuda", "cpu"] if prefer_cuda else ["cpu"]) if args.decoder == "auto" else [args.decoder]
+    attempts = [(encoder, decoder) for encoder in candidates for decoder in decoders]
     last_error: CommandFailed | None = None
     temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
     if temp_output.exists():
         temp_output.unlink()
     live_dir: Path | None = args.live_dir.expanduser() if args.live_dir else None
 
-    for index, encoder in enumerate(candidates):
+    for index, (encoder, decoder) in enumerate(attempts):
+        cuda_graph = (
+            cuda_filtergraph_path
+            if decoder == "cuda" and encoder in {"h264_nvenc", "hevc_nvenc"}
+            else None
+        )
         command = render_command(
             input_path=input_path,
             output_path=temp_output,
-            filtergraph_path=filtergraph_path,
+            filtergraph_path=cuda_graph or filtergraph_path,
             encoder=encoder,
             args=args,
             live_dir=live_dir,
             manual_rotation=manual_rotation,
+            decoder=decoder,
+            cuda_frames=cuda_graph is not None,
+            cuda_output=cuda_graph is not None and cuda_output,
         )
         if args.dry_run:
             report("\nRender command:")
@@ -3358,11 +3407,12 @@ def render_with_fallback(
                 "live",
                 playlist=str(live_dir / LIVE_PLAYLIST),
                 encoder=encoder,
+                decoder=decoder,
                 attempt=index + 1,
             )
 
         start_phase(PHASE_RENDER)
-        report(f"Rendering with {encoder}...")
+        report(f"Rendering with {encoder} (decoder: {decoder})...")
         start = time.monotonic()
         try:
             result = run_command(
@@ -3384,6 +3434,7 @@ def render_with_fallback(
             raise
         elapsed = time.monotonic() - start
         if result.returncode == 0:
+            args.decoder_used = decoder
             os.replace(temp_output, output_path)
             if live_dir is not None and not args.keep_live_dir:
                 clear_live_dir(live_dir)
@@ -3394,10 +3445,12 @@ def render_with_fallback(
         last_error = CommandFailed(command, result.returncode, result.stderr)
         if temp_output.exists():
             temp_output.unlink()
-        if index + 1 < len(candidates):
+        if index + 1 < len(attempts):
+            next_encoder, next_decoder = attempts[index + 1]
             report(
-                f"{encoder} failed (exit code {result.returncode}); "
-                f"falling back to {candidates[index + 1]}...",
+                f"{encoder} (decoder: {decoder}) failed (exit code {result.returncode}); "
+                f"falling back to {next_encoder} (decoder: {next_decoder})... "
+                f"Reason: {stderr_tail(result.stderr)}",
                 error=True,
             )
 
@@ -3405,6 +3458,7 @@ def render_with_fallback(
     tried = ", ".join(candidates)
     raise PipelineError(
         f"Rendering failed with every encoder tried ({tried}). "
+        f"Decoders tried: {', '.join(decoders)}. "
         f"Last error: {last_error}"
     ) from last_error
 
@@ -3497,6 +3551,24 @@ def plan_segments(
     return silences, segments
 
 
+def cuda_download_format(pixel_format: str) -> str:
+    """NVDEC's host layout for common decoded formats; unknown uses auto-download.
+
+    Semiplanar P010/P016 retains the source depth before software HDR conversion.
+    The mapping is deliberately limited; unusual formats keep FFmpeg's normal
+    transfer path instead of guessing the hardware frame layout.
+    """
+
+    return {
+        "yuv420p": "nv12", "nv12": "nv12",
+        "yuv420p10le": "p010le", "p010le": "p010le",
+        "yuv420p12le": "p016le", "p016le": "p016le",
+        "yuv444p": "yuv444p",
+        "yuv444p10le": "yuv444p16le", "yuv444p12le": "yuv444p16le",
+        "yuv444p16le": "yuv444p16le",
+    }.get(pixel_format, "")
+
+
 def render_segments(
     *,
     input_path: Path,
@@ -3518,12 +3590,42 @@ def render_segments(
     )
     filtergraph_path = workdir / filtergraph_name
     filtergraph_path.write_text(filtergraph, encoding="utf-8")
+    cuda_filtergraph_path = None
+    convert_hdr = bool(media.sdr) and args.tonemap != "off"
+    # Device-to-host transfer cancels the decode gain for HDR on the tested
+    # lecture. Keep automatic mode conservative when software colour filters
+    # are needed; explicit --decoder=cuda still enables the hybrid path.
+    prefer_cuda = not (convert_hdr or args.board != "off")
+    download_format = cuda_download_format(media.pixel_format)
+    if (
+        (args.decoder == "cuda" or (args.decoder == "auto" and prefer_cuda))
+        and args.encoder != "libx264"
+        and args.filtergraph_mode == "select"
+        and media.upright is not None
+        and (not convert_hdr or download_format)
+    ):
+        # Keep the ordinary graph for CPU retries, concat, and matrices whose
+        # rotation must be handled by FFmpeg's own autorotate.
+        cuda_filtergraph_path = filtergraph_path.with_name(f"cuda_{filtergraph_path.name}")
+        cuda_filtergraph_path.write_text(
+            build_filtergraph(
+                segments, args, video_fps=media.video_fps,
+                upright=media.upright, cuda_frames=True,
+                sdr=media.sdr, size=(media.width, media.height),
+                cuda_download_format=download_format,
+            ),
+            encoding="utf-8",
+        )
 
     report(describe_plan(media=media, silences=silences, segments=segments, speed=args.speed))
     if args.filtergraph_mode == "concat" and not args.dry_run:
         report(CONCAT_MEMORY_WARNING, error=True)
     if args.dry_run:
         print_dry_run_filtergraph(filtergraph_path, filtergraph)
+        if cuda_filtergraph_path is not None:
+            print_dry_run_filtergraph(
+                cuda_filtergraph_path, cuda_filtergraph_path.read_text(encoding="utf-8")
+            )
 
     kept = sum(segment.duration for segment in segments)
     return render_with_fallback(
@@ -3536,6 +3638,9 @@ def render_segments(
         # matrix, ffmpeg's autorotate stays on and a missed one still lands
         # upright, merely without the saving.
         manual_rotation=bool(media.upright),
+        cuda_filtergraph_path=cuda_filtergraph_path,
+        cuda_output=not (media.upright or convert_hdr or args.board != "off"),
+        prefer_cuda=prefer_cuda,
     )
 
 
@@ -3747,12 +3852,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         realtime = media.duration / elapsed if elapsed > 0 else 0.0
         report(f"Output: {output_path}")
         report(f"Encoder: {encoder}")
+        report(f"Decoder: {args.decoder_used}")
         report(f"Output duration: {output_media.duration:.2f}s")
         report(f"Render time: {elapsed:.2f}s ({realtime:.2f}x input realtime)")
         report_event(
             "result",
             output=str(output_path),
             encoder=encoder,
+            decoder=args.decoder_used,
             input_duration=media.duration,
             output_duration=output_media.duration,
             output_size=output_path.stat().st_size,

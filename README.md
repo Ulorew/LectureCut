@@ -23,7 +23,7 @@ what they are, and what was tried and rejected.
 
 - FFmpeg with `ffprobe`, 6.0 or newer
 - Python 3.10 or newer
-- optional: `yt-dlp` for URL inputs, an NVIDIA card for `h264_nvenc`
+- optional: `yt-dlp` for URL inputs, an NVIDIA card and driver for CUDA/NVDEC decoding and NVENC encoding
 
 ```bash
 sudo apt install ffmpeg
@@ -57,6 +57,7 @@ The options worth knowing:
 | `--denoise auto` | `auto`, `afftdn`, `anlmdn`, `arnndn`, `none` |
 | `--target-lufs -17` | loudness to aim for |
 | `--encoder auto` | `auto` (NVENC), `libx264`, `hevc_nvenc` |
+| `--decoder auto` | GPU decoding for SDR; CPU for HDR conversion/board filters; `cuda` or `cpu` overrides |
 | `--cq 28`, `--crf 23` | quality; higher means a smaller file |
 | `--max-fps 30` | cap the frame rate; halves a 60 fps screen recording |
 | `--tonemap auto` | convert HDR phone recordings to ordinary SDR |
@@ -66,6 +67,26 @@ The options worth knowing:
 | `--live-dir DIR` | render through a playlist you can watch as it grows |
 
 `python3 main.py --help` lists the rest.
+
+Automatic decoding prefers NVIDIA for SDR and CPU when HDR conversion or board
+filters are enabled: transferring those frames back can cancel the gain. Use
+`--decoder cuda` to try the combined GPU/CPU path on your hardware, or
+`--decoder cpu` to disable GPU decoding. Decoding is separate from encoding:
+`--encoder libx264` can still decode on NVIDIA. When automatic mode chooses GPU,
+it retries a failed render with CPU decoding before changing encoders. The log
+and result report which decoder completed the render. Audio-only analysis and
+silence passes do not decode video.
+
+With NVENC and the default `select` mode, decoded frames stay on the GPU through
+the cuts and FPS limiting. SDR without board processing or rotation stays there
+through encoding. HDR conversion, board processing and rotation download only
+the kept frames; HDR retains its source bit depth until conversion to SDR.
+Unsupported CUDA paths fall back to CPU decoding in `auto` mode. The CPU encoder,
+`concat` mode, and unusual display matrices use downloaded frames with the
+existing software filters.
+
+[GPU decoding details and measurements](docs/gpu-decoding.md) cover the CUDA
+path and a CPU/GPU comparison on a HEVC Main 10 lecture.
 
 An output is never overwritten: an existing name gets `_2`, `_3` and so on.
 `Ctrl+C` stops FFmpeg and removes the partial file.

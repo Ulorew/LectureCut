@@ -112,6 +112,13 @@
           <option value="hevc_nvenc" data-i18n="enc.hevc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
         </select>
       </label>
+      <label><span data-i18n="set.decoder">Декодирование видео</span>
+        <select id="set-decoder">
+          <option value="auto" data-i18n="dec.auto">авто: GPU для SDR, CPU для HDR и доски</option>
+          <option value="cuda" data-i18n="dec.cuda">только NVIDIA GPU</option>
+          <option value="cpu" data-i18n="dec.cpu">процессор</option>
+        </select>
+      </label>
       <label><span data-i18n="set.maxFps">Кадров в секунду</span>
         <select id="set-max-fps">
           <option value="0" data-i18n="fps.source">как в источнике</option>
