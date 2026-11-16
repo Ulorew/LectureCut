@@ -1402,6 +1402,7 @@ class ParserSchemaTests(unittest.TestCase):
         self.assertEqual(by_dest["decoder"]["default"], "auto")
         self.assertEqual(by_dest["target_lufs"]["kind"], "number")
         self.assertEqual(by_dest["analysis_samples"]["kind"], "integer")
+        self.assertEqual(by_dest["videotoolbox_quality"]["kind"], "integer")
         self.assertEqual(by_dest["workdir"]["kind"], "path")
         self.assertEqual(by_dest["target_lufs"]["default"], -17.0)
         self.assertTrue(by_dest["denoise"]["help"])

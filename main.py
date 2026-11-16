@@ -951,7 +951,7 @@ def field_kind(action: argparse.Action) -> str:
         return "flag"
     if action.choices:
         return "choice"
-    if action.type in (positive_int, quality_value, int):
+    if action.type in (positive_int, quality_value, videotoolbox_quality_value, int):
         return "integer"
     if action.type in (
         positive_float, non_negative_float, unit_interval, finite_float, board_white, float
