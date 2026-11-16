@@ -79,7 +79,7 @@ class WebUITests(unittest.TestCase):
             if field["dest"] == "decoder"
         )
         self.assertEqual(decoder["default"], "auto")
-        self.assertEqual(decoder["choices"], ["auto", "cuda", "cpu"])
+        self.assertEqual(decoder["choices"], ["auto", "cuda", "videotoolbox", "cpu"])
         self.assertEqual(body["roots"], [str(self.root.resolve())])
 
     def test_file_listing_only_offers_media_from_the_roots(self):
@@ -612,7 +612,7 @@ class SourceFolderTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 403)
         self.assertEqual(self.config.roots, roots)
         self.assertEqual(
-            self.client.get("/api/file", params={"path": "/etc/hostname"}).status_code, 403
+            self.client.get("/api/file", params={"path": "/etc/hosts"}).status_code, 403
         )
 
     def test_lecture_folders_can_be_chosen_wherever_they_plausibly_live(self):
@@ -1218,10 +1218,22 @@ class LivePreviewTests(unittest.TestCase):
         self.assertTrue(job["settings"]["live_dir"].startswith(str(webui.live_root())))
 
     def test_no_preview_for_a_codec_browsers_cannot_play(self):
-        job = self.client.get(f"/api/jobs/{self.create({'encoder': 'hevc_nvenc'})['id']}").json()
+        for encoder in ("hevc_nvenc", "hevc_videotoolbox"):
+            with self.subTest(encoder=encoder):
+                job = self.client.get(f"/api/jobs/{self.create({'encoder': encoder})['id']}").json()
+                self.assertNotIn("live_dir", job["settings"])
+                self.assertFalse(job["live"])
 
-        self.assertNotIn("live_dir", job["settings"])
-        self.assertFalse(job["live"])
+    def test_apple_h264_keeps_live_preview_and_uses_shared_settings(self):
+        settings = {"encoder": "h264_videotoolbox", "decoder": "videotoolbox",
+                    "videotoolbox_quality": 75}
+        response = self.create(settings)
+        self.assertIn("id", response)
+        job = self.client.get(f"/api/jobs/{response['id']}").json()
+        self.assertIn("live_dir", job["settings"])
+        args = main.parse_args(main.settings_to_argv(str(self.root / "a.mp4"), job["settings"]))
+        self.assertEqual((args.encoder, args.decoder, args.videotoolbox_quality),
+                         ("h264_videotoolbox", "videotoolbox", 75))
 
     def test_previews_can_be_turned_off(self):
         self.config.live_preview = False

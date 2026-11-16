@@ -1,6 +1,8 @@
 import argparse
 import contextlib
 import io
+import json
+import os
 import random
 import re
 import shutil
@@ -975,6 +977,103 @@ class LectureCutTests(unittest.TestCase):
         self.assertEqual(main.build_audio_filters(args), ["anull"])
 
 
+class AppleVideoTests(unittest.TestCase):
+    def test_auto_encoder_prefers_nvenc_and_never_selects_apple(self):
+        args = main.parse_args(["in.mp4"])
+        available = {"h264_videotoolbox", "h264_nvenc", "libx264"}
+        for encoders, expected in (
+            (available, ["h264_nvenc", "libx264"]),
+            ({"h264_videotoolbox", "libx264"}, ["libx264"]),
+            ({"libx264"}, ["libx264"]),
+        ):
+            with self.subTest(encoders=encoders), \
+                    unittest.mock.patch.object(main, "supported_encoders", return_value=encoders):
+                self.assertEqual(main.encoder_candidates(args), expected)
+
+    def test_auto_decoders_follow_priority_and_skip_missing_backends(self):
+        args = main.parse_args(["in.mp4"])
+        for available, expected in (
+            ({"cuda", "videotoolbox"}, ["cuda", "videotoolbox", "cpu"]),
+            ({"cuda"}, ["cuda", "cpu"]),
+            ({"videotoolbox"}, ["videotoolbox", "cpu"]),
+            (set(), ["cpu"]),
+        ):
+            with self.subTest(available=available), \
+                    unittest.mock.patch.object(main, "supported_hwaccels", return_value=available):
+                self.assertEqual(main.decoder_candidates(args), expected)
+        with unittest.mock.patch.object(main, "supported_hwaccels", return_value={"cuda", "videotoolbox"}):
+            self.assertEqual(main.decoder_candidates(args, prefer_cuda=False), ["videotoolbox", "cpu"])
+
+    def test_explicit_decoder_is_not_replaced_or_probed(self):
+        for decoder in ("cuda", "videotoolbox", "cpu"):
+            args = main.parse_args(["in.mp4", f"--decoder={decoder}"])
+            with unittest.mock.patch.object(main, "supported_hwaccels") as detect:
+                self.assertEqual(main.decoder_candidates(args), [decoder])
+            detect.assert_not_called()
+
+    def test_hwaccel_listing_ignores_headers_and_unrelated_backends(self):
+        listing = "Hardware acceleration methods:\nvaapi\ncuda\nvideotoolbox\n\n"
+        with unittest.mock.patch.object(main, "run_command", return_value=
+                                        subprocess.CompletedProcess([], 0, listing, "")) as run:
+            self.assertEqual(main.supported_hwaccels(), {"cuda", "videotoolbox"})
+        self.assertEqual(run.call_args.args[0], ["ffmpeg", "-hide_banner", "-hwaccels"])
+
+    def test_explicit_encoder_does_not_silently_switch_to_cpu(self):
+        args = main.parse_args(["in.mp4", "--encoder=hevc_videotoolbox"])
+        with unittest.mock.patch.object(main, "supported_encoders") as detect:
+            self.assertEqual(main.encoder_candidates(args), ["hevc_videotoolbox"])
+        detect.assert_not_called()
+
+    def test_apple_decode_uses_host_frames_with_either_encoder(self):
+        for encoder in ("h264_videotoolbox", "libx264"):
+            args = main.parse_args(["in.mp4", "--decoder=videotoolbox"])
+            command = main.render_command(
+                input_path=Path("in.mp4"), output_path=Path("out.mp4"),
+                filtergraph_path=Path("graph"), encoder=encoder, args=args,
+            )
+            self.assertEqual(command[command.index("-hwaccel") + 1], "videotoolbox")
+            self.assertLess(command.index("-hwaccel"), command.index("-i"))
+            self.assertNotIn("-hwaccel_output_format", command)
+
+    def test_apple_encoder_uses_native_quality_and_hevc_playback_tag(self):
+        args = main.parse_args(["in.mp4", "--videotoolbox-quality=75"])
+        for encoder in ("h264_videotoolbox", "hevc_videotoolbox"):
+            command = main.video_encoder_args(encoder, args)
+            self.assertEqual(command[command.index("-q:v") + 1], "75")
+            self.assertEqual(command[command.index("-allow_sw") + 1], "0")
+            self.assertNotIn("-cq", command)
+            self.assertNotIn("-crf", command)
+            self.assertNotIn("-preset", command)
+            self.assertEqual("hvc1" in command, encoder == "hevc_videotoolbox")
+
+    def test_ffmpeg_6_filtergraph_retry_keeps_the_same_encoder(self):
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command.copy())
+            if "-/filter_complex" in command:
+                return subprocess.CompletedProcess(command, 8, "", "Unrecognized option '/filter_complex'.")
+            Path(command[-1]).write_bytes(b"finished")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            args = main.parse_args(["in.mp4", "--encoder=h264_videotoolbox", "--decoder=cpu"])
+            with unittest.mock.patch.object(main, "run_command", side_effect=fake_run), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                encoder, _ = main.render_with_fallback(
+                    input_path=base / "in.mp4", output_path=base / "out.mp4",
+                    filtergraph_path=base / "graph", args=args,
+                )
+            self.assertEqual((base / "out.mp4").read_bytes(), b"finished")
+        self.assertEqual(encoder, "h264_videotoolbox")
+        self.assertEqual(len(commands), 2)
+        self.assertIn("-/filter_complex", commands[0])
+        self.assertIn("-filter_complex_script", commands[1])
+        self.assertEqual(commands[0][commands[0].index("-c:v") + 1],
+                         commands[1][commands[1].index("-c:v") + 1])
+
+
 class LivePreviewTests(unittest.TestCase):
     """Rendering into a playlist that can be watched while it grows."""
 
@@ -1014,7 +1113,8 @@ class LivePreviewTests(unittest.TestCase):
         self.assertNotIn("hls", " ".join(command))
 
     def test_gpu_decode_is_default_and_is_an_input_option(self):
-        command = self.render()
+        with unittest.mock.patch.object(main, "supported_hwaccels", return_value={"cuda"}):
+            command = self.render()
         self.assertEqual(command[command.index("-hwaccel") + 1], "cuda")
         self.assertLess(command.index("-hwaccel"), command.index("-i"))
         # The software cut/rotation filters need downloaded frames.
@@ -1031,7 +1131,7 @@ class LivePreviewTests(unittest.TestCase):
         graph = main.build_filtergraph([main.Segment(1, 3)], args, cuda_frames=True)
         self.assertIn("scale_cuda=format=yuv420p[vout]", graph)
         self.assertNotIn("hwdownload", graph)
-        command = self.render(encoder="h264_nvenc", cuda_frames=True, cuda_output=True)
+        command = self.render(encoder="h264_nvenc", decoder="cuda", cuda_frames=True, cuda_output=True)
         self.assertEqual(command[command.index("-hwaccel_output_format") + 1], "cuda")
         self.assertEqual(command[command.index("-pix_fmt") + 1], "cuda")
 
@@ -1071,7 +1171,8 @@ class LivePreviewTests(unittest.TestCase):
     def test_clearing_a_missing_dir_is_harmless(self):
         main.clear_live_dir(Path("/definitely/not/here"))
 
-    def fallback_run(self, *, returncodes, keep=False, decoder="cpu", cuda_graph=False, prefer_cuda=True):
+    def fallback_run(self, *, returncodes, keep=False, decoder="cpu", cuda_graph=False,
+                     platform="linux", encoders=None, hwaccels=None, prefer_cuda=True):
         """Drive render_with_fallback with a fake ffmpeg; return what happened."""
 
         temp = tempfile.TemporaryDirectory()
@@ -1104,8 +1205,13 @@ class LivePreviewTests(unittest.TestCase):
         token = main.ACTIVE_REPORTER.set(reporter)
         try:
             with unittest.mock.patch.object(main, "run_command", fake_run), \
+                    unittest.mock.patch.object(main.sys, "platform", platform), \
+                    unittest.mock.patch.object(main, "supported_hwaccels", return_value=(
+                        hwaccels if hwaccels is not None else
+                        {"videotoolbox"} if platform == "darwin" else {"cuda"}
+                    )), \
                     unittest.mock.patch.object(
-                        main, "encoder_candidates", lambda args: ["h264_nvenc", "libx264"]
+                        main, "encoder_candidates", return_value=encoders or ["h264_nvenc", "libx264"]
                     ):
                 encoder, _ = main.render_with_fallback(
                     input_path=Path("in.MOV"),
@@ -1153,8 +1259,8 @@ class LivePreviewTests(unittest.TestCase):
         renders = [cmd for cmd in commands if "hls" in cmd]
         self.assertIn("-hwaccel", renders[0])
         self.assertNotIn("-hwaccel", renders[1])
-        self.assertEqual(Path(renders[0][renders[0].index("-filter_complex_script") + 1]).name, "cuda_graph")
-        self.assertEqual(Path(renders[1][renders[1].index("-filter_complex_script") + 1]).name, "graph")
+        self.assertEqual(Path(renders[0][renders[0].index("-/filter_complex") + 1]).name, "cuda_graph")
+        self.assertEqual(Path(renders[1][renders[1].index("-/filter_complex") + 1]).name, "graph")
         self.assertEqual(renders[0][renders[0].index("-pix_fmt") + 1], "cuda")
         self.assertEqual(renders[1][renders[1].index("-pix_fmt") + 1], "yuv420p")
         live = [fields for kind, fields in events if kind == "live"]
@@ -1186,6 +1292,47 @@ class LivePreviewTests(unittest.TestCase):
         self.assertEqual(encoder, "libx264")
         for command in commands[:-1]:
             self.assertIn("-hwaccel", command)
+
+    def test_apple_decode_fallback_retries_cpu_before_software_encoding(self):
+        encoder, commands, events, _, output = self.fallback_run(
+            returncodes=[1, 1, 0], decoder="auto", platform="darwin",
+            encoders=["h264_nvenc", "libx264"],
+        )
+        self.assertEqual(encoder, "libx264")
+        renders = [cmd for cmd in commands if "hls" in cmd]
+        self.assertEqual([cmd[cmd.index("-c:v") + 1] for cmd in renders],
+                         ["h264_nvenc", "h264_nvenc", "libx264"])
+        self.assertEqual(renders[0][renders[0].index("-hwaccel") + 1], "videotoolbox")
+        self.assertNotIn("-hwaccel", renders[1])
+        self.assertEqual(renders[2][renders[2].index("-hwaccel") + 1], "videotoolbox")
+        self.assertTrue(output.exists())
+        live = [fields for kind, fields in events if kind == "live"]
+        self.assertEqual([item["decoder"] for item in live], ["videotoolbox", "cpu", "videotoolbox"])
+
+    def test_explicit_apple_decoder_survives_encoder_fallback(self):
+        encoder, commands, _, _, _ = self.fallback_run(
+            returncodes=[1, 0], decoder="videotoolbox",
+            encoders=["h264_nvenc", "libx264"],
+        )
+        self.assertEqual(encoder, "libx264")
+        for command in commands[:-1]:
+            self.assertEqual(command[command.index("-hwaccel") + 1], "videotoolbox")
+
+    def test_runtime_failures_walk_all_decoder_priorities_for_each_encoder(self):
+        encoder, commands, events, _, _ = self.fallback_run(
+            returncodes=[1, 1, 1, 1, 1, 0], decoder="auto", cuda_graph=True,
+            hwaccels={"cuda", "videotoolbox"},
+        )
+        self.assertEqual(encoder, "libx264")
+        live = [fields for kind, fields in events if kind == "live"]
+        self.assertEqual([(item["encoder"], item["decoder"]) for item in live], [
+            (encoder, decoder) for encoder in ("h264_nvenc", "libx264")
+            for decoder in ("cuda", "videotoolbox", "cpu")
+        ])
+        renders = [cmd for cmd in commands if "hls" in cmd]
+        for cmd in (renders[1], renders[4]):
+            self.assertNotIn("-hwaccel_output_format", cmd)
+            self.assertEqual(Path(cmd[cmd.index("-/filter_complex") + 1]).name, "graph")
 
     def test_when_every_encoder_fails_the_error_says_why(self):
         """A web job used to get only "returned non-zero exit status 234"."""
@@ -1251,10 +1398,11 @@ class ParserSchemaTests(unittest.TestCase):
         self.assertEqual(by_dest["mono"]["kind"], "flag")
         self.assertEqual(by_dest["denoise"]["kind"], "choice")
         self.assertEqual(by_dest["denoise"]["choices"], list(main.AUDIO_DENOISE_MODES))
-        self.assertEqual(by_dest["decoder"]["choices"], ["auto", "cuda", "cpu"])
+        self.assertEqual(by_dest["decoder"]["choices"], ["auto", "cuda", "videotoolbox", "cpu"])
         self.assertEqual(by_dest["decoder"]["default"], "auto")
         self.assertEqual(by_dest["target_lufs"]["kind"], "number")
         self.assertEqual(by_dest["analysis_samples"]["kind"], "integer")
+        self.assertEqual(by_dest["videotoolbox_quality"]["kind"], "integer")
         self.assertEqual(by_dest["workdir"]["kind"], "path")
         self.assertEqual(by_dest["target_lufs"]["default"], -17.0)
         self.assertTrue(by_dest["denoise"]["help"])
@@ -1332,6 +1480,13 @@ class NumericOptionTests(unittest.TestCase):
         for argv in ("--cq=52", "--cq=-1", "--crf=60", "--crf=-5"):
             with self.subTest(argv=argv):
                 self.assert_rejected(argv)
+
+    def test_apple_quality_has_its_own_scale(self):
+        for value in (0, 65, 100):
+            self.assertEqual(main.parse_args(["input.mp4", f"--videotoolbox-quality={value}"])
+                             .videotoolbox_quality, value)
+        for value in ("-1", "101", "65.5", "nan", "inf"):
+            self.assert_rejected(f"--videotoolbox-quality={value}")
 
     def test_atempo_filters_refuses_a_speed_it_cannot_reach(self):
         for speed in (float("inf"), float("nan"), 0.0, -1.0):
@@ -1899,7 +2054,8 @@ class HdrTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "phone.mp4"
-            make_tiny_lecture(source, extra=HLG_TAGS)
+            make_tiny_lecture(source, extra=(*HLG_TAGS, "-vf",
+                "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc"))
             self.assertEqual(main.probe_media(source).hdr, "HLG")
             results = {}
             for mode in ("auto", "off"):
@@ -2041,6 +2197,108 @@ class BoardTests(unittest.TestCase):
                     self.assertEqual(code, 0)
                     media = main.probe_media(output)
                     self.assertEqual((media.width, media.height), (96, 50))
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and os.environ.get("LECTURECUT_APPLE_TESTS") == "1"
+    and shutil.which("ffmpeg") and shutil.which("ffprobe"),
+    "needs macOS hardware access: set LECTURECUT_APPLE_TESTS=1",
+)
+class AppleVideoIntegrationTests(unittest.TestCase):
+    def test_apple_hdr_conversion_and_board_filters_keep_sdr_tags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source, hdr = base / "source.mp4", base / "hdr.mp4"
+            make_tiny_lecture(source, seconds=4, size="320x240")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-vf",
+                 "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+                 "-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-q:v", "65", "-allow_sw", "0", "-c:a", "copy", str(hdr)],
+                check=True, capture_output=True,
+            )
+            media = main.probe_media(hdr)
+            self.assertEqual((media.hdr, media.pixel_format), ("HLG", "yuv420p10le"))
+            for encoder, decoder, board in (
+                ("auto", "auto", "off"),
+                ("libx264", "cpu", "off"),
+                ("h264_videotoolbox", "videotoolbox", "clean"),
+                ("hevc_videotoolbox", "cpu", "ink"),
+            ):
+                with self.subTest(encoder=encoder, decoder=decoder, board=board):
+                    output = base / f"{encoder}-{decoder}-{board}.mp4"
+                    log = io.StringIO()
+                    with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                        code = main.main([
+                            str(hdr), "-o", str(output), f"--encoder={encoder}",
+                            f"--decoder={decoder}", f"--board={board}", "--max-fps=5",
+                            "--no-analyze", "--gain-bias=0", "--denoise=none",
+                            "--no-cut-silence", "--silence-threshold=-45dB",
+                        ])
+                    self.assertEqual(code, 0, log.getvalue())
+                    self.assertIn(f"Encoder: {'libx264' if encoder == 'auto' else encoder}", log.getvalue())
+                    self.assertIn(f"Decoder: {'videotoolbox' if decoder == 'auto' else decoder}", log.getvalue())
+                    video = json.loads(subprocess.check_output([
+                        "ffprobe", "-v", "error", "-select_streams", "v:0",
+                        "-show_streams", "-of", "json", str(output),
+                    ]))["streams"][0]
+                    self.assertEqual((video["color_transfer"], video["color_primaries"]), ("bt709", "bt709"))
+                    self.assertEqual((video["width"], video["height"]), (320, 240))
+                    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(output),
+                                    "-f", "null", "-"], check=True, capture_output=True)
+
+    def test_real_apple_render_cuts_rotates_caps_fps_and_remuxes_live(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source.mp4"
+            make_tiny_lecture(source, size="320x240")
+            hevc_source = base / "source10.mp4"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(source),
+                 "-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-pix_fmt", "p010le",
+                 "-q:v", "65", "-allow_sw", "0", "-c:a", "copy", str(hevc_source)],
+                check=True, capture_output=True,
+            )
+            cases = (
+                ("auto", "auto", "select", True, "h264"),
+                ("h264_videotoolbox", "videotoolbox", "select", True, "h264"),
+                ("hevc_videotoolbox", "videotoolbox", "select", False, "hevc"),
+                ("h264_videotoolbox", "cpu", "concat", False, "h264"),
+                ("libx264", "videotoolbox", "select", False, "h264"),
+            )
+            for index, (encoder, decoder, mode, live, codec) in enumerate(cases):
+                with self.subTest(encoder=encoder, decoder=decoder, mode=mode, live=live):
+                    input_path = hevc_source if codec == "hevc" else source
+                    output = base / f"out{index}.mp4"
+                    argv = [str(input_path), f"--encoder={encoder}", f"--decoder={decoder}",
+                            f"--filtergraph-mode={mode}", "--max-fps=5"]
+                    if live:
+                        argv.extend(["--live-dir", str(base / "live")])
+                    args = main.parse_args(argv)
+                    args.audio_chain = main.atempo_filters(args.speed)
+                    media = main.replace(main.probe_media(input_path), upright=("transpose=clock",))
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        used, _ = main.render_segments(
+                            input_path=input_path, output_path=output, workdir=base,
+                            media=media, silences=[],
+                            segments=[main.Segment(0, 2), main.Segment(4, 7)], args=args,
+                        )
+                    self.assertEqual(used, "libx264" if encoder == "auto" else encoder)
+                    self.assertEqual(args.decoder_used, "videotoolbox" if decoder == "auto" else decoder)
+                    result = json.loads(subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output)],
+                        check=True, capture_output=True, text=True,
+                    ).stdout)
+                    video = next(s for s in result["streams"] if s["codec_type"] == "video")
+                    self.assertEqual(video["codec_name"], codec)
+                    self.assertEqual((video["width"], video["height"]), (240, 320))
+                    self.assertEqual(video["avg_frame_rate"], "5/1")
+                    self.assertAlmostEqual(float(result["format"]["duration"]), 4.0, delta=0.3)
+                    self.assertTrue(main.read_lecturecut_tag(output))
+                    if codec == "hevc":
+                        self.assertEqual(video["codec_tag_string"], "hvc1")
+                    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(output),
+                                    "-f", "null", "-"], check=True, capture_output=True)
 
 
 def display_matrix(a: int, b: int, c: int, d: int, rotation: float) -> dict:

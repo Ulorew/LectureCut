@@ -107,14 +107,18 @@
       </label>
       <label><span data-i18n="set.encoder">Кодировщик</span>
         <select id="set-encoder">
-          <option value="auto" data-i18n="enc.gpu">видеокарта (быстро)</option>
-          <option value="libx264" data-i18n="enc.cpu">процессор (файл вдвое меньше, рендер вдвое дольше)</option>
-          <option value="hevc_nvenc" data-i18n="enc.hevc">видеокарта, HEVC (тоже вдвое меньше, но без просмотра на ходу)</option>
+          <option value="auto" data-i18n="enc.gpu">авто: NVIDIA → CPU</option>
+          <option value="h264_videotoolbox" data-i18n="enc.apple">Apple, H.264</option>
+          <option value="hevc_videotoolbox" data-i18n="enc.appleHevc">Apple, HEVC (без просмотра на ходу)</option>
+          <option value="h264_nvenc" data-i18n="enc.nvidia">NVIDIA, H.264</option>
+          <option value="libx264" data-i18n="enc.cpu">процессор, H.264</option>
+          <option value="hevc_nvenc" data-i18n="enc.hevc">NVIDIA, HEVC (без просмотра на ходу)</option>
         </select>
       </label>
       <label><span data-i18n="set.decoder">Декодирование видео</span>
         <select id="set-decoder">
-          <option value="auto" data-i18n="dec.auto">авто: GPU для SDR, CPU для HDR и доски</option>
+          <option value="auto" data-i18n="dec.auto">авто: NVIDIA → Apple → CPU</option>
+          <option value="videotoolbox" data-i18n="dec.apple">Apple VideoToolbox</option>
           <option value="cuda" data-i18n="dec.cuda">только NVIDIA GPU</option>
           <option value="cpu" data-i18n="dec.cpu">процессор</option>
         </select>

@@ -762,16 +762,15 @@ def build_parser() -> argparse.ArgumentParser:
     video_group = parser.add_argument_group("video")
     video_group.add_argument(
         "--decoder",
-        choices=("auto", "cuda", "cpu"),
+        choices=("auto", "cuda", "videotoolbox", "cpu"),
         default="auto",
-        help=("Video decoding; auto prefers NVIDIA for SDR, CPU for HDR conversion or "
-              "board processing; cuda requires NVIDIA; cpu disables GPU decoding"),
+        help="Video decoding; auto tries available CUDA/NVDEC, then Apple VideoToolbox, then CPU",
     )
     video_group.add_argument(
         "--encoder",
-        choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
+        choices=("auto", "h264_nvenc", "hevc_nvenc", "h264_videotoolbox", "hevc_videotoolbox", "libx264"),
         default="auto",
-        help="Video encoder; auto prefers h264_nvenc when available",
+        help="Video encoder; auto tries NVIDIA h264_nvenc, then CPU libx264; Apple VideoToolbox is manual",
     )
     video_group.add_argument(
         "--nvenc-preset",
@@ -824,6 +823,12 @@ def build_parser() -> argparse.ArgumentParser:
             "auto converts HDR sources (HLG or PQ, as phones record) to ordinary "
             "SDR BT.709; off passes them through unconverted"
         ),
+    )
+    video_group.add_argument(
+        "--videotoolbox-quality",
+        type=videotoolbox_quality_value,
+        default=65,
+        help="Apple VideoToolbox quality, 0..100; higher means better quality and a larger file (Apple Silicon)",
     )
     video_group.add_argument(
         "--max-fps",
@@ -946,7 +951,7 @@ def field_kind(action: argparse.Action) -> str:
         return "flag"
     if action.choices:
         return "choice"
-    if action.type in (positive_int, quality_value, int):
+    if action.type in (positive_int, quality_value, videotoolbox_quality_value, int):
         return "integer"
     if action.type in (
         positive_float, non_negative_float, unit_interval, finite_float, board_white, float
@@ -1079,6 +1084,13 @@ def quality_value(value: str) -> int:
     low, high = QUALITY_LIMITS
     if not low <= parsed <= high:
         raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
+    return parsed
+
+
+def videotoolbox_quality_value(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
     return parsed
 
 
@@ -3179,9 +3191,21 @@ def encoder_candidates(args: argparse.Namespace) -> list[str]:
     if args.encoder != "auto":
         return [args.encoder]
     encoders = supported_encoders()
-    if "h264_nvenc" in encoders:
-        return ["h264_nvenc", "libx264"]
-    return ["libx264"]
+    return (["h264_nvenc"] if "h264_nvenc" in encoders else []) + ["libx264"]
+
+
+def supported_hwaccels() -> set[str]:
+    result = run_command(["ffmpeg", "-hide_banner", "-hwaccels"], capture=True)
+    return {line.strip() for line in result.stdout.splitlines()
+            if line.strip() in {"cuda", "videotoolbox"}}
+
+
+def decoder_candidates(args: argparse.Namespace, *, prefer_cuda: bool = True) -> list[str]:
+    if args.decoder != "auto":
+        return [args.decoder]
+    available = supported_hwaccels()
+    return [decoder for decoder in ("cuda", "videotoolbox")
+            if decoder in available and (decoder != "cuda" or prefer_cuda)] + ["cpu"]
 
 
 def video_encoder_args(
@@ -3223,6 +3247,17 @@ def video_encoder_args(
             str(args.crf),
             "-pix_fmt",
             "yuv420p",
+        ]
+    if encoder in {"h264_videotoolbox", "hevc_videotoolbox"}:
+        # VideoToolbox uses 0..100, increasing with quality, unlike CQ/CRF.
+        # Require hardware encoding: auto fallback belongs to our retry loop.
+        return [
+            "-c:v", encoder,
+            "-q:v", str(args.videotoolbox_quality),
+            "-b:v", "0",
+            "-allow_sw", "0",
+            "-pix_fmt", "yuv420p",
+            *(["-tag:v", "hvc1"] if encoder == "hevc_videotoolbox" else []),
         ]
     raise ValueError(f"Unsupported encoder: {encoder}")
 
@@ -3280,7 +3315,7 @@ def render_command(
     cuda_frames: bool = False,
     cuda_output: bool = False,
 ) -> list[str]:
-    decoder = decoder or ("cuda" if args.decoder == "auto" else args.decoder)
+    decoder = decoder or decoder_candidates(args)[0]
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -3290,13 +3325,13 @@ def render_command(
         # The ordinary graph expects host frames. The CUDA graph keeps them
         # on the device through the cuts and conversion, downloading only
         # when software rotation requires it.
-        *(["-hwaccel", "cuda"] if decoder == "cuda" else []),
+        *(["-hwaccel", decoder] if decoder in {"cuda", "videotoolbox"} else []),
         *(["-hwaccel_output_format", "cuda"] if cuda_frames else []),
         # The filtergraph turns the kept frames itself; see upright_filters.
         *(["-noautorotate"] if manual_rotation else []),
         "-i",
         str(input_path),
-        "-filter_complex_script",
+        "-/filter_complex",
         str(filtergraph_path),
         "-map",
         "[vout]",
@@ -3368,13 +3403,14 @@ def render_with_fallback(
     prefer_cuda: bool = True,
 ) -> tuple[str, float]:
     candidates = encoder_candidates(args)
-    decoders = (["cuda", "cpu"] if prefer_cuda else ["cpu"]) if args.decoder == "auto" else [args.decoder]
+    decoders = decoder_candidates(args, prefer_cuda=prefer_cuda)
     attempts = [(encoder, decoder) for encoder in candidates for decoder in decoders]
     last_error: CommandFailed | None = None
     temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
     if temp_output.exists():
         temp_output.unlink()
     live_dir: Path | None = args.live_dir.expanduser() if args.live_dir else None
+    legacy_filtergraph = False
 
     for index, (encoder, decoder) in enumerate(attempts):
         cuda_graph = (
@@ -3394,6 +3430,8 @@ def render_with_fallback(
             cuda_frames=cuda_graph is not None,
             cuda_output=cuda_graph is not None and cuda_output,
         )
+        if legacy_filtergraph:
+            command[command.index("-/filter_complex")] = "-filter_complex_script"
         if args.dry_run:
             report("\nRender command:")
             report(shell_join(command))
@@ -3418,6 +3456,13 @@ def render_with_fallback(
             result = run_command(
                 command, check=False, progress_total=expected_duration
             )
+            if (result.returncode != 0 and not legacy_filtergraph
+                    and "Unrecognized option '/filter_complex'" in (result.stderr or "")):
+                # FFmpeg 6 needs the old option; FFmpeg 9 removed that option.
+                # Retry the same hardware pair without changing the graph.
+                legacy_filtergraph = True
+                command[command.index("-/filter_complex")] = "-filter_complex_script"
+                result = run_command(command, check=False, progress_total=expected_duration)
             if result.returncode == 0 and live_dir is not None:
                 report("Remuxing the live playlist into the final MP4...")
                 run_command(
@@ -3598,8 +3643,8 @@ def render_segments(
     prefer_cuda = not (convert_hdr or args.board != "off")
     download_format = cuda_download_format(media.pixel_format)
     if (
-        (args.decoder == "cuda" or (args.decoder == "auto" and prefer_cuda))
-        and args.encoder != "libx264"
+        "cuda" in decoder_candidates(args, prefer_cuda=prefer_cuda)
+        and args.encoder in {"auto", "h264_nvenc", "hevc_nvenc"}
         and args.filtergraph_mode == "select"
         and media.upright is not None
         and (not convert_hdr or download_format)

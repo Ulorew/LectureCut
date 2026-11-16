@@ -1,12 +1,61 @@
-# NVIDIA video decoding
+# Hardware video decoding
 
-`--decoder auto` is the default in the CLI and web UI. For SDR without board
-processing it tries CUDA/NVDEC first, then retries with software decoding if the
-render fails. HDR conversion and board processing default to CPU decoding: the
-transfer back to software filters did not give a consistent gain in the integration
-measurements below. Explicit `--decoder cuda` enables the hybrid path for comparisons
-on other hardware. Decoder fallback keeps
-the same encoder; only after its decoder attempts fail does `--encoder auto`
+## Apple VideoToolbox
+
+`--decoder auto` tries CUDA/NVDEC, VideoToolbox, then CPU, skipping hardware
+backends absent from FFmpeg's `-hwaccels` listing. A listed but unusable backend
+is retried with the next decoder. `--encoder auto` tries NVIDIA NVENC, then
+libx264; Apple encoding is available only by explicit selection.
+Explicit `--decoder videotoolbox` disables decoder fallback; explicit
+`--encoder h264_videotoolbox` or `hevc_videotoolbox` disables encoder fallback.
+Encoding and decoding can be selected independently.
+
+For HDR conversion or board processing, auto skips CUDA: its device-to-host
+transfer did not consistently help those software filters in the NVIDIA
+measurements below. VideoToolbox can still be selected automatically before
+CPU. Explicit `--decoder cuda` overrides this CUDA-specific policy.
+
+Apple's video engines are accessed through VideoToolbox, not Metal shaders.
+Decoded frames are made available to the ordinary software filtergraph, so
+selection, timestamp changes, rotation, FPS caps, and concat mode keep their
+existing behavior. This is hardware decoding and encoding, not a promise that
+all processing stays on the GPU. Audio analysis remains audio-only.
+
+Apple Silicon constant quality uses `--videotoolbox-quality 65` (0–100,
+higher means better quality), separately from CQ/CRF. Encoding requires hardware
+(`-allow_sw 0`); an explicitly selected Apple encoder reports failure instead of
+silently using software encoding. HEVC uses `hvc1` for Apple playback. The web UI
+supports H.264 live preview and disables live preview for HEVC.
+
+Current FFmpeg uses `-/filter_complex` to load the graph from a file. If an
+older build rejects that option, LectureCut retries the same hardware pair
+with `-filter_complex_script`, retaining support for FFmpeg 6.
+
+### Apple Silicon check, 2026-11-16
+
+Machine: MacBook Pro, M5 Pro (15 CPU cores), 24 GB RAM; FFmpeg 9.0 with zscale.
+Input: a 180 s excerpt of a 1080p, approximately 30 fps iPhone HEVC Main 10 HLG
+lecture. Both paths use the same measured HDR-to-SDR conversion, audio chain,
+cut plan, speed 1.25, and libx264 `veryfast`/CRF 23. Each runs twice, sequentially,
+with the second order reversed. Times exclude the shared preparation.
+
+| Decoder | Mean render | Individual runs |
+| --- | ---: | ---: |
+| CPU | 13.42 s | 12.80, 14.03 s |
+| VideoToolbox (`auto`) | 12.64 s | 12.46, 12.82 s |
+
+The mean reduction is 5.8%, although the CPU spread makes this a small-sample
+observation rather than a general speed guarantee. Auto selected libx264 for
+encoding in every run. All four outputs decoded without errors, retained SDR
+BT.709 tags, and had identical video timestamps and decoded audio hashes.
+Separate hardware tests cover explicit Apple H.264/HEVC encoders, 10-bit input,
+live remux, rotation, FPS limits, HDR conversion, and both board modes.
+
+## NVIDIA CUDA/NVDEC
+
+`--decoder auto` tries CUDA/NVDEC first when FFmpeg includes it,
+then VideoToolbox when available, then software decoding. Decoder fallback keeps
+the same encoder; only after all decoder attempts fail does `--encoder auto`
 try the next encoder. `--decoder cuda` disables software decoder fallback, and
 `--decoder cpu` uses the previous software decoding path. Encoding is a separate
 choice: `--encoder libx264` can still decode on NVIDIA.
@@ -118,7 +167,7 @@ The board CPU runs varied from 37.39 to 33.42 s while CUDA took 33.00 and
 33.06 s; that spread is larger than the mean improvement. There is no reliable
 board-mode gain to promise from this small sample. The original PR's benefit
 is real for the path without software colour processing, but does not carry
-over to HDR automatically. This is why `auto` uses CPU decoding for HDR
+over to HDR automatically. This is why `auto` skips CUDA decoding for HDR
 conversion and board modes, while `--decoder cuda` keeps the combined path
 available. NVENC encoding remains independent of that choice.
 
