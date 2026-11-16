@@ -71,7 +71,7 @@ CSRF_HEADER = "X-LectureCut"
 PREVIEW_GRACE_SECONDS = 15 * 60
 LIVE_SERVE_RE = re.compile(r"^(index\.m3u8|init\.mp4|seg_\d{5}\.m4s)$")
 # Browsers will not play HEVC; a preview of one would be a black box.
-LIVE_ENCODER_BLOCKLIST = {"hevc_nvenc"}
+LIVE_ENCODER_BLOCKLIST = {"hevc_nvenc", "hevc_videotoolbox"}
 EVENT_HISTORY_LIMIT = 2000
 # Settings a request may not pass at all. Each names a place the pipeline
 # writes to, and the page has no use for any of them: web sources are always

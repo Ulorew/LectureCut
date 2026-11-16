@@ -21,9 +21,9 @@ what they are, and what was tried and rejected.
 
 ## Requirements
 
-- FFmpeg with `ffprobe`, 6.0 or newer
+- FFmpeg with `ffprobe`, 6.0 or newer; `zscale` is needed for automatic HDR-to-SDR conversion
 - Python 3.10 or newer
-- optional: `yt-dlp` for URL inputs, an NVIDIA card and driver for CUDA/NVDEC decoding and NVENC encoding
+- optional: `yt-dlp` for URL inputs; Apple VideoToolbox on macOS, or an NVIDIA card and driver for CUDA/NVDEC decoding and NVENC encoding
 
 ```bash
 sudo apt install ffmpeg
@@ -56,9 +56,10 @@ The options worth knowing:
 | `--silence-bias 0` | shift the automatic threshold by ear, in dB |
 | `--denoise auto` | `auto`, `afftdn`, `anlmdn`, `arnndn`, `none` |
 | `--target-lufs -17` | loudness to aim for |
-| `--encoder auto` | `auto` (NVENC), `libx264`, `hevc_nvenc` |
-| `--decoder auto` | GPU decoding for SDR; CPU for HDR conversion/board filters; `cuda` or `cpu` overrides |
+| `--encoder auto` | NVIDIA NVENC → CPU (`libx264`); Apple encoding is manual: `h264_videotoolbox` or `hevc_videotoolbox` |
+| `--decoder auto` | CUDA/NVDEC → Apple VideoToolbox → CPU, skipping backends absent from FFmpeg; explicit `videotoolbox`, `cuda`, `cpu` |
 | `--cq 28`, `--crf 23` | quality; higher means a smaller file |
+| `--videotoolbox-quality 65` | Apple quality, 0–100; higher means better quality and a larger file |
 | `--max-fps 30` | cap the frame rate; halves a 60 fps screen recording |
 | `--tonemap auto` | convert HDR phone recordings to ordinary SDR |
 | `--board clean` | whiten the board and darken the marker; `ink` for a faint one |
@@ -68,14 +69,34 @@ The options worth knowing:
 
 `python3 main.py --help` lists the rest.
 
-Automatic decoding prefers NVIDIA for SDR and CPU when HDR conversion or board
-filters are enabled: transferring those frames back can cancel the gain. Use
-`--decoder cuda` to try the combined GPU/CPU path on your hardware, or
-`--decoder cpu` to disable GPU decoding. Decoding is separate from encoding:
-`--encoder libx264` can still decode on NVIDIA. When automatic mode chooses GPU,
-it retries a failed render with CPU decoding before changing encoders. The log
-and result report which decoder completed the render. Audio-only analysis and
-silence passes do not decode video.
+Hardware decoding is preferred by default in both the CLI and web UI. It is separate
+from encoding: `--encoder libx264` can still decode on Apple or NVIDIA hardware.
+Use `--decoder cpu` to compare with software decoding, or select `videotoolbox`
+or `cuda` explicitly to disable decoder fallback.
+The automatic mode tries each available decoder in priority order before changing
+encoders; the log and result report which decoder completed the render. The
+audio-only analysis and silence passes do not decode video.
+
+For HDR conversion or board processing, auto skips CUDA to preserve the existing
+CPU filtering policy; VideoToolbox remains available before CPU. Explicit
+`--decoder cuda` can still force the hybrid CUDA/software path.
+
+On macOS without CUDA, `auto` selects VideoToolbox for decoding and libx264 for
+encoding. Apple H.264/HEVC encoding is available explicitly. This uses Apple's video hardware through
+VideoToolbox, rather than Metal compute shaders. Cuts, rotation, and frame-rate
+filters still use CPU-accessible frames. Constant-quality encoding is intended
+for Apple Silicon; `--videotoolbox-quality` is independent of NVENC CQ/x264 CRF.
+The web quality selector sets the appropriate value for each encoder.
+
+```bash
+python3 main.py lecture.mov --decoder videotoolbox --encoder h264_videotoolbox
+python3 main.py lecture.mov --encoder hevc_videotoolbox --videotoolbox-quality 75
+```
+
+H.264 supports live preview; HEVC disables it in the web UI, as with HEVC NVENC.
+HEVC files use the `hvc1` tag for Apple playback. Explicit encoders report errors
+instead of switching to another encoder. Auto encoding tries NVENC and then
+libx264; it never selects an Apple encoder. FFmpeg builds without VideoToolbox can still use CPU.
 
 With NVENC and the default `select` mode, decoded frames stay on the GPU through
 the cuts and FPS limiting. SDR without board processing or rotation stays there
@@ -147,6 +168,12 @@ The web tests skip themselves unless the `web` extra is installed, so check that
 the summary does not end in `skipped=`. One slower test (about 25 s) renders a
 synthetic lecture and checks that sound stays with the picture across 300 cuts;
 it runs only with `LECTURECUT_SLOW_TESTS=1`.
+
+On macOS with hardware access, run
+`LECTURECUT_APPLE_TESTS=1 python3 -m unittest tests.test_main.AppleVideoIntegrationTests -v`
+to exercise real VideoToolbox H.264/HEVC encoding and decoding, live remux,
+cuts, rotation, an FPS cap, HDR conversion, and board filters. These tests require
+usable Apple video hardware and FFmpeg with `zscale`.
 
 ## Notes
 

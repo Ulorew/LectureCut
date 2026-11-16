@@ -12,6 +12,7 @@ const BASIC_DESTS = new Set([
   "arnndn_mix",
   "cq",
   "crf",
+  "videotoolbox_quality",
   "encoder",
   "decoder",
   "max_fps",
@@ -29,11 +30,11 @@ const SKIPPED_GROUPS = new Set(["preview sweep", "live preview"]);
 // indistinguishable between them. Sizes are for the GPU encoder; libx264 writes
 // roughly half as much for the same look.
 const QUALITY_LEVELS = [
-  { key: "q.max", cq: 23, crf: 20, gpu: 2.8, cpu: 1.3, hevc: 1.4 },
-  { key: "q.high", cq: 26, crf: 22, gpu: 1.9, cpu: 0.95, hevc: 1.0 },
-  { key: "q.normal", cq: 28, crf: 23, gpu: 1.4, cpu: 0.8, hevc: 0.8 },
-  { key: "q.compact", cq: 32, crf: 26, gpu: 0.77, cpu: 0.72, hevc: 0.5 },
-  { key: "q.min", cq: 36, crf: 29, gpu: 0.45, cpu: 0.5, hevc: 0.35 },
+  { key: "q.max", cq: 23, crf: 20, vt: 80, gpu: 2.8, cpu: 1.3, hevc: 1.4 },
+  { key: "q.high", cq: 26, crf: 22, vt: 75, gpu: 1.9, cpu: 0.95, hevc: 1.0 },
+  { key: "q.normal", cq: 28, crf: 23, vt: 65, gpu: 1.4, cpu: 0.8, hevc: 0.8 },
+  { key: "q.compact", cq: 32, crf: 26, vt: 55, gpu: 0.77, cpu: 0.72, hevc: 0.5 },
+  { key: "q.min", cq: 36, crf: 29, vt: 45, gpu: 0.45, cpu: 0.5, hevc: 0.35 },
 ];
 
 const ACTIVE_STATUSES = new Set(["queued", "running"]);
@@ -235,7 +236,7 @@ function applyDefaults() {
   denoise.value = d.denoise;
   el("set-arnndn-mix").value = d.arnndn_mix ?? 1;
   renderQualityLevels();
-  el("set-encoder").value = ["libx264", "hevc_nvenc"].includes(d.encoder) ? d.encoder : "auto";
+  el("set-encoder").value = d.encoder;
   el("set-decoder").value = d.decoder;
   el("set-max-fps").value = String(Number(d.max_fps) || 0);
   syncQualityHint();
@@ -289,8 +290,17 @@ function renderQualityLevels(rebuild) {
 function syncQualityHint() {
   const level = currentQuality();
   const encoder = el("set-encoder").value;
+  if (encoder.endsWith("_videotoolbox")) {
+    el("quality-hint").textContent = t("q.appleHint", { quality: level.vt });
+    return;
+  }
   const perHour =
+    encoder === "auto" ? null :
     encoder === "libx264" ? level.cpu : encoder === "hevc_nvenc" ? level.hevc : level.gpu;
+  if (perHour === null) {
+    el("quality-hint").textContent = t("q.autoHint");
+    return;
+  }
   const speed = Number(el("set-speed").value) || 1;
   const duration = state.selected && state.selected.duration;
   // The output is shorter than the input by the speed-up, and shorter again by
@@ -427,6 +437,7 @@ function collectSettings() {
   const quality = currentQuality();
   put("cq", quality.cq);
   put("crf", quality.crf);
+  put("videotoolbox_quality", quality.vt);
   put("encoder", el("set-encoder").value);
   put("decoder", el("set-decoder").value);
   put("max_fps", Number(el("set-max-fps").value));

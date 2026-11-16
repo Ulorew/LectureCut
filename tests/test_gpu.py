@@ -25,6 +25,22 @@ def command(*args):
 
 @unittest.skipUnless(os.environ.get("LECTURECUT_GPU_TESTS"), "opt-in: needs a free NVIDIA GPU")
 class GpuHdrIntegrationTests(unittest.TestCase):
+    def test_auto_uses_nvdec_and_nvenc_for_sdr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "source.mp4", Path(tmp) / "out.mp4"
+            command(
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4",
+                "-f", "lavfi", "-i", "sine=frequency=300:duration=4",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(source),
+            )
+            result = command(
+                sys.executable, str(ROOT / "main.py"), str(source), "-o", str(output),
+                "--encoder=auto", "--decoder=auto", "--analysis-samples=2",
+            )
+            self.assertIn(b"Encoder: h264_nvenc", result.stdout)
+            self.assertIn(b"Decoder: cuda", result.stdout)
+            command("ffmpeg", "-v", "error", "-xerror", "-i", str(output), "-f", "null", "-")
+
     def test_hdr_and_rotated_board_match_cpu_timing_audio_and_colour_tags(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -33,6 +49,7 @@ class GpuHdrIntegrationTests(unittest.TestCase):
                 "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4",
                 "-f", "lavfi", "-i", "sine=frequency=300:duration=4",
                 "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+                "-vf", "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
                 "-x265-params", "pools=1:frame-threads=1:log-level=error",
                 "-color_trc", "arib-std-b67", "-color_primaries", "bt2020",
                 "-colorspace", "bt2020nc", "-c:a", "aac", "-shortest", str(source),
