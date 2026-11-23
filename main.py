@@ -499,6 +499,7 @@ class AudioAnalysis:
     true_peak_db: float
     lra: float
     channel_imbalance_db: float
+    duration: float = 0.0
 
     @property
     def snr_db(self) -> float:
@@ -640,7 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--denoise",
         choices=AUDIO_DENOISE_MODES,
         default="auto",
-        help="Denoiser; auto picks arnndn when a model is given, otherwise afftdn",
+        help="Auto uses arnndn with a model, skips clean recordings, otherwise uses afftdn",
     )
     audio_group.add_argument(
         "--arnndn-model",
@@ -2059,6 +2060,7 @@ def analyze_audio(
         true_peak_db=max(peaks) if peaks else 0.0,
         lra=max(ranges) if ranges else 0.0,
         channel_imbalance_db=imbalance,
+        duration=media.duration,
     )
 
 
@@ -2625,6 +2627,7 @@ class DenoiseCheck:
     speech_after: float
     tilt_before: float = 0.0
     tilt_after: float = 0.0
+    local_loss_db: float | None = None
 
     @property
     def loss_db(self) -> float:
@@ -2684,6 +2687,72 @@ def run_spectral_probe(
     return parse_spectral_probe("\n".join(p for p in (result.stdout, result.stderr) if p))
 
 
+def local_denoise_loss(
+    path: Path, args: argparse.Namespace, analysis: AudioAnalysis,
+    prefix: list[str], denoise: list[str],
+) -> float | None:
+    """Find repeated attenuation well above the room floor, stopping at the first bad block."""
+    meter = (
+        "asetnsamples=n=24000:p=0,astats=metadata=1:reset=1:"
+        "measure_perchannel=none:measure_overall=RMS_level"
+    )
+    graph = (
+        f"[0:a:0]{','.join(prefix)},aresample=48000,asplit=2[d][w];"
+        f"[d]{meter},ametadata@dry=print:key=lavfi.astats.Overall.RMS_level[dry];"
+        # ARNNDN delays the signal by one 480-sample frame at 48 kHz.
+        f"[w]{','.join(denoise)},atrim=start_sample=480,{meter},"
+        "ametadata@wet=print:key=lavfi.astats.Overall.RMS_level[wet]"
+    )
+    def scan(offset: int) -> tuple[float, float] | None:
+        duration = min(180, analysis.duration - offset)
+        result = run_command([
+            "ffmpeg", "-nostdin", "-hide_banner", "-nostats",
+            *ffmpeg_input_options(args.start + offset, duration), "-i", str(path),
+            "-filter_complex", graph, "-map", "[dry]", "-map", "[wet]", "-f", "null", "-",
+        ], capture=True)
+        loss = repeated_level_loss(result.stderr, analysis.noise_floor_db, args.denoise_loss_limit)
+        if loss is not None:
+            seconds, loss_db = loss
+            return args.start + offset + seconds, loss_db
+        return None
+
+    # Check the opening first. Bound concurrent work and buffered logs to one
+    # batch, even on multi-hour inputs, and stop scheduling after a bad block.
+    offsets = range(0, math.ceil(analysis.duration), 180)
+    index = 0
+    while index < len(offsets):
+        batch = offsets[index:index + (PROBE_WORKERS if index else 1)]
+        for result in map_probes(scan, batch):
+            if result is not None:
+                seconds, loss_db = result
+                report(f"Repeated ARNNDN loss of {loss_db:.1f} dB near {seconds:.0f}s")
+                return loss_db
+        index += len(batch)
+    return None
+
+
+def repeated_level_loss(log: str, floor_db: float, limit_db: float) -> tuple[float, float] | None:
+    """Locate a 30-second interval with repeated above-floor losses."""
+    def levels(label: str) -> list[float]:
+        pattern = rf"ametadata@{label} .*?RMS_level=([-\d.inf]+)"
+        return [float(value) for value in re.findall(pattern, log)]
+
+    dry, wet = levels("dry"), levels("wet")
+    if abs(len(dry) - len(wet)) > 1:
+        raise PipelineError("Could not read aligned ARNNDN level measurements")
+    # Ignore warmup and the final partial frame. Empty audio tails are valid.
+    pairs = list(zip(dry, wet))[1:-1]
+    for start in range(0, len(pairs), 60):
+        losses = sorted(before - after for before, after in pairs[start:start + 60]
+                        if before > floor_db + 12)
+        # At least four seconds and a quarter of active frames must be affected.
+        if len(losses) >= 8:
+            loss = losses[-max(8, math.ceil(len(losses) / 4))]
+            if loss > limit_db:
+                return (start + 1) / 2, loss
+    return None
+
+
 def measure_denoise_effect(
     input_path: Path,
     *,
@@ -2719,7 +2788,7 @@ def measure_denoise_effect(
     treated_tilt: list[float] = []
     jobs = [
         (start, chain, loud_sink, tilt_sink)
-        for start in analysis.starts[:GAIN_CALIBRATION_WINDOWS]
+        for start in analysis.starts
         for chain, loud_sink, tilt_sink in (
             (prefix, plain, plain_tilt),
             (prefix + denoise, treated, treated_tilt),
@@ -2739,13 +2808,19 @@ def measure_denoise_effect(
             tilt_sink.append(tilt)
     if not plain or not treated:
         return None
-    return DenoiseCheck(
+    check = DenoiseCheck(
         mode,
         combine_loudness(plain),
         combine_loudness(treated),
         tilt_before=median(plain_tilt) if plain_tilt else 0.0,
         tilt_after=median(treated_tilt) if treated_tilt else 0.0,
     )
+    if mode == "arnndn" and denoise_failure(check, args) is None:
+        report("Checking local ARNNDN losses in 3-minute blocks...")
+        check = replace(check, local_loss_db=local_denoise_loss(
+            input_path, args, analysis, prefix, denoise,
+        ))
+    return check
 
 
 def enforce_denoise_sanity(
@@ -2774,12 +2849,18 @@ def enforce_denoise_sanity(
         reason = denoise_failure(check, args)
         if reason is None:
             return
+        if check.local_loss_db is not None and args.arnndn_mix > 0.3:
+            report(f"  {reason}; reducing ARNNDN mix to 0.3", error=True)
+            args.arnndn_mix = 0.3
+            continue
         fallback = "afftdn" if check.mode != "afftdn" else "none"
         report(f"  {reason}; using {fallback} instead", error=True)
         args.denoise = fallback
 
 
 def denoise_failure(check: DenoiseCheck, args: argparse.Namespace) -> str | None:
+    if check.local_loss_db is not None:
+        return f"repeated local attenuation exceeds {args.denoise_loss_limit:g} dB"
     if check.loss_db > args.denoise_loss_limit:
         return (
             f"that is more than {args.denoise_loss_limit:g} dB, so it is removing "
@@ -2875,6 +2956,11 @@ def resolve_audio_settings(
     """Freeze the derived silence threshold and audio chain onto args."""
 
     start_phase(PHASE_CALIBRATE)
+    if (args.denoise == "auto" and not args.arnndn_model and analysis is not None
+            and analysis.snr_db >= 30 and analysis.speech_lufs - analysis.noise_floor_db >= 24):
+        args.denoise = "none"
+        report("Clean recording: skipping automatic denoise")
+    args.denoise_requested = resolved_denoise_mode(args)
     enforce_denoise_sanity(input_path, args=args, analysis=analysis)
     if calibrate_threshold and str(args.silence_threshold).strip().lower() == "auto":
         calibrated = calibrate_silence_threshold(
@@ -3809,7 +3895,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return install_models(args.download_models)
     # Kept before any fallback can change it, so a result can say whether the
     # denoiser that ran is the one that was asked for.
-    args.denoise_requested = resolved_denoise_mode(args)
     require_command("ffmpeg")
     # Before any temporary directory exists: a refusal here has nothing to clean.
     validate_denoise_settings(args)

@@ -559,6 +559,29 @@ class LectureCutTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 main.enforce_denoise_sanity(main.Path("in.mp4"), args=args, analysis=self.analysis())
 
+    def test_local_guard_ignores_room_tone_but_catches_a_damaged_phrase(self):
+        def log(pairs):
+            return "\n".join(
+                f"[ametadata@{label} @ 0x1] lavfi.astats.Overall.RMS_level={level}"
+                for dry, wet in pairs for label, level in (("dry", dry), ("wet", wet))
+            )
+
+        background = [(-46, -70)] * 40
+        speech = [(-29, -30)] * 20
+        self.assertIsNone(main.repeated_level_loss(log(background + speech), -50, 6))
+        damaged = [(-29, -42)] * 10
+        self.assertEqual(main.repeated_level_loss(log(background + speech + damaged), -50, 6),
+                         (30.5, 13))
+
+    def test_auto_skips_clean_audio_only_when_quiet_passages_are_also_clear(self):
+        for quiet, expected in [(-23, "none"), (-37, "auto")]:
+            args = main.parse_args(["in.mp4", "--gain-bias=0", "--silence-threshold=-45dB"])
+            analysis = self.analysis(speech_lufs=quiet, speech_lufs_median=-18, noise_floor_db=-50)
+            with unittest.mock.patch.object(main, "measure_denoise_effect", return_value=None):
+                main.resolve_audio_settings(input_path=Path("in.mp4"), args=args, analysis=analysis)
+            self.assertEqual(args.denoise, expected)
+            self.assertTrue(any(f.startswith("dynaudnorm") for f in args.audio_chain))
+
     def test_a_muffling_denoiser_is_replaced_even_at_equal_loudness(self):
         # The seminar case: 0.3 dB of loudness, but the upper frequencies gone.
         args = self.audio_args(denoise="afftdn")

@@ -88,7 +88,7 @@ const I18N = {
       "≈ {perHour} ГБ на час записи{file} — прикидка по лекции с доской, зависит от съёмки",
     "q.hintFile": " · этот файл не больше {size}",
 
-    "den.auto": "arnndn, если указана модель, иначе afftdn",
+    "den.auto": "С моделью — arnndn. Без модели — afftdn или без денойза, если фон тихий.",
     "den.afftdn": "спектральный, быстрый; сила подбирается по замерам",
     "den.anlmdn": "нелокальное среднее, медленнее, иногда чище на широкополосном шуме",
     "den.arnndn": "нейросеть для речи, лучший из трёх, нужна модель",
@@ -291,7 +291,7 @@ const I18N = {
       "≈ {perHour} GB per hour of recording{file} — measured on a whiteboard lecture, depends on the footage",
     "q.hintFile": " · this file no more than {size}",
 
-    "den.auto": "arnndn when a model is given, otherwise afftdn",
+    "den.auto": "Uses arnndn with a model. Otherwise uses afftdn or skips denoising when the background is quiet.",
     "den.afftdn": "spectral gate, fast; its strength comes from the measurements",
     "den.anlmdn": "non-local means, slower, sometimes cleaner on broadband hiss",
     "den.arnndn": "recurrent network trained on speech, the best of these; needs a model",

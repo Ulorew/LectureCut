@@ -57,7 +57,7 @@ Denoiser options:
 
 | mode | what it is |
 | --- | --- |
-| `auto` | `arnndn` when a model is given, otherwise `afftdn` |
+| `auto` | `arnndn` when a model is given, otherwise skips clean audio or uses `afftdn` |
 | `afftdn` | spectral gate, fast; `nr` and `nf` are set from the measured floor |
 | `anlmdn` | non-local means, slower, sometimes cleaner on broadband hiss |
 | `arnndn` | recurrent network trained on speech, the best of these; needs a model |
@@ -105,7 +105,7 @@ sample-exact - so a lower strength adds no comb filtering.
 **`arnndn` is not automatically better than `afftdn`.** It cleans harder, but it
 decides what is speech, and when it decides wrong it removes the voice. On a
 very quiet source it also thins out quiet passages, widening the loudness range
-from ~7 LU to 20-25 LU. `afftdn` remains the default denoiser.
+from ~7 LU to 20-25 LU. Auto skips denoising when the median and quiet sampled levels exceed the estimated floor by at least 30 and 24 dB respectively. An explicit denoiser or model overrides this selection.
 
 ## When a denoiser goes wrong
 
@@ -118,6 +118,12 @@ render will feed it, downmixed first if `--mono` is set - and checks two things:
 - **spectral tilt**: the presence band (2-8 kHz) against the body band
   (100-1000 Hz) moving by more than 6 dB means it is reshaping the voice -
   muffled, as if under water, when negative, thin when positive.
+
+For ARNNDN the guard also compares aligned half-second RMS readings throughout
+the selected range. Each three-minute block is decoded once for both readings.
+Repeated losses above the limit on signal at least 12 dB above the estimated
+floor trigger a retry at mix 0.3. This level check is a heuristic for speech
+damage. The choice applies to the whole render, including live previews.
 
 Loudness alone missed the worst case: an afftdn that stripped the upper
 frequencies off a seminar changed its loudness by 0.3 dB while tilting it by
