@@ -212,7 +212,7 @@ class LectureCutTests(unittest.TestCase):
         self.assertIn(f"aselect='{select}'", filtergraph)
         self.assertIn(f"asetpts='({pts})/TB'", filtergraph)
         self.assertIn(
-            "atempo=2.000000,alimiter=limit=0.7943:level=disabled,aresample=48000[aout]",
+            "atempo=2.000000,alimiter=limit=0.7943:level=disabled,aresample=48000,asetpts=N/SR/TB[aout]",
             filtergraph,
         )
 

@@ -110,6 +110,25 @@ def audio_minus_video(path: Path) -> list[float]:
 @unittest.skipUnless(os.environ.get("LECTURECUT_SLOW_TESTS"), "slow: set LECTURECUT_SLOW_TESTS=1")
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
 class SyncTests(unittest.TestCase):
+    def test_sparse_screen_capture_keeps_audio_aligned_through_hls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            dense, sparse, output = (folder / name for name in ("dense.mp4", "sparse.mp4", "out.mp4"))
+            make_lecture(dense, 120)
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(dense), "-vf",
+                "select='not(between(t,5,65))'", "-fps_mode", "vfr", "-c:a", "copy",
+                str(sparse),
+            ], check=True)
+            subprocess.run([
+                sys.executable, str(ROOT / "main.py"), str(sparse), "-o", str(output),
+                "--denoise=none", "--decoder=cpu", "--encoder=libx264", "--no-analyze",
+                "--speed=1.15", "--live-dir", str(folder / "live"),
+            ], capture_output=True, check=True)
+            offsets = audio_minus_video(output)
+            self.assertGreater(len(offsets), 15)
+            self.assertLess(max(map(abs, offsets)), 0.18)
+
     def test_audio_does_not_drift_across_300_joins(self):
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp) / "lecture.mp4", Path(tmp) / "out.mp4"

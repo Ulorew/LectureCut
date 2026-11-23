@@ -185,7 +185,13 @@ mode stays as it is and warns when it renders.
 A screen recording at 60 fps doubles the frames without adding anything a
 lecture needs. `--max-fps 30` caps the output; on a 60 fps lecture that halved
 both the render time (24 s to 13 s for two minutes) and the file (4.9 to
-2.4 MB). A source that is already slower is left alone.
+2.4 MB). A source that is already slower normally keeps its frame rate.
+
+Some screen recorders store a single frame for a slide that stays on screen
+for minutes. When the average rate is well below the nominal capture rate,
+select mode repeats the held frame before cutting so a cut cannot discard the
+only copy of a slide. Live preview interleaves both tracks and preserves their
+timestamps when copying the completed playlist to MP4.
 
 ## Phone recordings in HDR
 

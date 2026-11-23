@@ -454,6 +454,7 @@ class MediaInfo:
     # Filters that turn an HDR source into SDR BT.709; empty for SDR.
     sdr: tuple[str, ...] = ()
     pixel_format: str = ""
+    sparse_fps: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1448,11 +1449,19 @@ def probe_media(
         (stream for stream in streams if stream.get("codec_type") == "video"),
         {},
     )
+    fps = stream_fps(video_stream)
+    try:
+        nominal = parse_fraction(video_stream.get("r_frame_rate") or "0")
+    except ValueError:
+        nominal = 0.0
+    # Screen captures can hold a slide for minutes with only one coded frame.
+    sparse_fps = nominal if 0 < fps < nominal * 0.8 and nominal <= 120 else 0.0
     return MediaInfo(
         duration=duration,
         has_audio=any(stream.get("codec_type") == "audio" for stream in streams),
         has_video=any(stream.get("codec_type") == "video" for stream in streams),
-        video_fps=stream_fps(video_stream),
+        video_fps=fps,
+        sparse_fps=sparse_fps,
         width=int(video_stream.get("width") or 0),
         pixel_format=str(video_stream.get("pix_fmt") or ""),
         height=int(video_stream.get("height") or 0),
@@ -2999,6 +3008,7 @@ def build_filtergraph(
     args: argparse.Namespace,
     *,
     video_fps: float = 30.0,
+    sparse_fps: float = 0.0,
     upright: tuple[str, ...] | None = (),
     sdr: tuple[str, ...] = (),
     size: tuple[int, int] = (0, 0),
@@ -3032,7 +3042,15 @@ def build_filtergraph(
     if args.filtergraph_mode == "concat":
         graph = build_concat_filtergraph(segments, args, tail=tail, video_label="vbase" if board else "vout")
     else:
-        graph = build_select_filtergraph(segments, args, tail=tail, video_label="vbase" if board else "vout")
+        if sparse_fps:
+            # Give the encoder a regular clock even when a slide never changes.
+            rate = sparse_fps * args.speed
+            if args.max_fps:
+                rate = min(rate, args.max_fps)
+            tail = [f for f in tail if not f.startswith("fps=")]
+            tail.insert(0, f"fps={format_seconds(rate)}:start_time=0")
+        graph = build_select_filtergraph(segments, args, tail=tail, sparse_fps=sparse_fps,
+                                         video_label="vbase" if board else "vout")
     if not board:
         return graph
     return graph.rstrip("\n") + ";\n" + board + "\n"
@@ -3138,11 +3156,15 @@ def build_select_filtergraph(
     args: argparse.Namespace,
     *,
     tail: list[str] = [],  # noqa: B006 - never mutated
+    sparse_fps: float = 0.0,
     video_label: str = "vout",
 ) -> str:
     select_expression = segment_select_expression(segments)
     pts_expression = segment_pts_expression(segments)
     video_filters = [
+        # Materialize the held image before cutting. Its only coded frame may
+        # otherwise disappear in a removed pause.
+        *([f"fps={format_seconds(sparse_fps)}:start_time=0", "settb=AVTB"] if sparse_fps else []),
         f"select='{select_expression}'",
         f"setpts='({pts_expression})/{args.speed:.8f}/TB'",
         *tail,
@@ -3160,6 +3182,9 @@ def build_select_filtergraph(
         # the offset where it is with no cuts at all.
         AUDIO_RESYNC_FILTER,
         *build_audio_filters(args),
+        # Buffered audio filters can emit retrograde PTS. AAC/fMP4 needs the
+        # playback clock of the actual contiguous samples after atempo.
+        "asetpts=N/SR/TB",
     ]
     return (
         f"[0:v]{','.join(video_filters)}[{video_label}];\n"
@@ -3368,6 +3393,9 @@ def live_output_args(live_dir: Path) -> list[str]:
     """
 
     return [
+        # Sparse screen video can arrive minutes after the matching audio.
+        # Wait for both streams so future audio stays out of earlier segments.
+        "-max_interleave_delta", "0",
         "-f",
         "hls",
         "-hls_time",
@@ -3447,6 +3475,9 @@ def remux_live_command(*, live_dir: Path, source: Path, output_path: Path) -> li
         "-hide_banner",
         "-y",
         "-nostdin",
+        # The HLS demuxer accepts discontinuities. Its timestamp correction
+        # can shift a continuous track when packets arrive far out of order.
+        "-copyts", "-start_at_zero",
         "-i",
         str(live_dir / LIVE_PLAYLIST),
         "-i",
@@ -3714,7 +3745,7 @@ def render_segments(
     filtergraph = build_filtergraph(
         segments,
         args,
-        video_fps=media.video_fps,
+        video_fps=media.video_fps, sparse_fps=media.sparse_fps,
         upright=media.upright,
         sdr=media.sdr,
         size=(media.width, media.height),
@@ -3740,7 +3771,7 @@ def render_segments(
         cuda_filtergraph_path = filtergraph_path.with_name(f"cuda_{filtergraph_path.name}")
         cuda_filtergraph_path.write_text(
             build_filtergraph(
-                segments, args, video_fps=media.video_fps,
+                segments, args, video_fps=media.video_fps, sparse_fps=media.sparse_fps,
                 upright=media.upright, cuda_frames=True,
                 sdr=media.sdr, size=(media.width, media.height),
                 cuda_download_format=download_format,
